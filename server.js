@@ -22,7 +22,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function gymHeaders() {
-  const token = Buffer.from(`${GYMMASTER_API_KEY}:`).toString("base64");
+  const token = Buffer.from(`:${GYMMASTER_API_KEY}`).toString("base64");
   return {
     Accept: "application/json",
     Authorization: `Basic ${token}`,
