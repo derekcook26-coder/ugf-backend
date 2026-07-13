@@ -8,10 +8,23 @@ app.use(express.json());
 
 app.use(
   cors({
-    origin: [
-      "https://ultimate-goals-fitness.sintra.site",
-      "http://localhost:3000",
-    ],
+    origin: (origin, callback) => {
+      const allowed = [
+        "https://ultimate-goals-fitness.sintra.site",
+        "https://ultimategoalsfitness.com",
+        "https://www.ultimategoalsfitness.com",
+      ];
+      if (
+        !origin ||
+        allowed.includes(origin) ||
+        /^https?:\/\/([\w-]+\.)*sintra\.(ai|site)$/.test(origin) ||
+        /^http:\/\/localhost(:\d+)?$/.test(origin)
+      ) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS blocked: ${origin}`));
+      }
+    },
   })
 );
 
