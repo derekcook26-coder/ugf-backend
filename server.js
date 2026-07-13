@@ -31,15 +31,14 @@ function gymHeaders() {
 }
 
 function isMemberActive(member) {
-  // Gatekeeper API: memberships array — check for at least one active membership
-  if (Array.isArray(member.memberships) && member.memberships.length > 0) {
-    return member.memberships.some((m) => {
-      const status = (m.status || m.member_status || "").toLowerCase();
-      return status === "active" || status === "enabled";
-    });
+  // Gatekeeper API: membership array uses expired:false for active memberships
+  // stopatgate:true means access is blocked even if membership exists
+  if (member.stopatgate) return false;
+  const memberships = member.membership || member.memberships || [];
+  if (Array.isArray(memberships) && memberships.length > 0) {
+    return memberships.some((m) => m.expired === false);
   }
-  const status = (member.status || member.member_status || "").toLowerCase();
-  return status === "active" || status === "enabled";
+  return false;
 }
 
 // ─── Health check ───────────────────────────────────────────────────────────
@@ -90,13 +89,14 @@ app.post("/verify-member", async (req, res) => {
     // Gatekeeper API returns { members: [...] }
     const list = data.members || data.data || (Array.isArray(data) ? data : []);
 
+    // Gatekeeper API stores names as "LastInitial, FirstName" e.g. "C, Derek"
     const match = list.find((m) => {
-      const emailMatch = (m.email || "").toLowerCase() === email.toLowerCase();
-      const firstMatch =
-        (m.firstname || m.first_name || "").toLowerCase() === firstName.toLowerCase();
-      const lastMatch =
-        (m.lastname || m.last_name || "").toLowerCase() === lastName.toLowerCase();
-      return emailMatch && firstMatch && lastMatch;
+      const parts = (m.name || "").split(",").map((s) => s.trim());
+      const apiLastInitial = (parts[0] || "").toLowerCase();
+      const apiFirstName = (parts[1] || "").toLowerCase();
+      const enteredLastInitial = lastName.trim().slice(0, 1).toLowerCase();
+      const enteredFirst = firstName.trim().toLowerCase();
+      return apiFirstName === enteredFirst && apiLastInitial === enteredLastInitial;
     });
 
     if (!match) {
