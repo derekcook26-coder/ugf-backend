@@ -68,8 +68,8 @@ app.get("/test-gymmaster", async (_req, res) => {
 app.post("/verify-member", async (req, res) => {
   const { firstName, lastName, email } = req.body;
 
-  if (!firstName || !lastName || !email) {
-    return res.status(400).json({ error: "firstName, lastName and email are required" });
+  if (!firstName || !lastName) {
+    return res.status(400).json({ error: "firstName and lastName are required" });
   }
 
   try {
