@@ -15,23 +15,30 @@ app.use(
   })
 );
 
-const GYMMASTER_BASE = "https://ugf.gymmasteronline.com/portal";
+const GYMMASTER_BASE = "https://ugf.gymmasteronline.com/gatekeeper_api/v2";
 const GYMMASTER_API_KEY = process.env.GYMMASTER_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function gymHeaders() {
+  const token = Buffer.from(`${GYMMASTER_API_KEY}:`).toString("base64");
   return {
     Accept: "application/json",
-    "Content-Type": "application/json",
-    "X-API-Key": GYMMASTER_API_KEY,
+    Authorization: `Basic ${token}`,
   };
 }
 
 function isMemberActive(member) {
+  // Gatekeeper API: memberships array — check for at least one active membership
+  if (Array.isArray(member.memberships) && member.memberships.length > 0) {
+    return member.memberships.some((m) => {
+      const status = (m.status || m.member_status || "").toLowerCase();
+      return status === "active" || status === "enabled";
+    });
+  }
   const status = (member.status || member.member_status || "").toLowerCase();
-  return status === "active";
+  return status === "active" || status === "enabled";
 }
 
 // ─── Health check ───────────────────────────────────────────────────────────
@@ -48,7 +55,7 @@ app.post("/verify-member", async (req, res) => {
   }
 
   try {
-    const url = `${GYMMASTER_BASE}/api/v1/members?email=${encodeURIComponent(email)}&api_key=${GYMMASTER_API_KEY}`;
+    const url = `${GYMMASTER_BASE}/members`;
     const response = await fetch(url, { headers: gymHeaders() });
 
     if (!response.ok) {
@@ -61,7 +68,7 @@ app.post("/verify-member", async (req, res) => {
     const data = await response.json();
     console.log("GymMaster /members raw keys:", Object.keys(data));
 
-    // GymMaster may return { members: [...] } or { data: [...] } or a plain array
+    // Gatekeeper API returns { members: [...] }
     const list = data.members || data.data || (Array.isArray(data) ? data : []);
 
     const match = list.find((m) => {
@@ -98,7 +105,7 @@ app.post("/verify-member-by-id", async (req, res) => {
   }
 
   try {
-    const url = `${GYMMASTER_BASE}/api/v1/members/${encodeURIComponent(memberId)}?api_key=${GYMMASTER_API_KEY}`;
+    const url = `${GYMMASTER_BASE}/members?id=${encodeURIComponent(memberId)}`;
     const response = await fetch(url, { headers: gymHeaders() });
 
     if (response.status === 404) {
@@ -111,9 +118,11 @@ app.post("/verify-member-by-id", async (req, res) => {
     }
 
     const data = await response.json();
-    const member = data.member || data.data || data;
+    // Gatekeeper API returns { members: [...] } even for single ID lookup
+    const list = data.members || data.data || (Array.isArray(data) ? data : []);
+    const member = list[0];
 
-    if (!member || (!member.id && !member.member_id)) {
+    if (!member) {
       return res.json({ found: false, active: false });
     }
 
