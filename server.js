@@ -53,10 +53,12 @@ app.get("/test-gymmaster", async (_req, res) => {
   const keyLen = GYMMASTER_API_KEY ? GYMMASTER_API_KEY.length : 0;
   const keyPreview = GYMMASTER_API_KEY ? GYMMASTER_API_KEY.slice(0, 4) + "***" : "NOT SET";
   try {
-    const response = await fetch(`${GYMMASTER_BASE}/time`, { headers: gymHeaders() });
-    let body = "";
-    try { body = await response.text(); } catch {}
-    return res.json({ site, keyLen, keyPreview, status: response.status, body: body.slice(0, 200) });
+    const response = await fetch(`${GYMMASTER_BASE}/members`, { headers: gymHeaders() });
+    const data = await response.json();
+    const list = data.members || data.data || (Array.isArray(data) ? data : []);
+    const sample = list[0] ? Object.keys(list[0]) : [];
+    const memberSample = list[0] || null;
+    return res.json({ site, keyLen, keyPreview, status: response.status, totalMembers: list.length, fields: sample, firstMember: memberSample });
   } catch (err) {
     return res.json({ site, keyLen, keyPreview, error: err.message });
   }
