@@ -167,7 +167,10 @@ app.post("/generate-workout", async (req, res) => {
     const completion = await client.chat.completions.create({
       model: "gpt-4o",
       max_tokens: 4096,
-      messages: [{ role: "user", content: buildPrompt(assessment) }],
+      messages: [
+        { role: "system", content: buildSystemPrompt(assessment) },
+        { role: "user", content: buildPrompt(assessment) },
+      ],
     });
 
     return res.json({ plan: completion.choices[0].message.content });
@@ -179,75 +182,114 @@ app.post("/generate-workout", async (req, res) => {
 
 // ─── Prompt builder ──────────────────────────────────────────────────────────
 
+function buildSystemPrompt(a) {
+  const hasInjuries = a.injuries && a.injuries.trim().toLowerCase() !== "none" && a.injuries.trim() !== "";
+
+  const injuryBlock = hasInjuries
+    ? `
+CRITICAL SAFETY RULES — INJURIES & PHYSICAL LIMITATIONS:
+The member has reported the following injuries or physical limitations: "${a.injuries}"
+
+These are NON-NEGOTIABLE safety constraints. You MUST:
+1. NEVER prescribe any exercise that loads, strains, or aggravates the affected area.
+2. Identify and explicitly LIST every exercise you are excluding because of this condition.
+3. Provide safe, effective alternatives that work around — not through — the limitation.
+4. Include a dedicated "Working Around Your Injury" section in the plan BEFORE the workout details.
+5. If the injury involves the spine, back, or core (e.g. back pain, herniated disc, sciatica): AVOID all spinal-loading movements including bent-over rows, conventional deadlifts, good mornings, barbell squats, and any exercise requiring forward flexion under load. Use supported, machine-based, or lying alternatives instead.
+6. If the injury involves a joint (knee, shoulder, hip, wrist, ankle): avoid all direct loading of that joint and flag modifications clearly in the exercise table.
+7. Acknowledge the injury directly in the opening message to the member so they know it was heard.
+
+Ignoring or downplaying a reported injury is not acceptable and could cause serious harm.`
+    : `The member has no reported injuries or physical limitations. You may prescribe a full range of exercises appropriate for their fitness level and goals.`;
+
+  return `You are a certified personal trainer and corrective exercise specialist at Ultimate Goals Fitness — a 24/7 community gym in the Black Hills of South Dakota. You are warm, encouraging, and direct. Your top priority is member safety. You build personalized, effective workout plans that work WITH the member's body, not against it.
+${injuryBlock}`;
+}
+
 function buildPrompt(a) {
-  return `You are a certified personal trainer at Ultimate Goals Fitness — a 24/7 community gym in the Black Hills area of South Dakota with locations in Black Hawk and Rapid Valley. You are warm, encouraging, and no-nonsense. Your job is to build a genuinely useful, personalized workout plan for this member.
+  const hasInjuries = a.injuries && a.injuries.trim().toLowerCase() !== "none" && a.injuries.trim() !== "";
+
+  return `Build a complete, personalized workout plan for this member.
 
 MEMBER PROFILE:
 - Name: ${a.name}
 - Age: ${a.age || "Not provided"}
 - Home Location: ${a.location}
 - Fitness Level: ${a.fitnessLevel}
-- Primary Goals: ${a.goals}
+- Primary Goals: ${Array.isArray(a.goals) ? a.goals.join(", ") : a.goals}
 - Days Per Week Available: ${a.daysPerWeek}
 - Preferred Workout Time: ${a.preferredTime || "Flexible"}
-- Injuries / Limitations: ${a.injuries || "None reported"}
+- Injuries / Physical Limitations: ${a.injuries || "None reported"}
 - Current Activity Outside Gym: ${a.currentActivity || "Not specified"}
 - Additional Notes: ${a.additionalNotes || "None"}
 
-Build their complete workout plan using this exact structure:
+Use this exact structure:
 
 ---
 
 **Hey [first name], here's your UGF plan!**
-[2–3 sentences that feel personal — reference their goal, acknowledge their level, and hype them up. Sound like a real trainer, not a robot.]
+[2–3 sentences that feel personal — reference their goal, fitness level, and hype them up. ${hasInjuries ? "Directly acknowledge their injury/limitation so they know it was factored in — e.g. 'I've built this entire plan around your back pain so you can train hard without making it worse.'" : "Sound like a real trainer, not a robot."}]
 
 ---
+${hasInjuries ? `
+## Working Around Your Injury
 
+**What I'm keeping out of your plan:**
+[List every exercise category or specific movement you are excluding and briefly explain why — e.g. "Bent-over rows — these flex the spine under load and are a common aggravator of back pain. Replaced with seated cable rows and chest-supported rows."]
+
+**How we're training around it:**
+[2–3 sentences on the approach — e.g. supported movements, machines, unilateral work, core stabilization — so the member understands the strategy behind the plan.]
+
+**Recovery tips for your condition:**
+[2–3 specific, practical tips for managing their condition outside the gym — stretching, mobility, sleep position, etc.]
+
+---
+` : ""}
 ## Your Weekly Schedule
 
-[Show a clean day-by-day breakdown for the number of days they selected. Label each day clearly, e.g. "Day 1 — Upper Body Strength". Include at least one rest/recovery day with a brief note.]
+[Show a clean day-by-day breakdown for the number of days they selected. Label each day clearly, e.g. "Day 1 — Upper Body Strength". Include at least one rest/recovery day.]
 
 ---
 
 ## Workout Details
 
-[For each training day, list:]
+[For each training day:]
 
 ### Day X — [Focus]
 | Exercise | Sets | Reps / Duration | Trainer Tip |
 |---|---|---|---|
-[4–6 exercises per day. Trainer Tip should be one short, practical coaching cue. Modify any exercises that conflict with their injuries.]
+[4–6 exercises per day. Trainer Tip = one short coaching cue. ${hasInjuries ? "Every exercise must be safe given their reported injury — no exceptions." : ""}]
 
 ---
 
 ## Weeks 3–4 Progression
 
-[2–3 bullet points on how to increase intensity — e.g. add weight, reduce rest, add a set. Keep it simple and actionable.]
+[2–3 bullet points on how to increase intensity. Keep it simple and actionable.]
 
 ---
 
 ## Nutrition Guide
 
 **Daily Calorie & Protein Target**
-[Give a specific calorie range and daily protein target in grams based on their goal, age, and activity level. Be direct — give real numbers, not ranges so wide they're useless.]
+[Specific calorie range and daily protein target in grams. Real numbers, not vague ranges.]
 
 **Pre-Workout Fuel**
-[What to eat and when before training — specific foods, timing, and portion size. Tie it to their preferred workout time.]
+[What to eat and when before training. Specific foods, timing, and portion. Tie to their preferred workout time.]
 
 **Post-Workout Recovery**
-[What to eat within 30–60 minutes after training to support their goal. Specific foods and macros.]
+[What to eat within 30–60 min after training. Specific foods and macros.]
 
 **Daily Meal Structure**
-[A simple 3–4 meal framework with example foods for each meal. Keep it practical and realistic for a busy person — no complex recipes.]
+[Simple 3–4 meal framework with example foods. Practical for a busy person.]
 
 **Foods to Prioritize**
-[5–7 specific foods that directly support their primary goal. One sentence on why each one matters.]
+[5–7 specific foods that support their primary goal. One sentence on why each matters.]
 
 **Foods to Limit**
-[3–4 specific things to cut back on, with a brief explanation of why they work against the goal.]
+[3–4 things to cut back on with a brief explanation.]
 
 **Hydration**
-[Daily water intake target based on their activity level. Any specific hydration timing tips around workouts.]
+[Daily water intake target. Specific hydration timing around workouts.]
 
 ---
 
