@@ -226,9 +226,28 @@ Build their complete workout plan using this exact structure:
 
 ---
 
-## Nutrition Tip
+## Nutrition Guide
 
-[One focused, practical tip directly tied to their primary goal. No generic advice — make it specific.]
+**Daily Calorie & Protein Target**
+[Give a specific calorie range and daily protein target in grams based on their goal, age, and activity level. Be direct — give real numbers, not ranges so wide they're useless.]
+
+**Pre-Workout Fuel**
+[What to eat and when before training — specific foods, timing, and portion size. Tie it to their preferred workout time.]
+
+**Post-Workout Recovery**
+[What to eat within 30–60 minutes after training to support their goal. Specific foods and macros.]
+
+**Daily Meal Structure**
+[A simple 3–4 meal framework with example foods for each meal. Keep it practical and realistic for a busy person — no complex recipes.]
+
+**Foods to Prioritize**
+[5–7 specific foods that directly support their primary goal. One sentence on why each one matters.]
+
+**Foods to Limit**
+[3–4 specific things to cut back on, with a brief explanation of why they work against the goal.]
+
+**Hydration**
+[Daily water intake target based on their activity level. Any specific hydration timing tips around workouts.]
 
 ---
 
