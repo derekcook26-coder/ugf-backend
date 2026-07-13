@@ -46,6 +46,22 @@ function isMemberActive(member) {
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// ─── GymMaster connection test ───────────────────────────────────────────────
+
+app.get("/test-gymmaster", async (_req, res) => {
+  const site = process.env.GYMMASTER_SITE || "ugf";
+  const keyLen = GYMMASTER_API_KEY ? GYMMASTER_API_KEY.length : 0;
+  const keyPreview = GYMMASTER_API_KEY ? GYMMASTER_API_KEY.slice(0, 4) + "***" : "NOT SET";
+  try {
+    const response = await fetch(`${GYMMASTER_BASE}/time`, { headers: gymHeaders() });
+    let body = "";
+    try { body = await response.text(); } catch {}
+    return res.json({ site, keyLen, keyPreview, status: response.status, body: body.slice(0, 200) });
+  } catch (err) {
+    return res.json({ site, keyLen, keyPreview, error: err.message });
+  }
+});
+
 // ─── Verify member by name + email ──────────────────────────────────────────
 
 app.post("/verify-member", async (req, res) => {
