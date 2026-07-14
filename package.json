@@ -1,7 +1,7 @@
 {
   "name": "ugf-backend",
   "version": "1.0.0",
-  "description": "UGF member verification and AI workout plan backend",
+  "description": "UGF member verification, AI workout plan, and weekly check-in backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "openai": "^4.52.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "pg": "^8.12.0"
   },
   "engines": {
     "node": ">=18.0.0"
