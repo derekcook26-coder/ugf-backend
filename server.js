@@ -1,0 +1,1292 @@
+var express = require("express");
+var cors = require("cors");
+var fetch = require("node-fetch");
+var jwt = require("jsonwebtoken");
+var rateLimit = require("express-rate-limit");
+var { Pool } = require("pg");
+var OpenAI = require("openai");
+
+var app = express();
+app.use(express.json());
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+
+app.use(cors({
+  origin: function (origin, callback) {
+    var allowed = [
+      "https://ultimate-goals-fitness.sintra.site",
+      "https://ultimategoalsfitness.com",
+      "https://www.ultimategoalsfitness.com",
+    ];
+    if (
+      !origin ||
+      allowed.includes(origin) ||
+      /^https?:\/\/([\w-]+\.)*sintra\.(ai|site)$/.test(origin) ||
+      /^http:\/\/localhost(:\d+)?$/.test(origin)
+    ) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS blocked: " + origin));
+    }
+  },
+}));
+
+// ─── Database ─────────────────────────────────────────────────────────────────
+
+var db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// ─── Rate limiters ────────────────────────────────────────────────────────────
+
+var verifyMemberLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many verification attempts. Please wait 15 minutes." },
+});
+
+// 60 requests per hour — enough for a full coaching conversation.
+var coachMessageLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many coaching requests. Please wait before trying again." },
+});
+
+var checkinSessionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many check-in session attempts. Please wait 15 minutes." },
+});
+
+var checkinSubmitLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many submissions. Please try again later." },
+});
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+var GYMMASTER_BASE = "https://ugf.gymmasteronline.com/gatekeeper_api/v2";
+var CHECKIN_SESSION_TTL = "2h";
+var VERIFY_TOKEN_TTL = "2h";
+var MAX_TRAINER_NOTIFICATION_ATTEMPTS = 5;
+
+// ─── GymMaster Gatekeeper helpers ─────────────────────────────────────────────
+//
+// Uses GYMMASTER_API_KEY with the confirmed Gatekeeper API.
+// Used for membership verification only.
+
+function gymHeaders() {
+  var site = process.env.GYMMASTER_SITE || "ugf";
+  var key = process.env.GYMMASTER_API_KEY;
+  var token = Buffer.from(site + ":" + key).toString("base64");
+  return {
+    Accept: "application/json",
+    Authorization: "Basic " + token,
+  };
+}
+
+function isMemberActive(member) {
+  if (member.stopatgate) return false;
+  var memberships = member.membership || member.memberships || [];
+  if (Array.isArray(memberships) && memberships.length > 0) {
+    return memberships.some(function (m) { return m.expired === false; });
+  }
+  return false;
+}
+
+// ─── GymMaster communication adapter — DISABLED ───────────────────────────────
+//
+// The GymMaster communication API endpoint for sending saved email templates
+// has not been confirmed. This adapter is disabled until GymMaster provides:
+//
+//   1. API product or service name
+//   2. API base URL (may differ from the Gatekeeper URL)
+//   3. Authentication method and which credential is required
+//   4. Exact endpoint path
+//   5. HTTP method
+//   6. Template identifier format (numeric ID, slug, etc.)
+//   7. Member identifier format (numeric ID, email, etc.)
+//   8. Complete request payload structure
+//   9. Expected success response
+//  10. Required account permissions
+//
+// IMPORTANT: GYMMASTER_MEMBER_PORTAL_API_KEY and GYMMASTER_API_KEY are treated
+// as separate credentials. Do not make one fall back to the other.
+//
+// The feature flag GYMMASTER_WEEKLY_EMAIL_ENABLED must also be set to "true"
+// in Railway after the adapter is updated and a single-member test succeeds.
+
+async function sendGymMasterWeeklyCheckinEmail() {
+  return {
+    configured: false,
+    error: "GymMaster communication endpoint has not been confirmed.",
+  };
+}
+
+// ─── JWT helpers ──────────────────────────────────────────────────────────────
+
+// Verification token — issued by /verify-member, consumed by /coach-message
+// and /generate-personalized-workout. Signed with MEMBER_VERIFY_SECRET.
+//
+// Payload:
+//   sub             — canonical GymMaster member ID (authoritative identity key)
+//   firstName       — first name exactly as returned by the GymMaster record
+//   lastInitial     — last initial exactly as returned by the GymMaster record
+//   displayLastName — full last name entered by the member; first character
+//                     confirmed against the GymMaster last initial, but the
+//                     full name is not confirmed by GymMaster
+//
+// /coach-message and /generate-personalized-workout use:
+//   sub             as the DB identity key
+//   firstName       as the authoritative first name
+//   displayLastName for display, plan context, and coach_members.last_name
+// Browser-supplied names are never used for DB writes.
+function signVerificationToken(gymmasterId, verifiedFirstName, verifiedLastInitial, displayLastName) {
+  var secret = process.env.MEMBER_VERIFY_SECRET;
+  if (!secret) throw new Error("MEMBER_VERIFY_SECRET is not configured");
+  return jwt.sign(
+    {
+      sub: String(gymmasterId),
+      firstName: verifiedFirstName,
+      lastInitial: verifiedLastInitial,
+      displayLastName: displayLastName,
+    },
+    secret,
+    { expiresIn: VERIFY_TOKEN_TTL }
+  );
+}
+
+function verifyVerificationToken(req, res) {
+  var secret = process.env.MEMBER_VERIFY_SECRET;
+  if (!secret) {
+    res.status(500).json({ error: "Server configuration error" });
+    return null;
+  }
+  var auth = (req.headers.authorization || "").trim();
+  var token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token) {
+    res.status(401).json({ error: "Membership verification required" });
+    return null;
+  }
+  try {
+    return jwt.verify(token, secret);
+  } catch (err) {
+    res.status(401).json({ error: "Verification expired or invalid. Please verify your membership again." });
+    return null;
+  }
+}
+
+// Check-in session token — issued by /weekly-checkin/session.
+// Signed with CHECKIN_SESSION_SECRET. Sub is the internal DB member ID.
+function signCheckinSession(dbMemberId, gymmasterId, firstName) {
+  var secret = process.env.CHECKIN_SESSION_SECRET;
+  if (!secret) throw new Error("CHECKIN_SESSION_SECRET is not configured");
+  return jwt.sign(
+    { sub: String(dbMemberId), gm: String(gymmasterId), fn: firstName },
+    secret,
+    { expiresIn: CHECKIN_SESSION_TTL }
+  );
+}
+
+function verifyCheckinToken(req, res) {
+  var secret = process.env.CHECKIN_SESSION_SECRET;
+  var auth = (req.headers.authorization || "").trim();
+  var token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token) {
+    res.status(401).json({ error: "Authentication required" });
+    return null;
+  }
+  try {
+    return jwt.verify(token, secret);
+  } catch (err) {
+    res.status(401).json({ error: "Session expired or invalid. Please verify your membership again." });
+    return null;
+  }
+}
+
+// ─── OpenAI ───────────────────────────────────────────────────────────────────
+
+function getOpenAI() {
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+}
+
+function getModel() {
+  return process.env.OPENAI_MODEL || "gpt-4o";
+}
+
+// ─── Week start (Monday, America/Denver) ──────────────────────────────────────
+//
+// Uses Mountain Time so Sunday-evening submissions are not assigned to next week.
+// Intl.DateTimeFormat handles MDT/MST automatically.
+// No additional dependencies — Node >= 18 ships full ICU data.
+
+function getWeekStart(date) {
+  var d = date instanceof Date ? date : new Date();
+  var mtDateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Denver",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+  // en-CA locale produces "YYYY-MM-DD"
+  var parts = mtDateStr.split("-");
+  var year  = parseInt(parts[0], 10);
+  var month = parseInt(parts[1], 10) - 1; // 0-indexed
+  var day   = parseInt(parts[2], 10);
+  var mt = new Date(year, month, day);
+  var dow = mt.getDay(); // 0 = Sunday, 1 = Monday, …, 6 = Saturday
+  var diff = dow === 0 ? -6 : 1 - dow;
+  mt.setDate(mt.getDate() + diff);
+  return mt.getFullYear() + "-" +
+    String(mt.getMonth() + 1).padStart(2, "0") + "-" +
+    String(mt.getDate()).padStart(2, "0");
+}
+
+// ─── Cron secret guard ────────────────────────────────────────────────────────
+
+function requireCronSecret(req, res) {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+// ─── GymMaster email feature flag guard ──────────────────────────────────────
+
+function requireGymMasterEmailEnabled(res) {
+  if (process.env.GYMMASTER_WEEKLY_EMAIL_ENABLED !== "true") {
+    res.status(503).json({
+      configured: false,
+      error:
+        "GymMaster weekly email sending is disabled until the official communication endpoint is confirmed. " +
+        "Set GYMMASTER_WEEKLY_EMAIL_ENABLED=true in Railway only after the adapter is updated and a single-member test succeeds.",
+    });
+    return false;
+  }
+  return true;
+}
+
+// ─── Trainer summary webhook ──────────────────────────────────────────────────
+
+async function sendTrainerSummaryWebhook(payload) {
+  var webhookUrl = process.env.ZAPIER_TRAINER_SUMMARY_WEBHOOK;
+  if (!webhookUrl) {
+    console.warn("[UGF] ZAPIER_TRAINER_SUMMARY_WEBHOOK not set — skipping trainer notification");
+    return { skipped: true };
+  }
+
+  var controller = new AbortController();
+  var timeout = setTimeout(function () { controller.abort(); }, 10000);
+
+  try {
+    var response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!response.ok) {
+      console.error("[UGF] Zapier trainer webhook returned " + response.status);
+      return { error: "Webhook returned HTTP " + response.status };
+    }
+    return { ok: true };
+  } catch (err) {
+    clearTimeout(timeout);
+    console.error("[UGF] Zapier trainer webhook failed:", err.message);
+    return { error: err.message };
+  }
+}
+
+// ─── Trainer notification DB helpers ─────────────────────────────────────────
+//
+// trainer_notification_attempts is incremented BEFORE each webhook attempt
+// (at the call site). These helpers only update the outcome columns — they
+// do NOT touch the attempt counter.
+
+function markTrainerNotified(dbMemberId, weekStart) {
+  db.query(
+    "UPDATE weekly_checkins SET " +
+    "trainer_notified_at = NOW(), " +
+    "trainer_notification_status = 'sent', " +
+    "trainer_notification_last_error = NULL, " +
+    "trainer_notification_last_attempt_at = NOW() " +
+    "WHERE member_id = $1 AND week_start = $2",
+    [dbMemberId, weekStart]
+  ).catch(function (e) { console.error("[UGF] markTrainerNotified failed:", e.message); });
+}
+
+function markTrainerNotificationFailed(dbMemberId, weekStart, errorMsg, isSkipped) {
+  var newStatus = isSkipped ? "pending" : "failed";
+  var safeError = String(errorMsg || "unknown").slice(0, 200);
+  db.query(
+    "UPDATE weekly_checkins SET " +
+    "trainer_notification_status = $3, " +
+    "trainer_notification_last_error = $4, " +
+    "trainer_notification_last_attempt_at = NOW() " +
+    "WHERE member_id = $1 AND week_start = $2",
+    [dbMemberId, weekStart, newStatus, safeError]
+  ).catch(function (e) { console.error("[UGF] markTrainerNotificationFailed failed:", e.message); });
+}
+
+// ─── AI check-in analysis ─────────────────────────────────────────────────────
+
+var CHECKIN_ANALYSIS_SYSTEM =
+  "You are the UGF Weekly Check-In Assistant for Ultimate Goals Fitness.\n" +
+  "Review an adult member's current weekly check-in together with their original assessment,\n" +
+  "current workout, goals, limitations, and recent check-in history.\n\n" +
+  "Your job is to help a real UGF trainer quickly understand:\n" +
+  "- adherence,\n- wins,\n- barriers,\n- recovery,\n- pain or safety concerns,\n" +
+  "- meaningful trends,\n- and whether a program review is advisable.\n\n" +
+  "Do not diagnose medical conditions.\n" +
+  "Do not claim medical clearance.\n" +
+  "Do not automatically rewrite or modify the member's workout.\n" +
+  "Do not recommend training through sharp, severe, unusual, or worsening pain.\n" +
+  "Do not guarantee outcomes.\n\n" +
+  "Status rules:\n" +
+  "GREEN: No meaningful safety concern. Recovery acceptable. Program difficulty appropriate. Adherence generally on track.\n" +
+  "YELLOW: Staff review advisable. Examples: recurring discomfort, low recovery, repeated missed workouts, excessive difficulty, requested program change.\n" +
+  "RED: Prompt human follow-up needed. Examples: chest pain, fainting, unexplained severe shortness of breath, severe or worsening pain, acute injury.\n" +
+  "For RED status, the memberReply must tell the member not to continue the concerning activity and to seek appropriate urgent or professional medical guidance.\n\n" +
+  "Return valid JSON only:\n" +
+  "{\"status\":\"green\",\"memberReply\":\"string\",\"trainerSummary\":\"string\",\"wins\":[],\"barriers\":[]," +
+  "\"adherence\":{\"completed\":0,\"planned\":0,\"summary\":\"string\"}," +
+  "\"painFlags\":[],\"recoveryFlags\":[],\"trendNotes\":[],\"suggestedStaffActions\":[]," +
+  "\"programReviewRecommended\":false,\"urgentFollowUpRecommended\":false,\"reason\":\"string\"}\n\n" +
+  "memberReply: concise, supportive, under 130 words, uses member's first name naturally, " +
+  "acknowledges a specific win or difficulty, states clearly when staff review is needed.\n" +
+  "trainerSummary: concise factual summary distinguishing member-reported facts from AI suggestions.\n" +
+  "The trainerSummary must include a disclaimer: 'AI-generated — requires staff review before any program changes.'";
+
+async function analyzeCheckin(opts) {
+  var member = opts.member;
+  var responses = opts.responses;
+  var latestPlan = opts.latestPlan;
+  var profile = opts.profile;
+  var recentCheckins = opts.recentCheckins;
+
+  var client = getOpenAI();
+  var completion = await client.chat.completions.create({
+    model: getModel(),
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: CHECKIN_ANALYSIS_SYSTEM },
+      {
+        role: "user",
+        content: JSON.stringify({
+          member: { firstName: member.firstName, lastName: member.lastName },
+          currentWeekResponses: responses,
+          profile: profile || {},
+          recentCheckins: (recentCheckins || []).slice(0, 6),
+          currentPlanSummary: latestPlan
+            ? latestPlan.slice(0, 2000) + (latestPlan.length > 2000 ? "\n[truncated]" : "")
+            : null,
+        }),
+      },
+    ],
+  });
+
+  return JSON.parse(completion.choices[0].message.content || "{}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Health ───────────────────────────────────────────────────────────────────
+
+app.get("/health", function (_req, res) {
+  res.json({ ok: true });
+});
+
+// ─── POST /verify-member ──────────────────────────────────────────────────────
+//
+// Rate-limited: 10 attempts per 15 minutes per IP.
+//
+// Requires firstName, lastName, AND memberId — all three fields.
+// Returns 400 if any field is missing.
+//
+// Lookup order:
+//   1. Find the GymMaster member by exact Member ID.
+//   2. Verify the provided firstName matches the GymMaster first name exactly.
+//   3. Verify the provided lastName's first character matches the GymMaster last initial.
+//   4. Confirm the member is active and not stop-at-gate.
+//
+// On success, issues a signed verification token (MEMBER_VERIFY_SECRET, 2h TTL)
+// containing the canonical GymMaster member ID and the verified name values.
+// /coach-message and /generate-personalized-workout both require this token.
+
+app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
+  var firstName = (req.body.firstName || "").trim();
+  var lastName  = (req.body.lastName  || "").trim();
+  var memberId  = (req.body.memberId  || "").trim();
+
+  if (!firstName || !lastName || !memberId) {
+    return res.status(400).json({ error: "firstName, lastName, and memberId are required" });
+  }
+
+  try {
+    var response = await fetch(GYMMASTER_BASE + "/members", { headers: gymHeaders() });
+    if (!response.ok) {
+      console.error("[UGF] GymMaster responded with", response.status);
+      return res.status(502).json({ error: "Membership system unavailable" });
+    }
+    var data = await response.json();
+    var list = data.members || data.data || (Array.isArray(data) ? data : []);
+
+    // Step 1: find by exact Member ID — do not search by name.
+    var match = list.find(function (m) {
+      return String(m.id || m.member_id || "").trim() === memberId;
+    });
+
+    if (!match) {
+      return res.json({ found: false, active: false });
+    }
+
+    // Step 2 & 3: verify name against GymMaster "LastInitial, FirstName" format.
+    // Parse without lowercasing so the original GymMaster casing is preserved
+    // for the token. Lowercase copies are used only for the comparison.
+    var parts = String(match.name || "").split(",").map(function (value) { return value.trim(); });
+    var verifiedLastInitial = parts[0] || "";
+    var verifiedFirstName   = parts[1] || "";
+
+    if (
+      verifiedFirstName.toLowerCase() !== firstName.toLowerCase() ||
+      verifiedLastInitial.toLowerCase() !== lastName.slice(0, 1).toLowerCase()
+    ) {
+      return res.json({ found: false, active: false });
+    }
+
+    // Step 4: confirm active, not stop-at-gate.
+    if (!isMemberActive(match)) {
+      return res.json({ found: true, active: false });
+    }
+
+    var canonicalId = String(match.id || match.member_id || "").trim();
+
+    // Token carries GymMaster-confirmed values (firstName, lastInitial) plus the
+    // member-entered full last name (displayLastName). The full last name is not
+    // confirmed by GymMaster — only its first character was verified against
+    // verifiedLastInitial. displayLastName is used for display and staff reports only.
+    var verificationToken = signVerificationToken(canonicalId, verifiedFirstName, verifiedLastInitial, lastName);
+
+    return res.json({
+      found: true,
+      active: true,
+      memberId: canonicalId,
+      verificationToken: verificationToken,
+    });
+  } catch (err) {
+    console.error("[UGF] verify-member error:", err.message);
+    return res.status(500).json({ error: "Verification service error" });
+  }
+});
+
+// ─── AI Coach (conversational assessment) ─────────────────────────────────────
+//
+// Rate-limited: 60 requests per hour per IP.
+// Requires a valid verification token (MEMBER_VERIFY_SECRET).
+// Token supplies the authoritative member name used in the coaching system prompt.
+
+var COACH_SYSTEM =
+  "You are the UGF AI Coach for Ultimate Goals Fitness, a friendly and approachable\n" +
+  "24/7 gym community in the Black Hills of South Dakota.\n" +
+  "You should sound like the favorite coach at the gym: welcoming, practical,\n" +
+  "encouraging, honest, occasionally funny, and easy to talk to.\n" +
+  "You are not a therapist, doctor, lecturer, salesperson, or corporate chatbot.\n\n" +
+  "YOUR PERSONALITY\n" +
+  "- Warm, confident, approachable, and down-to-earth.\n" +
+  "- Use plain conversational English.\n" +
+  "- Sound human, not polished to the point of being robotic.\n" +
+  "- Use the member's first name occasionally, but not in every response.\n" +
+  "- Keep most replies between 30 and 90 words.\n" +
+  "- Ask one main question at a time.\n" +
+  "- Briefly respond to what the member actually said before asking the next question.\n" +
+  "- Use light humor when the member clearly invites it.\n" +
+  "- Never mock, embarrass, shame, or judge the member.\n" +
+  "- Never use crude language unless briefly and harmlessly acknowledging language already used by the member.\n" +
+  "- Do not overexplain.\n" +
+  "- Do not sound like a therapist.\n" +
+  "- Do not repeat the member's exact words unnecessarily.\n\n" +
+  "AVOID ROBOTIC LANGUAGE\n" +
+  "Do not use phrases such as:\n" +
+  "- \"Let's explore this further.\"\n" +
+  "- \"What specific goal would you like to achieve?\"\n" +
+  "- \"Improve your physical condition.\"\n" +
+  "- \"Thank you for sharing.\"\n" +
+  "- \"Based on the information provided.\"\n" +
+  "- \"It sounds like you are seeking...\"\n" +
+  "- \"Can you elaborate?\"\n" +
+  "- \"Perhaps regain some confidence.\"\n\n" +
+  "Replace those with natural coaching language.\n\n" +
+  "HUMOR\n" +
+  "When the member gives a humorous or blunt answer, acknowledge it naturally without turning the conversation into a joke.\n\n" +
+  "EMOTIONAL ANSWERS\n" +
+  "If the member says they are embarrassed, frustrated, afraid of failing, or have quit before:\n" +
+  "- Acknowledge the feeling.\n" +
+  "- Normalize it without minimizing it.\n" +
+  "- Reinforce that beginning the assessment is a useful first step.\n" +
+  "- Ask a practical follow-up question.\n\n" +
+  "CONVERSATION GOALS\n" +
+  "Learn enough about the member to build a genuinely personalized plan:\n" +
+  "- What brought them here today\n" +
+  "- Their main fitness goal\n" +
+  "- The result they hope to see\n" +
+  "- Why that result matters personally\n" +
+  "- Their timeline\n" +
+  "- Previous attempts\n" +
+  "- Barriers to consistency\n" +
+  "- Realistic training days per week\n" +
+  "- Available workout time\n" +
+  "- Exercise experience\n" +
+  "- Activities they enjoy and dislike\n" +
+  "- Daily activity outside the gym\n" +
+  "- Sleep and stress when relevant\n" +
+  "- UGF location and equipment access\n" +
+  "- Pain, injuries, surgeries, restrictions, or relevant medications\n" +
+  "- Confidence level\n\n" +
+  "SAFETY\n" +
+  "- Do not diagnose medical conditions.\n" +
+  "- Do not claim medical clearance.\n" +
+  "- Do not recommend working through sharp, severe, or worsening pain.\n" +
+  "- If the member reports chest pain, fainting, unexplained severe shortness of breath, or another urgent warning sign, stop the assessment and advise appropriate medical attention. Set safetyStop=true.\n\n" +
+  "SUMMARY PHASE\n" +
+  "When enough information has been collected, provide a concise summary beginning with:\n" +
+  "\"Here's what I heard from you:\"\n" +
+  "End by asking: \"Did I get that right, or is there anything you'd like to change before I build your plan?\"\n" +
+  "Only set readyToGenerate to true AFTER the member has explicitly confirmed the summary in a follow-up message. Never set readyToGenerate=true in the same message that presents the summary.\n\n" +
+  "JSON RESPONSE\n" +
+  "Return valid JSON only:\n" +
+  "{\"reply\":\"string\",\"phase\":\"assessment\",\"profile\":{\"primaryGoal\":\"\",\"desiredOutcome\":\"\",\"timeline\":\"\",\"motivation\":\"\",\"barriers\":[],\"daysPerWeek\":\"\",\"sessionLength\":\"\",\"experience\":\"\",\"preferences\":[],\"dislikes\":[],\"outsideActivity\":\"\",\"sleep\":\"\",\"stress\":\"\",\"location\":\"\",\"equipment\":[],\"limitations\":[],\"medicalNotes\":[],\"confidence\":\"\",\"additionalContext\":\"\"},\"readyToGenerate\":false,\"safetyStop\":false}\n" +
+  "Preserve all previously known profile values. Use empty strings or empty arrays for unknown values. Never return Markdown outside the JSON object.";
+
+app.post("/coach-message", coachMessageLimiter, async function (req, res) {
+  // Requires a valid verification token. Token supplies the authoritative name
+  // used in the coaching system prompt — browser-supplied member fields are not used.
+  var verifyPayload = verifyVerificationToken(req, res);
+  if (!verifyPayload) return;
+
+  var tokenFirstName       = verifyPayload.firstName;
+  var tokenDisplayLastName = verifyPayload.displayLastName || "";
+
+  var messages = req.body.messages;
+  var profile  = req.body.profile;
+
+  if (!Array.isArray(messages)) {
+    return res.status(400).json({ error: "messages array is required" });
+  }
+
+  try {
+    var client = getOpenAI();
+    var systemMessages = [
+      { role: "system", content: COACH_SYSTEM },
+      {
+        role: "system",
+        content: "Member: " + tokenFirstName + " " + tokenDisplayLastName +
+          "\nCurrent profile:\n" + JSON.stringify(profile || {}, null, 2),
+      },
+    ];
+
+    var completion = await client.chat.completions.create({
+      model: getModel(),
+      temperature: 0.7,
+      max_tokens: 900,
+      response_format: { type: "json_object" },
+      messages: systemMessages.concat(messages.slice(-30)),
+    });
+
+    var result = JSON.parse(completion.choices[0].message.content || "{}");
+    var reply = result.reply || "Tell me a little more about that.";
+    var isSummaryMessage = reply.toLowerCase().includes("here's what i heard");
+    return res.json({
+      reply: reply,
+      phase: result.phase || "assessment",
+      profile: result.profile || profile || {},
+      readyToGenerate: isSummaryMessage ? false : Boolean(result.readyToGenerate),
+      safetyStop: Boolean(result.safetyStop),
+    });
+  } catch (err) {
+    console.error("[UGF] coach-message error:", err.message);
+    return res.status(500).json({ error: "The coach is temporarily unavailable." });
+  }
+});
+
+// ─── POST /generate-personalized-workout ──────────────────────────────────────
+//
+// Requires a valid verification token (MEMBER_VERIFY_SECRET).
+// Responds 401 for missing, expired, or invalid tokens.
+//
+// The GymMaster member ID and verified name come from the token — browser-supplied
+// values are never used for DB writes or as plan context.
+//
+// The coach_members upsert and coach_plans insert run in a transaction before the
+// response is sent. If the DB save fails, a 500 error is returned — the plan is
+// not returned without a saved history record.
+
+var PLAN_SYSTEM =
+  "You are a certified fitness professional writing a workout plan for an Ultimate Goals Fitness member.\n\n" +
+  "Write like a UGF coach who listened carefully. Be specific, practical, encouraging, and conservative around limitations.\n\n" +
+  "RULES\n" +
+  "- Do not diagnose or claim medical clearance.\n" +
+  "- Do not guarantee outcomes.\n" +
+  "- Do not prescribe through sharp or worsening pain.\n" +
+  "- Nutrition content is general education only, not medical nutrition therapy.\n" +
+  "- Include at least three explicit connections between the member's answers and program design.\n" +
+  "- Match the available days and session length. Include substitutions, effort guidance, and simple progression.\n" +
+  "- Use Markdown.\n\n" +
+  "STRUCTURE\n" +
+  "# [First Name]'s UGF Game Plan\n" +
+  "## What I Heard From You\n" +
+  "## Why This Plan Fits You\n" +
+  "## Your Weekly Schedule\n" +
+  "## Warm-Up\n" +
+  "## Workout Details\n" +
+  "Table per day: | Exercise | Sets | Reps / Time | Rest | Effort | Coaching Cue |\n" +
+  "## Progression for the First Four Weeks\n" +
+  "## Cardio and Daily Movement\n" +
+  "## Recovery\n" +
+  "## General Nutrition Guidance\n" +
+  "## When to Pause and Ask for Help\n" +
+  "Close with a grounded UGF message.";
+
+app.post("/generate-personalized-workout", async function (req, res) {
+  var verifyPayload = verifyVerificationToken(req, res);
+  if (!verifyPayload) return;
+
+  // All identity values come from the token — not from the request body.
+  var gymmasterId      = verifyPayload.sub;
+  var verifiedFirstName  = verifyPayload.firstName;
+  var verifiedLastInitial = verifyPayload.lastInitial || "";
+  var displayLastName  = verifyPayload.displayLastName || "";
+
+  var profile  = req.body.profile;
+  var messages = req.body.messages;
+
+  if (!profile) {
+    return res.status(400).json({ error: "profile is required" });
+  }
+
+  try {
+    var client = getOpenAI();
+    var completion = await client.chat.completions.create({
+      model: getModel(),
+      temperature: 0.45,
+      max_tokens: 4096,
+      messages: [
+        { role: "system", content: PLAN_SYSTEM },
+        {
+          role: "user",
+          content: "Create the plan.\n\nMEMBER\n" +
+            JSON.stringify({ firstName: verifiedFirstName, lastName: displayLastName }, null, 2) +
+            "\n\nPROFILE\n" + JSON.stringify(profile, null, 2) +
+            "\n\nCONVERSATION\n" + JSON.stringify((messages || []).slice(-30), null, 2),
+        },
+      ],
+    });
+
+    var plan = completion.choices[0].message.content;
+    if (!plan) throw new Error("No plan returned from OpenAI");
+
+    // Save to DB before responding. Uses a transaction so that coach_members and
+    // coach_plans are always written together. If the save fails, return an error
+    // rather than returning a plan the member cannot later retrieve.
+    var dbClient = await db.connect();
+    try {
+      await dbClient.query("BEGIN");
+
+      var upsertResult = await dbClient.query(
+        "INSERT INTO coach_members (gymmaster_member_id, first_name, last_name) " +
+        "VALUES ($1, $2, $3) ON CONFLICT (gymmaster_member_id) DO UPDATE SET " +
+        "first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, updated_at = NOW() RETURNING id",
+        [gymmasterId, verifiedFirstName, displayLastName]
+      );
+      var dbMemberId = upsertResult.rows[0] && upsertResult.rows[0].id;
+      if (!dbMemberId) throw new Error("coach_members upsert did not return an id");
+
+      await dbClient.query(
+        "INSERT INTO coach_plans (member_id, profile_json, assessment_messages, plan_markdown) VALUES ($1, $2, $3, $4)",
+        [dbMemberId, JSON.stringify(profile), JSON.stringify((messages || []).slice(-60)), plan]
+      );
+
+      await dbClient.query("COMMIT");
+    } catch (dbErr) {
+      await dbClient.query("ROLLBACK").catch(function () {});
+      console.error("[UGF] Failed to save plan:", dbErr.message);
+      return res.status(500).json({
+        error: "Your plan was generated but could not be saved. Please try again.",
+      });
+    } finally {
+      dbClient.release();
+    }
+
+    return res.json({ plan: plan });
+  } catch (err) {
+    console.error("[UGF] generate-personalized-workout error:", err.message);
+    return res.status(500).json({ error: "Plan generation failed" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEEKLY CHECK-IN SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── POST /weekly-checkin/session ─────────────────────────────────────────────
+// Verifies member via GymMaster Gatekeeper (by Member ID, then name check),
+// upserts coach_members, issues JWT check-in session token.
+
+app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, res) {
+  var firstName = (req.body.firstName || "").trim();
+  var lastName  = (req.body.lastName  || "").trim();
+  var memberId  = (req.body.memberId  || "").trim();
+
+  if (!firstName || !lastName || !memberId) {
+    return res.status(400).json({ error: "firstName, lastName, and memberId are required" });
+  }
+
+  try {
+    var gmRes = await fetch(GYMMASTER_BASE + "/members", { headers: gymHeaders() });
+    if (!gmRes.ok) {
+      console.error("[UGF] GymMaster responded with", gmRes.status);
+      return res.status(502).json({ error: "Membership system unavailable. Please try again shortly." });
+    }
+    var gmData = await gmRes.json();
+    var list = gmData.members || gmData.data || (Array.isArray(gmData) ? gmData : []);
+
+    // Find by exact Member ID first
+    var match = list.find(function (m) {
+      return String(m.id || m.member_id || "").trim() === memberId;
+    });
+
+    if (!match) return res.json({ found: false, active: false });
+
+    // Verify name — GymMaster format "LastInitial, FirstName"
+    var parts = (match.name || "").split(",").map(function (s) { return s.trim(); });
+    var apiLastInitial = (parts[0] || "").toLowerCase();
+    var apiFirstName   = (parts[1] || "").toLowerCase();
+
+    if (
+      apiFirstName !== firstName.toLowerCase() ||
+      apiLastInitial !== lastName.slice(0, 1).toLowerCase()
+    ) {
+      return res.json({ found: false, active: false });
+    }
+
+    if (!isMemberActive(match)) {
+      return res.json({ found: true, active: false });
+    }
+
+    // Upsert coach_members keyed by verified GymMaster ID
+    var upsertResult = await db.query(
+      "INSERT INTO coach_members (gymmaster_member_id, first_name, last_name) " +
+      "VALUES ($1, $2, $3) ON CONFLICT (gymmaster_member_id) DO UPDATE SET " +
+      "first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, updated_at = NOW() RETURNING id",
+      [memberId, firstName, lastName]
+    );
+    var dbMemberId = upsertResult.rows[0].id;
+
+    // Load latest plan for plannedDaysPerWeek
+    var planResult = await db.query(
+      "SELECT profile_json, created_at FROM coach_plans WHERE member_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [dbMemberId]
+    );
+    var latestPlan = planResult.rows[0] || null;
+    var plannedDaysPerWeek = null;
+    if (latestPlan && latestPlan.profile_json) {
+      var profile = typeof latestPlan.profile_json === "string"
+        ? JSON.parse(latestPlan.profile_json)
+        : latestPlan.profile_json;
+      plannedDaysPerWeek = profile.daysPerWeek || null;
+    }
+
+    // Check for existing submission this week (Mountain Time boundary)
+    var weekStart = getWeekStart(new Date());
+    var existingCheckin = await db.query(
+      "SELECT id FROM weekly_checkins WHERE member_id = $1 AND week_start = $2",
+      [dbMemberId, weekStart]
+    );
+
+    var sessionToken = signCheckinSession(dbMemberId, memberId, firstName);
+
+    return res.json({
+      found: true,
+      active: true,
+      sessionToken: sessionToken,
+      firstName: firstName,
+      planDate: latestPlan ? latestPlan.created_at : null,
+      plannedDaysPerWeek: plannedDaysPerWeek,
+      alreadySubmitted: existingCheckin.rows.length > 0,
+      weekStart: weekStart,
+    });
+  } catch (err) {
+    console.error("[UGF] weekly-checkin/session error:", err.message);
+    return res.status(500).json({ error: "Verification service error. Please try again." });
+  }
+});
+
+// ─── GET /weekly-checkin/context ──────────────────────────────────────────────
+// Returns latest plan and recent check-ins for the authenticated member.
+
+app.get("/weekly-checkin/context", async function (req, res) {
+  var payload = verifyCheckinToken(req, res);
+  if (!payload) return;
+
+  var dbMemberId = parseInt(payload.sub, 10);
+  if (!dbMemberId) return res.status(400).json({ error: "Invalid session" });
+
+  try {
+    var planResult = await db.query(
+      "SELECT profile_json, plan_markdown, created_at FROM coach_plans WHERE member_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [dbMemberId]
+    );
+    var plan = planResult.rows[0] || null;
+
+    var checkinResult = await db.query(
+      "SELECT week_start, status, member_reply, responses_json, created_at " +
+      "FROM weekly_checkins WHERE member_id = $1 ORDER BY week_start DESC LIMIT 6",
+      [dbMemberId]
+    );
+
+    return res.json({
+      hasPlan: !!plan,
+      planDate: plan ? plan.created_at : null,
+      profile: plan
+        ? (typeof plan.profile_json === "string" ? JSON.parse(plan.profile_json) : plan.profile_json)
+        : {},
+      recentCheckins: checkinResult.rows,
+    });
+  } catch (err) {
+    console.error("[UGF] weekly-checkin/context error:", err.message);
+    return res.status(500).json({ error: "Could not load check-in context" });
+  }
+});
+
+// ─── POST /weekly-checkin/submit ──────────────────────────────────────────────
+// Validates responses, runs AI analysis, saves to DB (DB-first), fires Zapier
+// non-blocking. A failed webhook never rolls back the check-in record.
+// trainer_notification_attempts is incremented immediately before each webhook.
+
+app.post("/weekly-checkin/submit", checkinSubmitLimiter, async function (req, res) {
+  var payload = verifyCheckinToken(req, res);
+  if (!payload) return;
+
+  var dbMemberId   = parseInt(payload.sub, 10);
+  var gymmasterId  = payload.gm;
+  var firstName    = payload.fn;
+
+  var responses = req.body.responses;
+  if (!responses) return res.status(400).json({ error: "responses is required" });
+
+  var workoutsCompleted = responses.workoutsCompleted;
+  var difficulty        = responses.difficulty;
+  var energy            = responses.energy;
+  var sleep             = responses.sleep;
+  var soreness          = responses.soreness;
+  var physicalConcern   = responses.physicalConcern;
+  var win               = (responses.win || "").trim();
+
+  if (
+    typeof workoutsCompleted !== "number" || workoutsCompleted < 0 ||
+    typeof difficulty        !== "number" || difficulty < 1 || difficulty > 10 ||
+    typeof energy            !== "number" || energy < 1    || energy > 10    ||
+    typeof sleep             !== "number" || sleep < 1     || sleep > 10     ||
+    typeof soreness          !== "number" || soreness < 0  || soreness > 10  ||
+    typeof physicalConcern !== "boolean" ||
+    !win
+  ) {
+    return res.status(400).json({ error: "All required fields must be completed" });
+  }
+
+  if (physicalConcern && !(responses.physicalConcernDetails || "").trim()) {
+    return res.status(400).json({ error: "Please describe the physical concern" });
+  }
+
+  try {
+    var weekStart = getWeekStart(new Date());
+
+    // Prevent duplicate weekly submission
+    var existing = await db.query(
+      "SELECT id FROM weekly_checkins WHERE member_id = $1 AND week_start = $2",
+      [dbMemberId, weekStart]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "You have already submitted a check-in for this week." });
+    }
+
+    var memberResult = await db.query(
+      "SELECT first_name, last_name FROM coach_members WHERE id = $1",
+      [dbMemberId]
+    );
+    var memberRow = memberResult.rows[0];
+    if (!memberRow) return res.status(404).json({ error: "Member not found" });
+
+    var planResult = await db.query(
+      "SELECT profile_json, plan_markdown FROM coach_plans WHERE member_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [dbMemberId]
+    );
+    var planRow = planResult.rows[0] || null;
+
+    var recentResult = await db.query(
+      "SELECT week_start, status, responses_json FROM weekly_checkins WHERE member_id = $1 ORDER BY week_start DESC LIMIT 6",
+      [dbMemberId]
+    );
+
+    // Sanitize and cap all text inputs before storing
+    var safeResponses = {
+      workoutsCompleted: workoutsCompleted,
+      difficulty: difficulty,
+      energy: energy,
+      sleep: sleep,
+      soreness: soreness,
+      physicalConcern: physicalConcern,
+      physicalConcernDetails: physicalConcern
+        ? (responses.physicalConcernDetails || "").slice(0, 1000)
+        : null,
+      win: win.slice(0, 2000),
+      challenge: (responses.challenge || "").trim().slice(0, 2000) || null,
+      requestedAdjustment: (responses.requestedAdjustment || "").trim().slice(0, 2000) || null,
+    };
+
+    var analysis = await analyzeCheckin({
+      member: { firstName: memberRow.first_name, lastName: memberRow.last_name },
+      responses: safeResponses,
+      profile: planRow
+        ? (typeof planRow.profile_json === "string"
+            ? JSON.parse(planRow.profile_json)
+            : planRow.profile_json)
+        : {},
+      latestPlan: planRow ? planRow.plan_markdown : null,
+      recentCheckins: recentResult.rows,
+    });
+
+    var status         = ["green", "yellow", "red"].includes(analysis.status) ? analysis.status : "green";
+    var memberReply    = analysis.memberReply || "Thanks for checking in — your trainer will review this shortly.";
+    var trainerSummary = analysis.trainerSummary || "";
+
+    // DB commit before responding. trainer_notification_status defaults to 'pending'.
+    // A failed webhook never rolls back this record.
+    await db.query(
+      "INSERT INTO weekly_checkins " +
+      "(member_id, week_start, responses_json, ai_analysis_json, member_reply, trainer_summary, status, trainer_notification_status) " +
+      "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+      [
+        dbMemberId, weekStart,
+        JSON.stringify(safeResponses),
+        JSON.stringify(analysis),
+        memberReply, trainerSummary, status,
+      ]
+    );
+
+    // Respond to the member now — webhook fires non-blocking below.
+    res.json({ status: status, memberReply: memberReply });
+
+    // Pre-increment attempt count before the webhook fires, then update
+    // status-only fields after the result is known.
+    var webhookPayload = {
+      type: "trainer_summary",
+      trainerEmail: "staff@ugf.club",
+      memberName: memberRow.first_name + " " + memberRow.last_name,
+      memberId: gymmasterId,
+      weekStart: weekStart,
+      status: status,
+      trainerSummary: trainerSummary,
+      wins: analysis.wins || [],
+      barriers: analysis.barriers || [],
+      adherence: analysis.adherence || { completed: workoutsCompleted, planned: 0, summary: "" },
+      painFlags: analysis.painFlags || [],
+      recoveryFlags: analysis.recoveryFlags || [],
+      trendNotes: analysis.trendNotes || [],
+      suggestedStaffActions: analysis.suggestedStaffActions || [],
+      programReviewRecommended: Boolean(analysis.programReviewRecommended),
+      urgentFollowUpRecommended: Boolean(analysis.urgentFollowUpRecommended),
+    };
+
+    db.query(
+      "UPDATE weekly_checkins SET " +
+      "trainer_notification_attempts = trainer_notification_attempts + 1, " +
+      "trainer_notification_last_attempt_at = NOW() " +
+      "WHERE member_id = $1 AND week_start = $2",
+      [dbMemberId, weekStart]
+    ).then(function () {
+      return sendTrainerSummaryWebhook(webhookPayload);
+    }).then(function (result) {
+      if (result && !result.error && !result.skipped) {
+        markTrainerNotified(dbMemberId, weekStart);
+      } else {
+        markTrainerNotificationFailed(
+          dbMemberId,
+          weekStart,
+          (result && result.error) ? result.error : "webhook_not_configured",
+          !!(result && result.skipped)
+        );
+      }
+    }).catch(function (err) {
+      console.error("[UGF] trainer notification chain error:", err.message);
+    });
+
+  } catch (err) {
+    console.error("[UGF] weekly-checkin/submit error:", err.message);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Could not process your check-in. Please try again." });
+    }
+  }
+});
+
+// ─── POST /admin/send-weekly-checkins ─────────────────────────────────────────
+// Protected by X-Cron-Secret and GYMMASTER_WEEKLY_EMAIL_ENABLED flag.
+// Reverifies all members against GymMaster before sending — skips inactive,
+// missing, blocked, or stop-at-gate members.
+
+app.post("/admin/send-weekly-checkins", async function (req, res) {
+  if (!requireCronSecret(req, res)) return;
+  if (!requireGymMasterEmailEnabled(res)) return;
+
+  var weekStart = getWeekStart(new Date());
+  var attempted = 0, sent = 0, skipped = 0, failed = 0;
+
+  try {
+    // Fetch all GymMaster members once to avoid N individual API calls.
+    var gmAllRes = await fetch(GYMMASTER_BASE + "/members", { headers: gymHeaders() });
+    if (!gmAllRes.ok) {
+      return res.status(502).json({
+        error: "GymMaster unavailable — cannot reverify members before sending. No emails sent.",
+        weekStart: weekStart,
+      });
+    }
+    var gmAllData = await gmAllRes.json();
+    var gmList = gmAllData.members || gmAllData.data || (Array.isArray(gmAllData) ? gmAllData : []);
+
+    // Build a Set of active GymMaster member IDs for O(1) per-member lookup
+    var activeGymMasterIds = new Set();
+    for (var g = 0; g < gmList.length; g++) {
+      if (isMemberActive(gmList[g])) {
+        var gId = String(gmList[g].id || gmList[g].member_id || "").trim();
+        if (gId) activeGymMasterIds.add(gId);
+      }
+    }
+
+    var membersResult = await db.query(
+      "SELECT cm.id, cm.gymmaster_member_id, cm.first_name, cm.last_name " +
+      "FROM coach_members cm " +
+      "WHERE EXISTS (SELECT 1 FROM coach_plans cp WHERE cp.member_id = cm.id)"
+    );
+
+    for (var i = 0; i < membersResult.rows.length; i++) {
+      var member = membersResult.rows[i];
+      attempted++;
+
+      // Skip if not currently active in GymMaster
+      if (!activeGymMasterIds.has(String(member.gymmaster_member_id).trim())) {
+        skipped++;
+        continue;
+      }
+
+      // Skip if already sent this week
+      var alreadySent = await db.query(
+        "SELECT id FROM checkin_email_log WHERE member_id = $1 AND week_start = $2",
+        [member.id, weekStart]
+      );
+      if (alreadySent.rows.length > 0) {
+        skipped++;
+        continue;
+      }
+
+      var deliveryStatus = "failed";
+      var providerResponse = null;
+
+      try {
+        var result = await sendGymMasterWeeklyCheckinEmail({
+          memberId: member.gymmaster_member_id,
+          templateId: process.env.GYMMASTER_WEEKLY_CHECKIN_TEMPLATE_ID,
+        });
+
+        if (result && result.configured === false) {
+          deliveryStatus = "not_configured";
+          providerResponse = { error: result.error };
+          failed++;
+        } else {
+          deliveryStatus = "sent";
+          providerResponse = {};
+          sent++;
+        }
+      } catch (emailErr) {
+        console.error("[UGF] check-in email failed for member " + member.id);
+        providerResponse = { error: emailErr.message.slice(0, 200) };
+        failed++;
+      }
+
+      await db.query(
+        "INSERT INTO checkin_email_log (member_id, week_start, gymmaster_template_id, delivery_status, provider_response, sent_at) " +
+        "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (member_id, week_start) DO NOTHING",
+        [
+          member.id, weekStart,
+          process.env.GYMMASTER_WEEKLY_CHECKIN_TEMPLATE_ID || null,
+          deliveryStatus,
+          JSON.stringify(providerResponse),
+          deliveryStatus === "sent" ? new Date() : null,
+        ]
+      );
+    }
+
+    return res.json({ weekStart, attempted, sent, skipped, failed });
+  } catch (err) {
+    console.error("[UGF] admin/send-weekly-checkins error:", err.message);
+    return res.status(500).json({ error: "Bulk send failed", weekStart, attempted, sent, skipped, failed });
+  }
+});
+
+// ─── POST /admin/test-weekly-checkin-email ────────────────────────────────────
+// Protected by X-Cron-Secret and GYMMASTER_WEEKLY_EMAIL_ENABLED flag.
+
+app.post("/admin/test-weekly-checkin-email", async function (req, res) {
+  if (!requireCronSecret(req, res)) return;
+  if (!requireGymMasterEmailEnabled(res)) return;
+
+  var memberId = (req.body.memberId || "").trim();
+  if (!memberId) return res.status(400).json({ error: "memberId is required" });
+
+  try {
+    var result = await sendGymMasterWeeklyCheckinEmail({
+      memberId: memberId,
+      templateId: process.env.GYMMASTER_WEEKLY_CHECKIN_TEMPLATE_ID,
+    });
+
+    if (result && result.configured === false) {
+      return res.status(503).json({ configured: false, error: result.error });
+    }
+
+    return res.json({ ok: true, memberId: memberId });
+  } catch (err) {
+    console.error("[UGF] admin/test-weekly-checkin-email error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /admin/retry-trainer-notifications ──────────────────────────────────
+// Protected by X-Cron-Secret.
+// Retries Zapier trainer webhooks for check-ins where notification has not
+// succeeded and attempt count is below the maximum.
+// Attempt count is incremented BEFORE each webhook call.
+
+app.post("/admin/retry-trainer-notifications", async function (req, res) {
+  if (!requireCronSecret(req, res)) return;
+
+  var attempted = 0, sent = 0, failed = 0, skipped = 0;
+
+  try {
+    var pending = await db.query(
+      "SELECT wc.id, wc.member_id, wc.week_start, wc.trainer_summary, wc.status, " +
+      "wc.trainer_notification_attempts, wc.ai_analysis_json, " +
+      "cm.gymmaster_member_id, cm.first_name, cm.last_name " +
+      "FROM weekly_checkins wc " +
+      "JOIN coach_members cm ON cm.id = wc.member_id " +
+      "WHERE wc.trainer_notification_status IN ('pending', 'failed') " +
+      "AND wc.trainer_notified_at IS NULL " +
+      "AND wc.trainer_notification_attempts < $1 " +
+      "ORDER BY wc.created_at ASC",
+      [MAX_TRAINER_NOTIFICATION_ATTEMPTS]
+    );
+
+    for (var i = 0; i < pending.rows.length; i++) {
+      var row = pending.rows[i];
+      attempted++;
+
+      var analysis = {};
+      try {
+        analysis = typeof row.ai_analysis_json === "string"
+          ? JSON.parse(row.ai_analysis_json)
+          : (row.ai_analysis_json || {});
+      } catch (e) {}
+
+      var payload = {
+        type: "trainer_summary",
+        trainerEmail: "staff@ugf.club",
+        memberName: row.first_name + " " + row.last_name,
+        memberId: row.gymmaster_member_id,
+        weekStart: row.week_start,
+        status: row.status,
+        trainerSummary: row.trainer_summary || "",
+        wins: analysis.wins || [],
+        barriers: analysis.barriers || [],
+        adherence: analysis.adherence || {},
+        painFlags: analysis.painFlags || [],
+        recoveryFlags: analysis.recoveryFlags || [],
+        trendNotes: analysis.trendNotes || [],
+        suggestedStaffActions: analysis.suggestedStaffActions || [],
+        programReviewRecommended: Boolean(analysis.programReviewRecommended),
+        urgentFollowUpRecommended: Boolean(analysis.urgentFollowUpRecommended),
+      };
+
+      // Increment attempt count BEFORE the webhook fires.
+      await db.query(
+        "UPDATE weekly_checkins SET " +
+        "trainer_notification_attempts = trainer_notification_attempts + 1, " +
+        "trainer_notification_last_attempt_at = NOW() " +
+        "WHERE id = $1",
+        [row.id]
+      );
+
+      var webhookResult = await sendTrainerSummaryWebhook(payload);
+
+      if (webhookResult && !webhookResult.error && !webhookResult.skipped) {
+        // Success: update status only (attempt already incremented above)
+        await db.query(
+          "UPDATE weekly_checkins SET " +
+          "trainer_notified_at = NOW(), " +
+          "trainer_notification_status = 'sent', " +
+          "trainer_notification_last_error = NULL " +
+          "WHERE id = $1",
+          [row.id]
+        );
+        sent++;
+      } else {
+        var errMsg = (webhookResult && webhookResult.error)
+          ? String(webhookResult.error).slice(0, 200)
+          : (webhookResult && webhookResult.skipped ? "webhook_not_configured" : "unknown_error");
+        var newStatus = (webhookResult && webhookResult.skipped) ? "pending" : "failed";
+        // Failure: update status only (attempt already incremented above)
+        await db.query(
+          "UPDATE weekly_checkins SET " +
+          "trainer_notification_status = $2, " +
+          "trainer_notification_last_error = $3 " +
+          "WHERE id = $1",
+          [row.id, newStatus, errMsg]
+        );
+        failed++;
+      }
+    }
+
+    // Count records that have exhausted max attempts
+    var exhausted = await db.query(
+      "SELECT COUNT(*) AS count FROM weekly_checkins " +
+      "WHERE trainer_notification_status IN ('pending', 'failed') " +
+      "AND trainer_notified_at IS NULL " +
+      "AND trainer_notification_attempts >= $1",
+      [MAX_TRAINER_NOTIFICATION_ATTEMPTS]
+    );
+    skipped = parseInt(exhausted.rows[0].count, 10) || 0;
+
+    return res.json({ attempted, sent, failed, skipped });
+  } catch (err) {
+    console.error("[UGF] admin/retry-trainer-notifications error:", err.message);
+    return res.status(500).json({ error: "Retry failed", attempted, sent, failed, skipped });
+  }
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+var PORT = process.env.PORT || 3001;
+app.listen(PORT, function () {
+  console.log("UGF backend running on port " + PORT);
+});
