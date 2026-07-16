@@ -5,6 +5,15 @@ var jwt = require("jsonwebtoken");
 var rateLimit = require("express-rate-limit");
 var { Pool } = require("pg");
 var OpenAI = require("openai");
+var {
+  createStaffAuthenticator,
+  createStaffOriginGuard,
+  loadStaffAuthConfiguration,
+} = require("./src/auth/clerk-staff-auth");
+var { createStaffAuthorization } = require("./src/auth/staff-authorization");
+var { goalsCoachErrorHandler } = require("./src/goals-coach/http-error-handler");
+var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
+var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
 
 var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
@@ -14,7 +23,13 @@ app.use(express.json());
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
-app.use(cors({
+// Staff browser traffic uses a separate exact-origin policy. This guard is
+// intentionally mounted before the existing member CORS middleware so the
+// broader member policy never authorizes a staff route.
+var staffAuthConfiguration = loadStaffAuthConfiguration();
+app.use("/staff", createStaffOriginGuard(staffAuthConfiguration));
+
+var memberCors = cors({
   origin: function (origin, callback) {
     var allowed = [
       "https://ultimate-goals-fitness.sintra.site",
@@ -32,7 +47,12 @@ app.use(cors({
       callback(new Error("CORS blocked: " + origin));
     }
   },
-}));
+});
+
+app.use(function (req, res, next) {
+  if (req.path === "/staff" || req.path.startsWith("/staff/")) return next();
+  return memberCors(req, res, next);
+});
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 
@@ -1380,6 +1400,37 @@ app.post("/admin/retry-trainer-notifications", async function (req, res) {
     return res.status(500).json({ error: "Retry failed", attempted, sent, failed, skipped });
   }
 });
+
+// ─── Goals Coach Phase 2 storage and staff-review foundation ─────────────────
+
+function requireGoalsCoachMember(req, res, next) {
+  var claims = verifyVerificationToken(req, res);
+  if (!claims) return;
+  req.memberClaims = claims;
+  return next();
+}
+
+var staffAuthorization = createStaffAuthorization({ db: db });
+
+app.use(
+  "/goals-coach",
+  createGoalsCoachMemberRouter({
+    db: db,
+    requireMember: requireGoalsCoachMember,
+  })
+);
+
+app.use(
+  "/staff",
+  createStaffAuthenticator({ configuration: staffAuthConfiguration }),
+  staffAuthorization.loadActiveStaff,
+  createGoalsCoachStaffRouter({
+    db: db,
+    requireAdmin: staffAuthorization.requireAdmin,
+  })
+);
+
+app.use(goalsCoachErrorHandler);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
