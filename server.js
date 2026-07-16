@@ -873,7 +873,7 @@ app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, 
   }
 
   try {
-    var gmRes = await fetch(GYMMASTER_BASE + "/members", { headers: gymHeaders() });
+    var gmRes = await fetch(GYMMASTER_BASE + "/members?memberid=" + encodeURIComponent(memberId), { headers: gymHeaders() });
     if (!gmRes.ok) {
       console.error("[UGF] GymMaster responded with", gmRes.status);
       return res.status(502).json({ error: "Membership system unavailable. Please try again shortly." });

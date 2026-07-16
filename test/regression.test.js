@@ -67,3 +67,14 @@ test("weekly check-in member lookup supports GymMaster memberid", () => {
   );
 });
 
+
+test("weekly check-in queries GymMaster by member ID", () => {
+  const start = serverSource.indexOf('app.post("/weekly-checkin/session"');
+  const end = serverSource.indexOf('app.get("/weekly-checkin/context"');
+  const weeklySessionSource = serverSource.slice(start, end);
+
+  assert.match(
+    weeklySessionSource,
+    /GYMMASTER_BASE \+ "\/members\?memberid=" \+ encodeURIComponent\(memberId\)/
+  );
+});
