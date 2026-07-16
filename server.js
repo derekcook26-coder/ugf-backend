@@ -446,12 +446,20 @@ app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
     var data = await response.json();
     var list = data.members || data.data || (Array.isArray(data) ? data : []);
 
+    // TEMPORARY: log privacy-safe reason codes only. Never log member-entered
+    // values, GymMaster field values, tokens, credentials, or full records.
+    if (!Array.isArray(list)) {
+      console.warn("[UGF] verify-member diagnostic: unexpected_member_list_shape");
+      throw new Error("Unexpected GymMaster member list shape");
+    }
+
     // Step 1: find by exact Member ID — do not search by name.
     var match = list.find(function (m) {
       return String(m.id || m.member_id || "").trim() === memberId;
     });
 
     if (!match) {
+      console.warn("[UGF] verify-member diagnostic: member_id_not_found");
       return res.json({ found: false, active: false });
     }
 
@@ -466,11 +474,24 @@ app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
       verifiedFirstName.toLowerCase() !== firstName.toLowerCase() ||
       verifiedLastInitial.toLowerCase() !== lastName.slice(0, 1).toLowerCase()
     ) {
+      console.warn("[UGF] verify-member diagnostic: name_mismatch");
       return res.json({ found: false, active: false });
     }
 
     // Step 4: confirm active, not stop-at-gate.
     if (!isMemberActive(match)) {
+      var diagnosticMemberships = match.membership || match.memberships;
+      var diagnosticReason = match.stopatgate
+        ? (typeof match.stopatgate === "boolean"
+            ? "stopatgate_or_blocked_status"
+            : "unexpected_stopatgate_data_shape")
+        : (!Array.isArray(diagnosticMemberships) ||
+            diagnosticMemberships.some(function (membership) {
+              return !membership || typeof membership.expired !== "boolean";
+            })
+            ? "unexpected_membership_data_shape"
+            : "active_membership_check_failed");
+      console.warn("[UGF] verify-member diagnostic: " + diagnosticReason);
       return res.json({ found: true, active: false });
     }
 
