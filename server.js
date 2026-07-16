@@ -883,7 +883,7 @@ app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, 
 
     // Find by exact Member ID first
     var match = list.find(function (m) {
-      return String(m.id || m.member_id || "").trim() === memberId;
+      return String(m.memberid || m.id || m.member_id || "").trim() === memberId;
     });
 
     if (!match) return res.json({ found: false, active: false });
@@ -1438,3 +1438,4 @@ var PORT = process.env.PORT || 3001;
 app.listen(PORT, function () {
   console.log("UGF backend running on port " + PORT);
 });
+

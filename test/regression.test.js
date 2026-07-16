@@ -55,3 +55,15 @@ test("Phase 2 uses no required Clerk audience variable", () => {
   assert.equal(authSource.includes("CLERK_JWT_AUDIENCE"), false);
   assert.equal(authSource.includes("audience:"), false);
 });
+
+test("weekly check-in member lookup supports GymMaster memberid", () => {
+  const start = serverSource.indexOf('app.post("/weekly-checkin/session"');
+  const end = serverSource.indexOf('app.get("/weekly-checkin/context"');
+  const weeklySessionSource = serverSource.slice(start, end);
+
+  assert.match(
+    weeklySessionSource,
+    /String\(m\.memberid \|\| m\.id \|\| m\.member_id \|\| ""\)\.trim\(\) === memberId/
+  );
+});
+
