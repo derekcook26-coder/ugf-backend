@@ -7,6 +7,9 @@ var { Pool } = require("pg");
 var OpenAI = require("openai");
 
 var app = express();
+// Railway routes public requests through one edge proxy. Trust that single hop
+// so Express exposes the client address to express-rate-limit.
+app.set("trust proxy", 1);
 app.use(express.json());
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -438,7 +441,10 @@ app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
   }
 
   try {
-    var response = await fetch(GYMMASTER_BASE + "/members", { headers: gymHeaders() });
+    var response = await fetch(
+      GYMMASTER_BASE + "/members?memberid=" + encodeURIComponent(memberId),
+      { headers: gymHeaders() }
+    );
     if (!response.ok) {
       console.error("[UGF] GymMaster responded with", response.status);
       return res.status(502).json({ error: "Membership system unavailable" });
@@ -455,7 +461,7 @@ app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
 
     // Step 1: find by exact Member ID — do not search by name.
     var match = list.find(function (m) {
-      return String(m.id || m.member_id || "").trim() === memberId;
+      return String(m.memberid || m.id || m.member_id || "").trim() === memberId;
     });
 
     if (!match) {
@@ -495,7 +501,7 @@ app.post("/verify-member", verifyMemberLimiter, async function (req, res) {
       return res.json({ found: true, active: false });
     }
 
-    var canonicalId = String(match.id || match.member_id || "").trim();
+    var canonicalId = String(match.memberid || match.id || match.member_id || "").trim();
 
     // Token carries GymMaster-confirmed values (firstName, lastInitial) plus the
     // member-entered full last name (displayLastName). The full last name is not
