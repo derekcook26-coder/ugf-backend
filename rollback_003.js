@@ -35,7 +35,7 @@ async function runRollback(options = {}) {
     }
 
     const applied = await client.query(
-      "SELECT applied_at FROM app_schema_migrations WHERE version = $1",
+      "SELECT 1 FROM app_schema_migrations WHERE version = $1",
       [MIGRATION_VERSION]
     );
     if (!applied.rows.length) {
@@ -44,8 +44,15 @@ async function runRollback(options = {}) {
     }
 
     const later = await client.query(
-      "SELECT version FROM app_schema_migrations WHERE applied_at > $1 ORDER BY applied_at LIMIT 1",
-      [applied.rows[0].applied_at]
+      `SELECT candidate.version
+       FROM app_schema_migrations AS current
+       JOIN app_schema_migrations AS candidate
+         ON candidate.version <> current.version
+        AND candidate.applied_at > current.applied_at
+       WHERE current.version = $1
+       ORDER BY candidate.applied_at, candidate.version
+       LIMIT 1`,
+      [MIGRATION_VERSION]
     );
     if (later.rows.length) {
       throw new Error(`Cannot roll back migration 003 while later migration ${later.rows[0].version} is applied`);

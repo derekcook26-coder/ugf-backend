@@ -36,13 +36,21 @@ jobs:
           test "$(id -u)" -ne 0
           node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major !== 20 || minor < 9) process.exit(1)"
 
-      - name: Clean dependency installation and syntax checks
+      - name: Clean dependency installation
         shell: bash
         run: |
           set -euo pipefail
           npm ci
-          node --check server.js
-          npm run check
+
+      - name: Run focused rollback and migration-order tests first
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 test/migration-003.test.js | tee phase1a-rollback.tap
+          grep -Fx "# tests 5" phase1a-rollback.tap
+          grep -Fx "# pass 5" phase1a-rollback.tap
+          grep -Fx "# fail 0" phase1a-rollback.tap
+          grep -Fx "# skipped 0" phase1a-rollback.tap
 
       - name: Run the four real PostgreSQL concurrency tests first
         shell: bash
@@ -62,12 +70,20 @@ jobs:
           grep -Fx "# fail 0" phase1a-full-suite.tap
           grep -Fx "# skipped 0" phase1a-full-suite.tap
 
+      - name: Run JavaScript syntax and repository checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          npm run check
+
       - name: Preserve validation output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: goals-coach-phase1a-validation-output
           path: |
+            phase1a-rollback.tap
             phase1a-concurrency.tap
             phase1a-full-suite.tap
           if-no-files-found: warn

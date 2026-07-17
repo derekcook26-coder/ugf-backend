@@ -175,3 +175,54 @@ test("migration 003 refuses a changed checksum and rollback refuses later migrat
     /Cannot roll back migration 003 while later migration 004_synthetic_later is applied/
   );
 });
+
+test("migration 003 rollback preserves PostgreSQL microsecond ordering without JavaScript Date precision", async (t) => {
+  const selfOnly = await createDisposableDatabase({ phase1a: true });
+  t.after(() => selfOnly.close());
+  await selfOnly.pool.query(
+    `UPDATE app_schema_migrations
+     SET applied_at = CASE version
+       WHEN '002_goals_coaching_foundation' THEN TIMESTAMPTZ '2026-07-17 11:59:59+00'
+       WHEN '003_goals_coach_alpha_foundation' THEN TIMESTAMPTZ '2026-07-17 12:00:00.000100+00'
+     END
+     WHERE version IN ('002_goals_coaching_foundation', '003_goals_coach_alpha_foundation')`
+  );
+  const roundedSelf = await selfOnly.pool.query(
+    "SELECT applied_at FROM app_schema_migrations WHERE version = '003_goals_coach_alpha_foundation'"
+  );
+  assert.equal(roundedSelf.rows[0].applied_at.getUTCMilliseconds(), 0);
+  assert.equal(
+    (await runRollback({ pool: selfOnly.pool, skipConfirmation: true })).status,
+    "rolled_back"
+  );
+
+  const withLater = await createDisposableDatabase({ phase1a: true });
+  t.after(() => withLater.close());
+  await withLater.pool.query(
+    `UPDATE app_schema_migrations
+     SET applied_at = CASE version
+       WHEN '002_goals_coaching_foundation' THEN TIMESTAMPTZ '2026-07-17 11:59:59+00'
+       WHEN '003_goals_coach_alpha_foundation' THEN TIMESTAMPTZ '2026-07-17 12:00:00.000100+00'
+     END
+     WHERE version IN ('002_goals_coaching_foundation', '003_goals_coach_alpha_foundation')`
+  );
+  await withLater.pool.query(
+    `INSERT INTO app_schema_migrations (version, checksum, applied_at)
+     VALUES (
+       '004_microsecond_later',
+       'synthetic',
+       TIMESTAMPTZ '2026-07-17 12:00:00.000900+00'
+     )`
+  );
+  const rounded = await withLater.pool.query(
+    `SELECT version, applied_at
+     FROM app_schema_migrations
+     WHERE version IN ('003_goals_coach_alpha_foundation', '004_microsecond_later')
+     ORDER BY version`
+  );
+  assert.equal(rounded.rows[0].applied_at.getTime(), rounded.rows[1].applied_at.getTime());
+  await assert.rejects(
+    runRollback({ pool: withLater.pool, skipConfirmation: true }),
+    /Cannot roll back migration 003 while later migration 004_microsecond_later is applied/
+  );
+});
