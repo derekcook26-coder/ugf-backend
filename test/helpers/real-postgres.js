@@ -5,6 +5,7 @@ const path = require("path");
 const EmbeddedPostgres = require("embedded-postgres").default;
 const { Pool } = require("pg");
 const { runMigration } = require("../../migrate_002");
+const { runMigration: runPhase1aMigration } = require("../../migrate_003");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
@@ -50,6 +51,7 @@ async function createRealDisposablePostgres() {
   );
   await pool.query(migration001);
   await runMigration({ pool });
+  await runPhase1aMigration({ pool });
   return {
     pool,
     async close() {

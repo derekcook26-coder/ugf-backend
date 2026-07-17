@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { createGoalsCoachService } = require("../src/goals-coach/service");
+const { runRollback: runPhase1aRollback } = require("../rollback_003");
 const { seedMemberAndPlan, seedStaff } = require("./helpers/disposable-db");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 
@@ -40,6 +41,8 @@ async function seedUnassignedReview(pool, seeded) {
 test("simultaneous session creation returns one active conversation to both callers", { skip: skipForRoot }, async (t) => {
   const disposable = await createRealDisposablePostgres();
   t.after(() => disposable.close());
+  const version = await disposable.pool.query("SHOW server_version");
+  assert.match(version.rows[0].server_version, /^16\./);
   const seeded = await seedMemberAndPlan(disposable.pool, "real-session-race");
   const service = createGoalsCoachService({ db: disposable.pool });
   const [first, second] = await Promise.all([
@@ -53,6 +56,12 @@ test("simultaneous session creation returns one active conversation to both call
     [seeded.member.id, seeded.plan.id]
   );
   assert.equal(count.rows[0].count, 1);
+  const rolledBack = await runPhase1aRollback({ pool: disposable.pool, skipConfirmation: true });
+  assert.equal(rolledBack.status, "rolled_back");
+  assert.equal((await disposable.pool.query(
+    "SELECT COUNT(*)::int AS count FROM coaching_conversations WHERE id = $1",
+    [first.conversation.id]
+  )).rows[0].count, 1);
 });
 
 test("concurrent duplicate staff messages store one message and one review event", { skip: skipForRoot }, async (t) => {

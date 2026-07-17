@@ -3,6 +3,7 @@ function goalsCoachErrorHandler(error, req, res, next) {
   if (
     !(req.path === "/staff" || req.path.startsWith("/staff/"))
     && !(req.path === "/goals-coach" || req.path.startsWith("/goals-coach/"))
+    && !(req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/"))
   ) {
     return next(error);
   }
@@ -14,6 +15,9 @@ function goalsCoachErrorHandler(error, req, res, next) {
     return res.status(409).json({ error: "CONFLICT" });
   }
   if (error && error.code === "23514") {
+    if (error.constraint === "goals_coach_alpha_consent_events_append_only") {
+      return res.status(409).json({ error: "ALPHA_CONSENT_HISTORY_IMMUTABLE" });
+    }
     if (error.constraint === "member_coach_assignments_open_review_guard") {
       return res.status(409).json({ error: "REVIEW_REASSIGNMENT_REQUIRED" });
     }

@@ -10,7 +10,10 @@
     "check": "node scripts/check-javascript.js",
     "migrate:phase2": "node migrate_002.js",
     "rollback:phase2": "node rollback_002.js",
-    "provision:staff": "node scripts/provision-staff-user.js"
+    "migrate:phase1a": "node migrate_003.js",
+    "rollback:phase1a": "node rollback_003.js",
+    "provision:staff": "node scripts/provision-staff-user.js",
+    "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },
   "dependencies": {
     "@clerk/express": "^2.1.42",

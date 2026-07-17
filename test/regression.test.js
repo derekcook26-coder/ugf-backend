@@ -38,12 +38,17 @@ test("existing weekly check-ins, cron protection, Zapier, and GymMaster email sa
 
 test("production startup never imports the test-only responder", () => {
   assert.equal(serverSource.includes("fake-goals-coach-responder"), false);
+  assert.equal(serverSource.includes("deterministic-alpha-responder"), false);
+  assert.equal(serverSource.includes("test/helpers"), false);
   const productionFiles = [
     path.join(projectRoot, "src", "goals-coach", "member-routes.js"),
     path.join(projectRoot, "src", "goals-coach", "service.js"),
+    path.join(projectRoot, "src", "goals-coach", "alpha-routes.js"),
+    path.join(projectRoot, "src", "goals-coach", "alpha-service.js"),
   ];
   for (const file of productionFiles) {
     assert.equal(fs.readFileSync(file, "utf8").includes("fake-goals-coach-responder"), false);
+    assert.equal(fs.readFileSync(file, "utf8").includes("deterministic-alpha-responder"), false);
   }
 });
 
