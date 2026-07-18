@@ -10,8 +10,20 @@ var {
   createStaffOriginGuard,
   loadStaffAuthConfiguration,
 } = require("./src/auth/clerk-staff-auth");
+var {
+  createAlphaMemberAuthenticator,
+  createAlphaOriginGuard,
+  loadAlphaAuthConfiguration,
+} = require("./src/auth/clerk-alpha-member-auth");
+var { createAlphaMemberAuthorization } = require("./src/auth/alpha-member-authorization");
 var { createStaffAuthorization } = require("./src/auth/staff-authorization");
 var { goalsCoachErrorHandler } = require("./src/goals-coach/http-error-handler");
+var {
+  createAlphaFeatureGate,
+  loadAlphaApplicationConfiguration,
+} = require("./src/goals-coach/alpha-config");
+var { createAlphaGoalsCoachRouter } = require("./src/goals-coach/alpha-routes");
+var { createPhase1bStartup } = require("./src/goals-coach/phase1b-startup");
 var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
 var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
 
@@ -28,6 +40,16 @@ app.use(express.json());
 // broader member policy never authorizes a staff route.
 var staffAuthConfiguration = loadStaffAuthConfiguration();
 app.use("/staff", createStaffOriginGuard(staffAuthConfiguration));
+
+// The private owner alpha has its own exact-origin boundary. It does not inherit
+// the public-member or staff allowlists.
+var alphaAuthConfiguration = loadAlphaAuthConfiguration();
+var alphaApplicationConfiguration = loadAlphaApplicationConfiguration();
+// Phase 1B has no default live provider adapter. Configuration may be prepared,
+// but coaching remains unavailable unless an approved provider is explicitly
+// supplied to the startup composition in a separately authorized release.
+var phase1bStartup = createPhase1bStartup();
+app.use("/alpha/goals-coach", createAlphaOriginGuard(alphaAuthConfiguration));
 
 var memberCors = cors({
   origin: function (origin, callback) {
@@ -51,6 +73,7 @@ var memberCors = cors({
 
 app.use(function (req, res, next) {
   if (req.path === "/staff" || req.path.startsWith("/staff/")) return next();
+  if (req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/")) return next();
   return memberCors(req, res, next);
 });
 
@@ -1642,6 +1665,23 @@ function requireGoalsCoachMember(req, res, next) {
 }
 
 var staffAuthorization = createStaffAuthorization({ db: db });
+var alphaMemberAuthorization = createAlphaMemberAuthorization({
+  db: db,
+  applicationConfiguration: alphaApplicationConfiguration,
+});
+
+app.use(
+  "/alpha/goals-coach",
+  createAlphaFeatureGate(),
+  createAlphaMemberAuthenticator({ configuration: alphaAuthConfiguration }),
+  alphaMemberAuthorization.loadActiveAlphaMember,
+  createAlphaGoalsCoachRouter({
+    db: db,
+    applicationConfiguration: alphaApplicationConfiguration,
+    requireCurrentConsent: alphaMemberAuthorization.requireCurrentAlphaConsent,
+    coachingEngine: phase1bStartup.engine,
+  })
+);
 
 app.use(
   "/goals-coach",
