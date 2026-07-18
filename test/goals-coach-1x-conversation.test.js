@@ -40,6 +40,10 @@ const coachRoute = sourceBetween(
   'app.post("/coach-message"',
   "// ─── POST /generate-personalized-workout"
 );
+const planRoute = sourceBetween(
+  'app.post("/generate-personalized-workout"',
+  "// ═══════════════════════════════════════════════════════════════════════════════"
+);
 const planPrompt = evaluateAssignment(
   "PLAN_SYSTEM",
   '\n\napp.post("/generate-personalized-workout"'
@@ -155,6 +159,103 @@ test("1.0 safety stop overrides contradictory summary output", () => {
   assert.equal(response.readyToGenerate, false);
   assert.equal(response.safetyStop, true);
   assert.match(helperSource, /isSummaryMessage = !safetyStop && phase === "summary"/);
+});
+
+test("1.0 current back pain transcript forces a persistent safety stop", () => {
+  const messages = [
+    {
+      role: "user",
+      content: "My back has been stiff and sometimes it has sharp pains.",
+    },
+    {
+      role: "assistant",
+      content: "Do you have a recent surgery or restriction?",
+    },
+    {
+      role: "user",
+      content: "My lower back is stiff, and I am concerned about further injury through bending and lifting.",
+    },
+    {
+      role: "user",
+      content: "No recent surgery.",
+    },
+  ];
+  const safetyState = helperContext.getGoalsCoachSafetyState(
+    messages,
+    { movementReviewLevel: "modify_and_monitor" },
+    false
+  );
+
+  assert.equal(safetyState.active, true);
+  assert.ok(safetyState.reasons.includes("current pain"));
+  assert.ok(safetyState.reasons.includes("current injury concern"));
+  assert.ok(safetyState.reasons.includes("unresolved safety concern"));
+  assert.equal(safetyState.reasons.includes("recent surgery"), false);
+
+  const response = helperContext.finalizeGoalsCoachResponse(
+    {
+      reply: "Here is your summary.",
+      phase: "summary",
+      readyToGenerate: true,
+      safetyStop: false,
+    },
+    {},
+    safetyState
+  );
+
+  assert.equal(response.reply, helperContext.GOALS_COACH_SAFETY_REPLY);
+  assert.equal(response.reply.includes(summaryEnding), false);
+  assert.equal(response.phase, "assessment");
+  assert.equal(response.readyToGenerate, false);
+  assert.equal(response.safetyStop, true);
+  assert.match(response.reply, /contact UGF staff and an appropriate healthcare professional/i);
+
+  const guardIndex = coachRoute.indexOf("if (requestSafetyState.active)");
+  const modelIndex = coachRoute.indexOf("var client = getOpenAI()");
+  assert.notEqual(guardIndex, -1);
+  assert.ok(guardIndex < modelIndex);
+  assert.match(coachRoute, /getGoalsCoachSafetyState\(messages, profile, req\.body\.safetyStop\)/);
+});
+
+test("1.0 historical injury alone remains non-blocking", () => {
+  const safetyState = helperContext.getGoalsCoachSafetyState(
+    [{ role: "user", content: "I injured my knee ten years ago and fully recovered." }],
+    {},
+    false
+  );
+
+  assert.equal(safetyState.active, false);
+  assert.deepEqual(Array.from(safetyState.reasons), []);
+});
+
+test("1.0 explicit current-safety denials remain non-blocking", () => {
+  const safetyState = helperContext.getGoalsCoachSafetyState(
+    [{
+      role: "user",
+      content: "I don't currently have any pain. I don't have any concerning symptoms. " +
+        "I don't have a current injury. I haven't had a recent surgery. " +
+        "I don't have any medical restrictions. I don't have any safety concerns.",
+    }],
+    {},
+    false
+  );
+
+  assert.equal(safetyState.active, false);
+  assert.deepEqual(Array.from(safetyState.reasons), []);
+});
+
+test("1.0 workout generation rechecks safety before model or database work", () => {
+  const guardIndex = planRoute.indexOf("if (planSafetyState.active)");
+  const modelIndex = planRoute.indexOf("var client = getOpenAI()");
+  const databaseIndex = planRoute.indexOf("var dbClient = await db.connect()");
+
+  assert.notEqual(guardIndex, -1);
+  assert.ok(guardIndex < modelIndex);
+  assert.ok(guardIndex < databaseIndex);
+  assert.match(planRoute, /getGoalsCoachSafetyState\(messages, profile, req\.body\.safetyStop\)/);
+  assert.match(planRoute, /res\.status\(409\)\.json/);
+  assert.match(planRoute, /readyToGenerate: false/);
+  assert.match(planRoute, /safetyStop: true/);
 });
 
 test("1.0 normal and corrected summaries keep the approved ending", () => {
