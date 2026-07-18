@@ -92,6 +92,38 @@ test("1.0 follow-ups are limited to material programming decisions", () => {
   assert.doesNotMatch(coachPrompt, /every normal coaching response must/i);
 });
 
+test("1.0 requires explicit safety-screen completion before summary or plan readiness", () => {
+  assert.match(
+    coachPrompt,
+    /Before any normal summary or\s+readyToGenerate=true, you MUST establish from the member's own words the presence or absence/i
+  );
+
+  for (const concern of [
+    "pain or concerning symptoms",
+    "an injury",
+    "a recent surgery",
+    "a medical or exercise restriction",
+    "another safety concern that could affect training",
+  ]) {
+    assert.match(coachPrompt, new RegExp(concern, "i"));
+  }
+
+  assert.match(coachPrompt, /The member may provide this information voluntarily/);
+  assert.match(coachPrompt, /do not\s+ask them to repeat any category already established/i);
+  assert.match(coachPrompt, /If any category remains unresolved, ask\s+ONE concise safety-screening question/i);
+  assert.match(coachPrompt, /Silence is not safety clearance/);
+  assert.match(coachPrompt, /five-answer target\s+never overrides unresolved safety screening/i);
+  assert.match(coachPrompt, /does not require the long movement questionnaire/i);
+  assert.match(
+    coachPrompt,
+    /Do not enter the normal summary phase or set readyToGenerate=true until the required pre-summary\s+safety screen is complete/i
+  );
+
+  assert.match(coachRoute, /Required safety screening must be established from the member's own words/);
+  assert.match(coachRoute, /silence and empty or default profile fields are not safety clearance/);
+  assert.match(coachRoute, /five-answer target cannot override unresolved safety screening/);
+});
+
 test("1.0 safety stop overrides contradictory summary output", () => {
   const safetyReply =
     "Call 911 now for urgent medical attention. Here's what I heard from you:";
