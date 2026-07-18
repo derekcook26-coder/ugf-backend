@@ -12,6 +12,8 @@
     "rollback:phase2": "node rollback_002.js",
     "migrate:phase1a": "node migrate_003.js",
     "rollback:phase1a": "node rollback_003.js",
+    "migrate:phase1b": "node migrate_004.js",
+    "rollback:phase1b": "node rollback_004.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },

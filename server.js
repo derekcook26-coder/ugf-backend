@@ -23,6 +23,7 @@ var {
   loadAlphaApplicationConfiguration,
 } = require("./src/goals-coach/alpha-config");
 var { createAlphaGoalsCoachRouter } = require("./src/goals-coach/alpha-routes");
+var { createPhase1bStartup } = require("./src/goals-coach/phase1b-startup");
 var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
 var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
 
@@ -44,6 +45,10 @@ app.use("/staff", createStaffOriginGuard(staffAuthConfiguration));
 // the public-member or staff allowlists.
 var alphaAuthConfiguration = loadAlphaAuthConfiguration();
 var alphaApplicationConfiguration = loadAlphaApplicationConfiguration();
+// Phase 1B has no default live provider adapter. Configuration may be prepared,
+// but coaching remains unavailable unless an approved provider is explicitly
+// supplied to the startup composition in a separately authorized release.
+var phase1bStartup = createPhase1bStartup();
 app.use("/alpha/goals-coach", createAlphaOriginGuard(alphaAuthConfiguration));
 
 var memberCors = cors({
@@ -1443,6 +1448,7 @@ app.use(
     db: db,
     applicationConfiguration: alphaApplicationConfiguration,
     requireCurrentConsent: alphaMemberAuthorization.requireCurrentAlphaConsent,
+    coachingEngine: phase1bStartup.engine,
   })
 );
 
