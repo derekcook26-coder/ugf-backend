@@ -1,17 +1,15 @@
 const crypto = require("crypto");
 const { buildCoachingContext, serializeWorkoutSession } = require("./coaching-context");
+const {
+  RETRYABLE_FAILURE_CATEGORIES,
+  loadCompletedTurnResult,
+  serializeCoachMessage,
+} = require("./phase1b-contracts");
 const { conflict, notFound, withTransaction } = require("./repository");
 const { applyWorkoutTransition } = require("./workout-state");
 
 const COACHING_UNAVAILABLE_MESSAGE =
   "Goals Coach is temporarily unavailable. Your conversation is saved, but I can’t safely generate the next coaching step right now.";
-
-const PROVIDER_FAILURE_CATEGORIES = new Set([
-  "provider_error",
-  "provider_timeout",
-  "malformed_provider_response",
-  "invalid_structured_output",
-]);
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -34,7 +32,7 @@ function unavailableError(failureCategory) {
 }
 
 function storedFailureError(failureCategory) {
-  if (PROVIDER_FAILURE_CATEGORIES.has(failureCategory)) {
+  if (RETRYABLE_FAILURE_CATEGORIES.has(failureCategory)) {
     return unavailableError(failureCategory);
   }
   const error = new Error("The coaching turn could not be completed safely");
@@ -43,17 +41,6 @@ function storedFailureError(failureCategory) {
     ? failureCategory
     : "COACHING_TURN_FAILED";
   return error;
-}
-
-function serializeCoachMessage(row) {
-  return {
-    id: String(row.id),
-    conversationId: String(row.conversation_id),
-    senderType: row.sender_type,
-    content: row.content,
-    structuredResponse: row.structured_response_json,
-    createdAt: row.created_at,
-  };
 }
 
 async function requireActiveMappingAndConsent(client, member, configuration) {
@@ -104,47 +91,6 @@ async function requireActiveMappingAndConsent(client, member, configuration) {
     error.code = "ALPHA_CONSENT_REQUIRED";
     throw error;
   }
-}
-
-async function loadCompletedResult(client, turn, idempotentReplay) {
-  const coachMessage = await client.query(
-    `SELECT *
-     FROM coaching_messages
-     WHERE id = $1
-       AND conversation_id = $2
-       AND member_id = $3
-       AND sender_type = 'goals_coach'`,
-    [turn.coach_message_id, turn.conversation_id, turn.member_id]
-  );
-  if (!coachMessage.rows.length) {
-    throw new Error("Completed coaching turn is missing its response");
-  }
-
-  let workoutState = null;
-  if (turn.workout_session_id) {
-    const workout = await client.query(
-      `SELECT *
-       FROM goals_coach_workout_sessions
-       WHERE id = $1
-         AND member_id = $2
-         AND conversation_id = $3
-         AND plan_id = $4`,
-      [turn.workout_session_id, turn.member_id, turn.conversation_id, turn.plan_id]
-    );
-    workoutState = serializeWorkoutSession(workout.rows[0] || null);
-  }
-
-  return {
-    memberMessageId: String(turn.member_message_id),
-    response: serializeCoachMessage(coachMessage.rows[0]),
-    workoutState,
-    turn: {
-      requestId: String(turn.request_id),
-      attemptNumber: Number(turn.attempt_number),
-      providerStatus: turn.provider_status,
-    },
-    idempotentReplay,
-  };
 }
 
 function createPhase1bCoachingService(options) {
@@ -215,7 +161,10 @@ function createPhase1bCoachingService(options) {
         if (previousTurn.rows.length) {
           const turn = previousTurn.rows[0];
           if (turn.provider_status === "completed") {
-            return { type: "completed", result: await loadCompletedResult(client, turn, true) };
+            return {
+              type: "completed",
+              result: await loadCompletedTurnResult(client, turn, true),
+            };
           }
           if (turn.provider_status === "pending") {
             return { type: "pending", turnId: String(turn.id) };
@@ -314,7 +263,7 @@ function createPhase1bCoachingService(options) {
       }
       const turn = result.rows[0];
       if (turn.provider_status === "completed") {
-        return loadCompletedResult(db, turn, true);
+        return loadCompletedTurnResult(db, turn, true);
       }
       if (turn.provider_status === "failed") {
         throw storedFailureError(turn.failure_category);
@@ -445,7 +394,7 @@ function createPhase1bCoachingService(options) {
     } catch (error) {
       const failureCategory = terminalFailureCategory(error);
       await markFailed(staged.turn.id, failureCategory);
-      if (PROVIDER_FAILURE_CATEGORIES.has(failureCategory)) {
+      if (RETRYABLE_FAILURE_CATEGORIES.has(failureCategory)) {
         throw unavailableError(failureCategory);
       }
       throw error;

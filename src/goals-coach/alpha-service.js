@@ -1,4 +1,11 @@
 const crypto = require("crypto");
+const { serializeWorkoutSession } = require("./coaching-context");
+const {
+  createCoachingCapability,
+  loadCompletedTurnResult,
+  publicTurnStatus,
+  serializeTurnSummary,
+} = require("./phase1b-contracts");
 const { conflict, notFound, withTransaction } = require("./repository");
 const { encodeCursor } = require("./validation");
 
@@ -14,7 +21,7 @@ function serializeConversation(row) {
 }
 
 function serializeMessage(row, includeStructuredResponse = true) {
-  return {
+  const message = {
     id: String(row.id),
     conversationId: String(row.conversation_id),
     senderType: row.sender_type,
@@ -22,6 +29,22 @@ function serializeMessage(row, includeStructuredResponse = true) {
     structuredResponse: includeStructuredResponse ? row.structured_response_json : null,
     createdAt: row.created_at,
   };
+  if (row.sender_type === "member") {
+    message.clientMessageId = row.client_message_id
+      ? String(row.client_message_id)
+      : null;
+    message.turn = row.turn_id
+      ? serializeTurnSummary({
+        provider_status: row.turn_provider_status,
+        failure_category: row.turn_failure_category,
+        attempt_number: row.turn_attempt_number,
+        provider_started_at: row.turn_provider_started_at,
+        provider_completed_at: row.turn_provider_completed_at,
+        created_at: row.turn_created_at,
+      })
+      : null;
+  }
+  return message;
 }
 
 function serializePreferences(row) {
@@ -44,6 +67,20 @@ function serializePreferences(row) {
 function createAlphaGoalsCoachService(options) {
   const db = options.db;
   const configuration = options.applicationConfiguration;
+  const coachingCapability = options.coachingCapability
+    || createCoachingCapability(null);
+
+  async function phase1bSchemaAvailability(client) {
+    const result = await client.query(
+      `SELECT
+         to_regclass('public.goals_coach_workout_sessions')::text AS workout_sessions,
+         to_regclass('public.goals_coach_coaching_turns')::text AS coaching_turns`
+    );
+    return {
+      workoutSessions: Boolean(result.rows[0] && result.rows[0].workout_sessions),
+      coachingTurns: Boolean(result.rows[0] && result.rows[0].coaching_turns),
+    };
+  }
 
   function requireConfiguration() {
     if (!configuration || !configuration.valid) {
@@ -296,6 +333,22 @@ function createAlphaGoalsCoachService(options) {
           [member.memberId, plan.id]
         );
       }
+      const schema = await phase1bSchemaAvailability(client);
+      let workoutState = null;
+      if (schema.workoutSessions) {
+        const workout = await client.query(
+          `SELECT *
+           FROM goals_coach_workout_sessions
+           WHERE member_id = $1
+             AND conversation_id = $2
+             AND plan_id = $3
+             AND status = 'active'
+           ORDER BY last_activity_at DESC, id DESC
+           LIMIT 1`,
+          [member.memberId, conversation.rows[0].id, plan.id]
+        );
+        workoutState = serializeWorkoutSession(workout.rows[0] || null);
+      }
       return {
         conversation: serializeConversation(conversation.rows[0]),
         plan: { id: String(plan.id), savedAt: plan.created_at },
@@ -303,6 +356,8 @@ function createAlphaGoalsCoachService(options) {
           ? { displayName: primaryCoach.display_name, reference: `Coach ${primaryCoach.display_name}` }
           : { displayName: null, reference: "one of our coaches" },
         coachingMode: "phase_1a_test_only",
+        coachingCapability,
+        workoutState,
       };
     });
   }
@@ -338,19 +393,49 @@ function createAlphaGoalsCoachService(options) {
       [conversationId, member.memberId]
     );
     if (!owner.rows.length) throw notFound("CONVERSATION_NOT_FOUND", "Conversation not found");
+    const schema = await phase1bSchemaAvailability(db);
     const values = [conversationId, member.memberId];
     let cursorSql = "";
     if (page.cursor) {
       values.push(page.cursor.t, page.cursor.id);
-      cursorSql = `AND (created_at, id) < ($${values.length - 1}::timestamptz, $${values.length}::bigint)`;
+      cursorSql = `AND (message.created_at, message.id) < ($${values.length - 1}::timestamptz, $${values.length}::bigint)`;
     }
     values.push(page.limit + 1);
-    const result = await db.query(
-      `SELECT * FROM coaching_messages
-       WHERE conversation_id = $1 AND member_id = $2 ${cursorSql}
-       ORDER BY created_at DESC, id DESC LIMIT $${values.length}`,
-      values
-    );
+    const result = schema.coachingTurns
+      ? await db.query(
+        `SELECT message.*,
+                turn.id AS turn_id,
+                turn.provider_status AS turn_provider_status,
+                turn.failure_category AS turn_failure_category,
+                turn.attempt_number AS turn_attempt_number,
+                turn.provider_started_at AS turn_provider_started_at,
+                turn.provider_completed_at AS turn_provider_completed_at,
+                turn.created_at AS turn_created_at
+         FROM coaching_messages message
+         LEFT JOIN LATERAL (
+           SELECT candidate.*
+           FROM goals_coach_coaching_turns candidate
+           WHERE candidate.member_message_id = message.id
+             AND candidate.conversation_id = message.conversation_id
+             AND candidate.member_id = message.member_id
+           ORDER BY candidate.attempt_number DESC
+           LIMIT 1
+         ) turn ON message.sender_type = 'member'
+         WHERE message.conversation_id = $1
+           AND message.member_id = $2 ${cursorSql}
+         ORDER BY message.created_at DESC, message.id DESC
+         LIMIT $${values.length}`,
+        values
+      )
+      : await db.query(
+        `SELECT message.*
+         FROM coaching_messages message
+         WHERE message.conversation_id = $1
+           AND message.member_id = $2 ${cursorSql}
+         ORDER BY message.created_at DESC, message.id DESC
+         LIMIT $${values.length}`,
+        values
+      );
     const hasMore = result.rows.length > page.limit;
     const rows = result.rows.slice(0, page.limit);
     const last = rows[rows.length - 1];
@@ -359,6 +444,55 @@ function createAlphaGoalsCoachService(options) {
       nextCursor: hasMore && last
         ? encodeCursor({ t: new Date(last.created_at).toISOString(), id: String(last.id) })
         : null,
+    };
+  }
+
+  async function getTurn(member, conversationId, clientMessageId) {
+    const schema = await phase1bSchemaAvailability(db);
+    if (!schema.coachingTurns) {
+      throw notFound("COACHING_TURN_NOT_FOUND", "Coaching turn not found");
+    }
+    const result = await db.query(
+      `SELECT turn.*, message.client_message_id
+       FROM coaching_conversations conversation
+       JOIN coaching_messages message
+         ON message.conversation_id = conversation.id
+        AND message.member_id = conversation.member_id
+        AND message.sender_type = 'member'
+        AND message.client_message_id = $3
+       JOIN LATERAL (
+         SELECT candidate.*
+         FROM goals_coach_coaching_turns candidate
+         WHERE candidate.member_message_id = message.id
+           AND candidate.conversation_id = conversation.id
+           AND candidate.member_id = conversation.member_id
+         ORDER BY candidate.attempt_number DESC
+         LIMIT 1
+       ) turn ON TRUE
+       WHERE conversation.id = $1
+         AND conversation.member_id = $2
+       LIMIT 1`,
+      [conversationId, member.memberId, clientMessageId]
+    );
+    if (!result.rows.length) {
+      throw notFound("COACHING_TURN_NOT_FOUND", "Coaching turn not found");
+    }
+
+    const turn = result.rows[0];
+    const status = publicTurnStatus(turn);
+    const summary = serializeTurnSummary(turn);
+    return {
+      conversationId: String(turn.conversation_id),
+      clientMessageId: String(turn.client_message_id),
+      memberMessageId: String(turn.member_message_id),
+      status,
+      messageSaved: true,
+      retrySafe: summary.retrySafe,
+      attemptNumber: summary.attemptNumber,
+      result: status === "completed"
+        ? await loadCompletedTurnResult(db, turn, true)
+        : null,
+      updatedAt: summary.updatedAt,
     };
   }
 
@@ -562,6 +696,7 @@ function createAlphaGoalsCoachService(options) {
     getCurrentPlan,
     getPreferences,
     getProfile,
+    getTurn,
     listConversations,
     listMessages,
     recordConsent,

@@ -1680,6 +1680,7 @@ app.use(
     applicationConfiguration: alphaApplicationConfiguration,
     requireCurrentConsent: alphaMemberAuthorization.requireCurrentAlphaConsent,
     coachingEngine: phase1bStartup.engine,
+    phase1bStartup: phase1bStartup,
   })
 );
 
