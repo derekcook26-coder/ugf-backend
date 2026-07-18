@@ -13,13 +13,13 @@ function serializeConversation(row) {
   };
 }
 
-function serializeMessage(row) {
+function serializeMessage(row, includeStructuredResponse = true) {
   return {
     id: String(row.id),
     conversationId: String(row.conversation_id),
     senderType: row.sender_type,
     content: row.content,
-    structuredResponse: null,
+    structuredResponse: includeStructuredResponse ? row.structured_response_json : null,
     createdAt: row.created_at,
   };
 }
@@ -355,7 +355,7 @@ function createAlphaGoalsCoachService(options) {
     const rows = result.rows.slice(0, page.limit);
     const last = rows[rows.length - 1];
     return {
-      messages: rows.map(serializeMessage),
+      messages: rows.map((row) => serializeMessage(row)),
       nextCursor: hasMore && last
         ? encodeCursor({ t: new Date(last.created_at).toISOString(), id: String(last.id) })
         : null,
@@ -456,7 +456,7 @@ function createAlphaGoalsCoachService(options) {
       );
       return {
         memberMessageId: String(memberMessage.rows[0].id),
-        response: serializeMessage(coachMessage.rows[0]),
+        response: serializeMessage(coachMessage.rows[0], false),
         idempotentReplay: false,
       };
     });

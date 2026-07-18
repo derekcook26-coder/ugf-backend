@@ -6,6 +6,7 @@ const EmbeddedPostgres = require("embedded-postgres").default;
 const { Pool } = require("pg");
 const { runMigration } = require("../../migrate_002");
 const { runMigration: runPhase1aMigration } = require("../../migrate_003");
+const { runMigration: runPhase1bMigration } = require("../../migrate_004");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
@@ -20,7 +21,7 @@ async function availablePort() {
   return port;
 }
 
-async function createRealDisposablePostgres() {
+async function createRealDisposablePostgres(options = {}) {
   const port = await availablePort();
   const databaseDir = path.join(
     os.tmpdir(),
@@ -52,6 +53,7 @@ async function createRealDisposablePostgres() {
   await pool.query(migration001);
   await runMigration({ pool });
   await runPhase1aMigration({ pool });
+  if (options.phase1b === true) await runPhase1bMigration({ pool });
   return {
     pool,
     async close() {

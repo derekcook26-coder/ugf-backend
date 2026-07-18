@@ -3,6 +3,7 @@ const path = require("path");
 const { PGlite } = require("@electric-sql/pglite");
 const { runMigration } = require("../../migrate_002");
 const { runMigration: runPhase1aMigration } = require("../../migrate_003");
+const { runMigration: runPhase1bMigration } = require("../../migrate_004");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
@@ -35,7 +36,10 @@ async function createDisposableDatabase(options = {}) {
   );
   await database.exec(migration001);
   if (options.phase2 !== false) await runMigration({ pool });
-  if (options.phase1a === true) await runPhase1aMigration({ pool });
+  if (options.phase1a === true || options.phase1b === true) {
+    await runPhase1aMigration({ pool });
+  }
+  if (options.phase1b === true) await runPhase1bMigration({ pool });
   return {
     database,
     pool,

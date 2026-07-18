@@ -1,5 +1,6 @@
 const express = require("express");
 const { createAlphaGoalsCoachService } = require("./alpha-service");
+const { createPhase1bCoachingService } = require("./phase1b-service");
 const { createAlphaRateLimits } = require("./alpha-rate-limits");
 const {
   alphaMessageInput,
@@ -17,6 +18,14 @@ function createAlphaGoalsCoachRouter(options) {
   });
   const requireCurrentConsent = options.requireCurrentConsent;
   const testOnlyResponder = options.testOnlyResponder || null;
+  const phase1bService = options.phase1bService || (options.coachingEngine
+    ? createPhase1bCoachingService({
+      db: options.db,
+      engine: options.coachingEngine,
+      applicationConfiguration: options.applicationConfiguration,
+      ...(options.phase1bServiceOptions || {}),
+    })
+    : null);
   const rateLimits = options.rateLimits || createAlphaRateLimits();
 
   if (typeof requireCurrentConsent !== "function") {
@@ -109,7 +118,7 @@ function createAlphaGoalsCoachRouter(options) {
   });
 
   router.post("/conversations/:conversationId/messages", rateLimits.message, async (req, res, next) => {
-    if (!testOnlyResponder) {
+    if (!phase1bService && !testOnlyResponder) {
       return res.status(503).json({
         error: "ALPHA_TEST_RESPONDER_NOT_AVAILABLE",
         message: "Private-alpha test messaging is not available in this startup mode.",
@@ -117,12 +126,15 @@ function createAlphaGoalsCoachRouter(options) {
     }
     try {
       const conversationId = positiveId(req.params.conversationId, "conversationId");
-      const result = await service.sendTestMessage(
-        req.alphaMember,
-        conversationId,
-        alphaMessageInput(req.body),
-        testOnlyResponder
-      );
+      const input = alphaMessageInput(req.body);
+      const result = phase1bService
+        ? await phase1bService.sendMessage(req.alphaMember, conversationId, input)
+        : await service.sendTestMessage(
+          req.alphaMember,
+          conversationId,
+          input,
+          testOnlyResponder
+        );
       return res.status(201).json(result);
     } catch (error) {
       return next(error);
