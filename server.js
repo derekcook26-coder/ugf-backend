@@ -541,6 +541,12 @@ function chooseGoalsCoachOpening() {
 var GOALS_COACH_SUMMARY_ENDING =
   "Let me know if I missed anything or if there’s something you’d like to add.";
 
+var GOALS_COACH_SAFETY_REPLY =
+  "Please stop any activity that causes the pain or concerning symptom. Before we continue or " +
+  "build a workout, contact UGF staff and an appropriate healthcare professional for review. " +
+  "If the symptom is severe, worsening, or urgent—or includes chest pain, fainting, severe " +
+  "shortness of breath, or stroke-like symptoms—seek urgent medical attention now.";
+
 function ensureGoalsCoachSummaryEnding(reply) {
   var trimmedReply = String(reply || "").trim();
   if (trimmedReply.endsWith(GOALS_COACH_SUMMARY_ENDING)) return trimmedReply;
@@ -555,10 +561,161 @@ function countGoalsCoachMemberAnswers(messages) {
   }, 0);
 }
 
-function finalizeGoalsCoachResponse(result, fallbackProfile) {
+function normalizeGoalsCoachSafetyText(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function hasMeaningfulGoalsCoachSafetyValue(value) {
+  if (Array.isArray(value)) {
+    return value.some(hasMeaningfulGoalsCoachSafetyValue);
+  }
+
+  var text = normalizeGoalsCoachSafetyText(value);
+  return Boolean(text) && !/^(?:0|none|no|unknown|not assessed|n\/a|clear to proceed|clear_to_proceed)$/.test(text);
+}
+
+function isHistoricalGoalsCoachSafetyText(text) {
+  var hasHistoricalContext =
+    /\b(?:old|past|previous|historical|history of|years? ago|fully healed|fully recovered)\b/.test(text);
+  var hasCurrentConcern =
+    /\b(?:current|currently|now|today|still|ongoing|sharp|stiff|stiffness|sore|swollen|numb|tingling|radiating|worsening|concerned|worried|restriction)\b/.test(text);
+  return hasHistoricalContext && !hasCurrentConcern;
+}
+
+function applyGoalsCoachSafetyText(state, value) {
+  var text = normalizeGoalsCoachSafetyText(value);
+  if (!text) return;
+
+  var clearsPain =
+    /\b(?:no|without)\s+(?:current\s+|ongoing\s+|remaining\s+)?(?:sharp\s+)?(?:pain|pains|soreness)\b/.test(text) ||
+    /\b(?:do not|don't)\s+(?:currently\s+)?(?:have|feel|experience)\s+(?:any\s+)?(?:sharp\s+)?(?:pain|pains|soreness)\b/.test(text) ||
+    /\b(?:pain|pains|soreness)\b[^.!?]{0,60}\b(?:gone|resolved|cleared|no longer present)\b/.test(text);
+  var clearsSymptoms =
+    /\b(?:no|without)\s+(?:current\s+|ongoing\s+|concerning\s+)?(?:symptoms?|stiffness|swelling|numbness|tingling|weakness|dizziness)\b/.test(text) ||
+    /\b(?:do not|don't)\s+(?:currently\s+)?(?:have|feel|experience)\s+(?:any\s+)?(?:concerning\s+)?(?:symptoms?|stiffness|swelling|numbness|tingling|weakness|dizziness)\b/.test(text) ||
+    /\b(?:symptoms?|stiffness|swelling|numbness|tingling|weakness|dizziness)\b[^.!?]{0,60}\b(?:gone|resolved|cleared|no longer present)\b/.test(text);
+  var clearsInjury =
+    /\b(?:no|without)\s+(?:current\s+|active\s+|recent\s+)?injur(?:y|ies)\b/.test(text) ||
+    /\b(?:do not|don't)\s+(?:currently\s+)?have\s+(?:an?\s+)?(?:current\s+|active\s+|recent\s+)?injur(?:y|ies)\b/.test(text) ||
+    /\binjur(?:y|ies)\b[^.!?]{0,80}\b(?:fully healed|fully recovered|resolved|cleared)\b/.test(text) ||
+    /\b(?:not|no longer) (?:concerned|worried) about[^.!?]{0,40}\binjur(?:y|ies)\b/.test(text);
+  var clearsSurgery =
+    /\b(?:no|without)\s+(?:current\s+|recent\s+)?surger(?:y|ies)\b/.test(text) ||
+    /\b(?:have not|haven't) had\s+(?:a\s+)?(?:current\s+|recent\s+)?surger(?:y|ies)\b/.test(text);
+  var clearsRestriction =
+    /\b(?:no|without)\s+(?:current\s+)?(?:medical\s+|exercise\s+)?restrictions?\b/.test(text) ||
+    /\b(?:do not|don't)\s+(?:currently\s+)?have\s+(?:any\s+)?(?:medical\s+|exercise\s+)?restrictions?\b/.test(text) ||
+    /\brestrictions?\b[^.!?]{0,60}\b(?:lifted|resolved|cleared)\b/.test(text);
+  var clearsOther =
+    /\b(?:no|without)\s+(?:current\s+|other\s+)?safety concerns?\b/.test(text) ||
+    /\b(?:do not|don't)\s+(?:currently\s+)?have\s+(?:any\s+)?(?:current\s+|other\s+)?safety concerns?\b/.test(text) ||
+    /\b(?:not|no longer) (?:concerned|worried)\b[^.!?]{0,100}\b(?:training|exercise|workout|bending|lifting|injur(?:y|ies))\b/.test(text);
+
+  if (clearsPain) state.pain = false;
+  if (clearsSymptoms) state.symptoms = false;
+  if (clearsInjury) state.injury = false;
+  if (clearsSurgery) state.surgery = false;
+  if (clearsRestriction) state.restriction = false;
+  if (clearsOther) state.other = false;
+
+  if (isHistoricalGoalsCoachSafetyText(text)) return;
+
+  if (!clearsPain && /\b(?:pain|pains|painful|sharp|sore|soreness)\b/.test(text)) {
+    state.pain = true;
+  }
+  if (!clearsSymptoms && /\b(?:stiff|stiffness|swelling|swollen|numb|numbness|tingling|radiating|weakness|dizzy|dizziness|fainting|shortness of breath|concerning symptoms?)\b/.test(text)) {
+    state.symptoms = true;
+  }
+  if (!clearsInjury && (
+    /\b(?:current|active|recent)\s+injur(?:y|ies)\b/.test(text) ||
+    /\binjured\b/.test(text) ||
+    /\b(?:concerned|worried)\b[^.!?]{0,80}\binjur(?:y|ies)\b/.test(text)
+  )) {
+    state.injury = true;
+  }
+  if (!clearsSurgery && (
+    /\b(?:current|recent)\s+surger(?:y|ies)\b/.test(text) ||
+    /\b(?:had|having|recovering from)\s+(?:a\s+)?surger(?:y|ies)\b/.test(text)
+  )) {
+    state.surgery = true;
+  }
+  if (!clearsRestriction && (
+    /\b(?:medical|exercise)\s+restrictions?\b/.test(text) ||
+    /\bnot\s+(?:medically\s+)?cleared\b/.test(text) ||
+    /\bdoctor\b[^.!?]{0,80}\b(?:avoid|restrict|not exercise|not train)\b/.test(text)
+  )) {
+    state.restriction = true;
+  }
+  if (!clearsOther && (
+    /\bsafety concerns?\b/.test(text) ||
+    /\b(?:concerned|worried)\b[^.!?]{0,100}\b(?:training|exercise|workout|bending|lifting|injur(?:y|ies))\b/.test(text)
+  )) {
+    state.other = true;
+  }
+}
+
+function getGoalsCoachSafetyState(messages, profile, explicitSafetyStop) {
+  var state = {
+    pain: false,
+    symptoms: false,
+    injury: false,
+    surgery: false,
+    restriction: false,
+    other: Boolean(explicitSafetyStop),
+  };
+  var currentProfile = profile || {};
+
+  if (hasMeaningfulGoalsCoachSafetyValue(currentProfile.painLocations) ||
+      hasMeaningfulGoalsCoachSafetyValue(currentProfile.painSeverity)) {
+    state.pain = true;
+  }
+  if (hasMeaningfulGoalsCoachSafetyValue(currentProfile.symptomFlags)) state.symptoms = true;
+  applyGoalsCoachSafetyText(state, currentProfile.recentInjuryOrSurgery);
+  if (hasMeaningfulGoalsCoachSafetyValue(currentProfile.medicalRestrictions)) state.restriction = true;
+  if (hasMeaningfulGoalsCoachSafetyValue(currentProfile.limitations) ||
+      hasMeaningfulGoalsCoachSafetyValue(currentProfile.medicalNotes) ||
+      hasMeaningfulGoalsCoachSafetyValue(currentProfile.staffReviewReasons)) {
+    state.other = true;
+  }
+
+  var reviewLevel = normalizeGoalsCoachSafetyText(currentProfile.movementReviewLevel);
+  if (reviewLevel && reviewLevel !== "clear_to_proceed" && reviewLevel !== "clear to proceed") {
+    state.other = true;
+  }
+
+  var movementPatterns = currentProfile.movementPatterns || {};
+  Object.keys(movementPatterns).forEach(function (key) {
+    var status = normalizeGoalsCoachSafetyText(movementPatterns[key] && movementPatterns[key].status);
+    if (status === "painful") state.pain = true;
+    if (status === "unsteady") state.other = true;
+  });
+
+  (Array.isArray(messages) ? messages : []).forEach(function (message) {
+    if (message && message.role === "user") applyGoalsCoachSafetyText(state, message.content);
+  });
+
+  var reasons = [];
+  if (state.pain) reasons.push("current pain");
+  if (state.symptoms) reasons.push("concerning symptom");
+  if (state.injury) reasons.push("current injury concern");
+  if (state.surgery) reasons.push("recent surgery");
+  if (state.restriction) reasons.push("medical or exercise restriction");
+  if (state.other) reasons.push("unresolved safety concern");
+
+  return { active: reasons.length > 0, reasons: reasons };
+}
+
+function finalizeGoalsCoachResponse(result, fallbackProfile, safetyOverride) {
   var reply = result.reply || "Tell me a little more about that.";
   var phase = result.phase || "assessment";
-  var safetyStop = Boolean(result.safetyStop);
+  var hasSafetyOverride = Boolean(safetyOverride && safetyOverride.active);
+  var safetyStop = Boolean(result.safetyStop) || hasSafetyOverride;
+
+  if (hasSafetyOverride) {
+    reply = GOALS_COACH_SAFETY_REPLY;
+    phase = "assessment";
+  }
+
   var isSummaryMessage = !safetyStop && phase === "summary";
 
   if (isSummaryMessage) reply = ensureGoalsCoachSummaryEnding(reply);
@@ -641,6 +798,11 @@ var COACH_SYSTEM =
   "never overrides unresolved safety screening. Continue until it is resolved unless a safety stop\n" +
   "ends the assessment. This screen does not require the long movement questionnaire. Ask individual\n" +
   "movement-pattern questions only when they materially affect programming or safety.\n" +
+  "Any disclosed current pain, sharp pain, concerning symptom, current injury concern, recent\n" +
+  "surgery, medical or exercise restriction, or unresolved safety concern MUST set safetyStop=true.\n" +
+  "Historical injury alone may be non-blocking when it is fully resolved and has no current symptom\n" +
+  "or concern. A later answer about a different category, such as no recent surgery, does not erase\n" +
+  "an earlier current-pain disclosure. Keep the safety stop active until that concern is explicitly resolved.\n" +
   "Use the established safety information to decide whether a safety stop, professional review,\n" +
   "exercise modification, or staff review is required.\n" +
   "Then collect the smallest useful set of schedule, duration, equipment, experience, preference,\n" +
@@ -723,6 +885,17 @@ app.post("/coach-message", coachMessageLimiter, async function (req, res) {
       readyToGenerate: false,
       safetyStop: false,
     });
+  }
+
+  var requestSafetyState = getGoalsCoachSafetyState(messages, profile, req.body.safetyStop);
+  if (requestSafetyState.active) {
+    return res.json(finalizeGoalsCoachResponse({
+      reply: GOALS_COACH_SAFETY_REPLY,
+      phase: "assessment",
+      profile: profile || {},
+      readyToGenerate: false,
+      safetyStop: true,
+    }, profile, requestSafetyState));
   }
 
   try {
@@ -842,6 +1015,15 @@ app.post("/generate-personalized-workout", async function (req, res) {
 
   if (!profile) {
     return res.status(400).json({ error: "profile is required" });
+  }
+
+  var planSafetyState = getGoalsCoachSafetyState(messages, profile, req.body.safetyStop);
+  if (planSafetyState.active) {
+    return res.status(409).json({
+      error: GOALS_COACH_SAFETY_REPLY,
+      readyToGenerate: false,
+      safetyStop: true,
+    });
   }
 
   try {
