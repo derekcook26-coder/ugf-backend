@@ -2,6 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const { PGlite } = require("@electric-sql/pglite");
 const { runMigration } = require("../../migrate_002");
+const { runMigration: runPhase1aMigration } = require("../../migrate_003");
+const { runMigration: runPhase1bMigration } = require("../../migrate_004");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
@@ -34,6 +36,10 @@ async function createDisposableDatabase(options = {}) {
   );
   await database.exec(migration001);
   if (options.phase2 !== false) await runMigration({ pool });
+  if (options.phase1a === true || options.phase1b === true) {
+    await runPhase1aMigration({ pool });
+  }
+  if (options.phase1b === true) await runPhase1bMigration({ pool });
   return {
     database,
     pool,
@@ -68,9 +74,22 @@ async function seedStaff(pool, suffix = "1", role = "coach", active = true) {
   return result.rows[0];
 }
 
+async function seedAlphaMapping(pool, member, suffix = "1", active = true) {
+  const result = await pool.query(
+    `INSERT INTO goals_coach_member_auth_mappings
+      (member_id, auth_provider, auth_subject, verified_email_snapshot,
+       active, provisioning_method, provisioning_reference)
+     VALUES ($1, 'clerk', $2, $3, $4, 'owner_approved_script', 'synthetic-test')
+     RETURNING *`,
+    [member.id, `user_alpha_${suffix}`, `alpha-${suffix}@example.test`, active]
+  );
+  return result.rows[0];
+}
+
 module.exports = {
   createDisposableDatabase,
   createPoolAdapter,
+  seedAlphaMapping,
   seedMemberAndPlan,
   seedStaff,
 };

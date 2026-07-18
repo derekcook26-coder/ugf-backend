@@ -1,0 +1,90 @@
+name: Goals Coach Phase 1A validation
+
+on:
+  push:
+    branches:
+      - feature/goals-coach-phase-1a
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE_ENV: test
+    steps:
+      - name: Check out the reviewed branch
+        uses: actions/checkout@v4
+
+      - name: Use the approved Node major
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.20.0
+          cache: npm
+
+      - name: Confirm the unprivileged runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          id
+          test "$(id -u)" -ne 0
+          node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major !== 20 || minor < 9) process.exit(1)"
+
+      - name: Clean dependency installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Run focused rollback and migration-order tests first
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 test/migration-003.test.js | tee phase1a-rollback.tap
+          grep -Fx "# tests 5" phase1a-rollback.tap
+          grep -Fx "# pass 5" phase1a-rollback.tap
+          grep -Fx "# fail 0" phase1a-rollback.tap
+          grep -Fx "# skipped 0" phase1a-rollback.tap
+
+      - name: Run the four real PostgreSQL concurrency tests first
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 test/concurrency.test.js | tee phase1a-concurrency.tap
+          grep -Fx "# tests 4" phase1a-concurrency.tap
+          grep -Fx "# pass 4" phase1a-concurrency.tap
+          grep -Fx "# fail 0" phase1a-concurrency.tap
+          grep -Fx "# skipped 0" phase1a-concurrency.tap
+
+      - name: Run the complete backend suite with no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test | tee phase1a-full-suite.tap
+          grep -Fx "# fail 0" phase1a-full-suite.tap
+          grep -Fx "# skipped 0" phase1a-full-suite.tap
+
+      - name: Run JavaScript syntax and repository checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          npm run check
+
+      - name: Preserve validation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goals-coach-phase1a-validation-output
+          path: |
+            phase1a-rollback.tap
+            phase1a-concurrency.tap
+            phase1a-full-suite.tap
+          if-no-files-found: warn
+          retention-days: 14
