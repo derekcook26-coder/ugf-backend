@@ -1,0 +1,137 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const test = require("node:test");
+const vm = require("node:vm");
+
+const projectRoot = path.resolve(__dirname, "..");
+const serverSource = fs.readFileSync(path.join(projectRoot, "server.js"), "utf8");
+const summaryEnding =
+  "Let me know if I missed anything or if there’s something you’d like to add.";
+
+function sourceBetween(startMarker, endMarker) {
+  const start = serverSource.indexOf(startMarker);
+  const end = serverSource.indexOf(endMarker, start);
+  assert.notEqual(start, -1, `missing start marker: ${startMarker}`);
+  assert.notEqual(end, -1, `missing end marker: ${endMarker}`);
+  return serverSource.slice(start, end);
+}
+
+function evaluateAssignment(variableName, endMarker, context = {}) {
+  const source = sourceBetween(`var ${variableName} =`, endMarker);
+  const expression = source.slice(source.indexOf("=") + 1).trim().replace(/;$/, "");
+  return vm.runInNewContext(expression, context);
+}
+
+const helperSource = sourceBetween(
+  "var GOALS_COACH_OPENINGS =",
+  "var COACH_SYSTEM ="
+);
+const helperContext = {};
+vm.runInNewContext(helperSource, helperContext);
+
+const openings = helperContext.GOALS_COACH_OPENINGS;
+const coachPrompt = evaluateAssignment("COACH_SYSTEM", '\n\napp.post("/coach-message"', {
+  GOALS_COACH_SUMMARY_ENDING: summaryEnding,
+});
+const coachRoute = sourceBetween(
+  'app.post("/coach-message"',
+  "// ─── POST /generate-personalized-workout"
+);
+const planPrompt = evaluateAssignment(
+  "PLAN_SYSTEM",
+  '\n\napp.post("/generate-personalized-workout"'
+);
+
+test("1.0 openings are concise, natural, and ask one question", () => {
+  assert.equal(openings.length, 5);
+
+  for (const opening of openings) {
+    assert.ok(opening.split(/\s+/).length <= 22, opening);
+    assert.equal((opening.match(/\?/g) || []).length, 1, opening);
+    assert.doesNotMatch(
+      opening,
+      /glad you're here|take our time|right or wrong answers|your story|test to pass|thanks for/i
+    );
+  }
+});
+
+test("1.0 prompt uses a five-answer target without creating a safety cap", () => {
+  assert.match(coachPrompt, /about five member answers is the normal target/i);
+  assert.match(coachPrompt, /not a hard safety cap/i);
+  assert.match(coachPrompt, /automatically present the summary/i);
+  assert.match(coachPrompt, /Do not ask permission to present it/i);
+
+  assert.equal(
+    helperContext.countGoalsCoachMemberAnswers([
+      { role: "assistant", content: "Question" },
+      { role: "user", content: "Answer one" },
+      { role: "assistant", content: "Question" },
+      { role: "user", content: "Answer two" },
+    ]),
+    2
+  );
+  assert.match(coachRoute, /Assessment progress: the member has provided/);
+});
+
+test("1.0 follow-ups are limited to material programming decisions", () => {
+  for (const decision of [
+    "safety",
+    "exercise selection",
+    "workout schedule or duration",
+    "available equipment",
+    "adherence design",
+  ]) {
+    assert.match(coachPrompt, new RegExp(decision, "i"));
+  }
+
+  assert.match(coachPrompt, /Ask no more than ONE natural question/);
+  assert.match(coachPrompt, /Do not ask compound or two-part questions/);
+  assert.match(coachPrompt, /Do not automatically praise, thank, reassure, validate, or paraphrase/);
+  assert.match(coachPrompt, /Do not use therapy-style reflection/);
+  assert.doesNotMatch(coachPrompt, /every normal coaching response must/i);
+});
+
+test("1.0 summary state is phase-based and always has the approved ending", () => {
+  assert.equal(helperContext.GOALS_COACH_SUMMARY_ENDING, summaryEnding);
+  assert.equal(
+    helperContext.ensureGoalsCoachSummaryEnding("You want two short workouts each week."),
+    `You want two short workouts each week.\n\n${summaryEnding}`
+  );
+  assert.equal(
+    helperContext.ensureGoalsCoachSummaryEnding(`Summary.\n\n${summaryEnding}`),
+    `Summary.\n\n${summaryEnding}`
+  );
+
+  assert.match(coachPrompt, /Set phase to summary and end exactly with/);
+  assert.match(coachPrompt, /If the member corrects the summary, update the profile/);
+  assert.match(coachRoute, /var isSummaryMessage = phase === "summary"/);
+  assert.match(coachRoute, /if \(isSummaryMessage\) reply = ensureGoalsCoachSummaryEnding\(reply\)/);
+  assert.doesNotMatch(coachRoute, /reply\.toLowerCase\(\)\.includes/);
+  assert.match(coachRoute, /readyToGenerate: isSummaryMessage \? false/);
+});
+
+test("1.0 keeps unknown facts unknown in both assessment and plan prompts", () => {
+  assert.match(coachPrompt, /Preserve unasked or unanswered\s+information as unknown/);
+  assert.match(coachPrompt, /Never infer a detail from silence/);
+  assert.match(coachPrompt, /using only facts the member actually provided/);
+  assert.match(planPrompt, /Use only facts explicitly supported by the member's profile or conversation/);
+  assert.match(planPrompt, /missing, empty, ambiguous, or conflicting information as unknown or not assessed/);
+  assert.match(planPrompt, /Never invent personal, movement, schedule, limitation, equipment, or preference details/);
+  assert.doesNotMatch(planPrompt, /at least four explicit connections/i);
+});
+
+test("1.0 safety instructions and response JSON contract remain in place", () => {
+  const safetyRules = [
+    "- Do not diagnose medical conditions or claim medical clearance.",
+    "- Do not recommend working through sharp, severe, unusual, or worsening pain.",
+    "- Treat numbness, tingling, radiating pain, recent significant injury, recent surgery, unexplained weakness, or repeated falls as staff-review or medical-review concerns.",
+    "- If the member reports chest pain, fainting, unexplained severe shortness of breath, stroke-like symptoms, or another urgent warning sign, stop the assessment, advise appropriate urgent medical attention, and set safetyStop=true.",
+    "- If a concern is not urgent but warrants professional review, explain that clearly without alarming the member.",
+  ];
+
+  for (const rule of safetyRules) assert.ok(coachPrompt.includes(rule), rule);
+  for (const key of ["reply", "phase", "profile", "readyToGenerate", "safetyStop"]) {
+    assert.match(coachRoute, new RegExp(`${key}:`));
+  }
+});
