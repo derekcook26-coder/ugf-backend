@@ -1,5 +1,6 @@
 const express = require("express");
 const { createAlphaGoalsCoachService } = require("./alpha-service");
+const { createCoachingCapability } = require("./phase1b-contracts");
 const { createPhase1bCoachingService } = require("./phase1b-service");
 const { createAlphaRateLimits } = require("./alpha-rate-limits");
 const {
@@ -8,13 +9,30 @@ const {
   feedbackInput,
   preferenceInput,
 } = require("./alpha-validation");
-const { decodeCursor, pageLimit, positiveId } = require("./validation");
+const {
+  decodeCursor,
+  pageLimit,
+  positiveId,
+  requiredClientMessageId,
+} = require("./validation");
 
 function createAlphaGoalsCoachRouter(options) {
   const router = express.Router();
+  const capabilityStartup = options.phase1bStartup || (options.coachingEngine
+    ? {
+      status: "ready",
+      configuration: options.coachingEngine.configuration,
+      engine: options.coachingEngine,
+    }
+    : {
+      status: "disabled",
+      configuration: Object.freeze({ aiEnabled: false, generationReady: false }),
+      engine: null,
+    });
   const service = options.service || createAlphaGoalsCoachService({
     db: options.db,
     applicationConfiguration: options.applicationConfiguration,
+    coachingCapability: createCoachingCapability(capabilityStartup),
   });
   const requireCurrentConsent = options.requireCurrentConsent;
   const testOnlyResponder = options.testOnlyResponder || null;
@@ -116,6 +134,22 @@ function createAlphaGoalsCoachRouter(options) {
       return next(error);
     }
   });
+
+  router.get(
+    "/conversations/:conversationId/turns/:clientMessageId",
+    rateLimits.read,
+    async (req, res, next) => {
+      try {
+        const conversationId = positiveId(req.params.conversationId, "conversationId");
+        const clientMessageId = requiredClientMessageId(req.params.clientMessageId);
+        return res.status(200).json(
+          await service.getTurn(req.alphaMember, conversationId, clientMessageId)
+        );
+      } catch (error) {
+        return next(error);
+      }
+    }
+  );
 
   router.post("/conversations/:conversationId/messages", rateLimits.message, async (req, res, next) => {
     if (!phase1bService && !testOnlyResponder) {
