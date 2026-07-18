@@ -5,7 +5,9 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const projectRoot = path.resolve(__dirname, "..");
-const serverSource = fs.readFileSync(path.join(projectRoot, "server.js"), "utf8");
+const serverSource = fs
+  .readFileSync(path.join(projectRoot, "server.js"), "utf8")
+  .replace(/\r\n/g, "\n");
 const summaryEnding =
   "Let me know if I missed anything or if there’s something you’d like to add.";
 
@@ -42,6 +44,17 @@ const planPrompt = evaluateAssignment(
   "PLAN_SYSTEM",
   '\n\napp.post("/generate-personalized-workout"'
 );
+
+test("1.0 source parsing normalizes CRLF before LF-only marker searches", () => {
+  const marker = '\n\napp.post("/coach-message"';
+  const lfFixture = `before${marker} after`;
+  const crlfFixture = lfFixture.replace(/\n/g, "\r\n");
+
+  assert.equal(lfFixture.includes(marker), true);
+  assert.equal(crlfFixture.includes(marker), false);
+  assert.equal(crlfFixture.replace(/\r\n/g, "\n").includes(marker), true);
+  assert.doesNotMatch(serverSource, /\r\n/);
+});
 
 test("1.0 openings are concise, natural, and ask one question", () => {
   assert.equal(openings.length, 5);
