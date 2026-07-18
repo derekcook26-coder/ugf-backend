@@ -92,7 +92,27 @@ test("1.0 follow-ups are limited to material programming decisions", () => {
   assert.doesNotMatch(coachPrompt, /every normal coaching response must/i);
 });
 
-test("1.0 summary state is phase-based and always has the approved ending", () => {
+test("1.0 safety stop overrides contradictory summary output", () => {
+  const safetyReply =
+    "Call 911 now for urgent medical attention. Here's what I heard from you:";
+  const response = helperContext.finalizeGoalsCoachResponse(
+    {
+      reply: safetyReply,
+      phase: "summary",
+      readyToGenerate: true,
+      safetyStop: true,
+    },
+    {}
+  );
+
+  assert.equal(response.reply, safetyReply);
+  assert.equal(response.reply.includes(summaryEnding), false);
+  assert.equal(response.readyToGenerate, false);
+  assert.equal(response.safetyStop, true);
+  assert.match(helperSource, /isSummaryMessage = !safetyStop && phase === "summary"/);
+});
+
+test("1.0 normal and corrected summaries keep the approved ending", () => {
   assert.equal(helperContext.GOALS_COACH_SUMMARY_ENDING, summaryEnding);
   assert.equal(
     helperContext.ensureGoalsCoachSummaryEnding("You want two short workouts each week."),
@@ -103,12 +123,36 @@ test("1.0 summary state is phase-based and always has the approved ending", () =
     `Summary.\n\n${summaryEnding}`
   );
 
+  const normalSummary = helperContext.finalizeGoalsCoachResponse(
+    {
+      reply: "You want two short workouts each week.",
+      phase: "summary",
+      readyToGenerate: true,
+      safetyStop: false,
+    },
+    {}
+  );
+  assert.equal(normalSummary.reply.endsWith(summaryEnding), true);
+  assert.equal(normalSummary.readyToGenerate, false);
+
+  const correctedSummary = helperContext.finalizeGoalsCoachResponse(
+    {
+      reply: "Correction: you can train two days each week.",
+      phase: "summary",
+      profile: { daysPerWeek: "2" },
+      readyToGenerate: false,
+      safetyStop: false,
+    },
+    {}
+  );
+  assert.equal(correctedSummary.profile.daysPerWeek, "2");
+  assert.equal(correctedSummary.reply.endsWith(summaryEnding), true);
+  assert.equal(correctedSummary.reply.split(summaryEnding).length - 1, 1);
+
   assert.match(coachPrompt, /Set phase to summary and end exactly with/);
   assert.match(coachPrompt, /If the member corrects the summary, update the profile/);
-  assert.match(coachRoute, /var isSummaryMessage = phase === "summary"/);
-  assert.match(coachRoute, /if \(isSummaryMessage\) reply = ensureGoalsCoachSummaryEnding\(reply\)/);
+  assert.match(coachRoute, /finalizeGoalsCoachResponse\(result, profile\)/);
   assert.doesNotMatch(coachRoute, /reply\.toLowerCase\(\)\.includes/);
-  assert.match(coachRoute, /readyToGenerate: isSummaryMessage \? false/);
 });
 
 test("1.0 keeps unknown facts unknown in both assessment and plan prompts", () => {
@@ -131,7 +175,15 @@ test("1.0 safety instructions and response JSON contract remain in place", () =>
   ];
 
   for (const rule of safetyRules) assert.ok(coachPrompt.includes(rule), rule);
-  for (const key of ["reply", "phase", "profile", "readyToGenerate", "safetyStop"]) {
-    assert.match(coachRoute, new RegExp(`${key}:`));
-  }
+  const response = helperContext.finalizeGoalsCoachResponse(
+    { reply: "Ready.", phase: "confirmed", readyToGenerate: true },
+    {}
+  );
+  assert.deepEqual(Object.keys(response).sort(), [
+    "phase",
+    "profile",
+    "readyToGenerate",
+    "reply",
+    "safetyStop",
+  ]);
 });

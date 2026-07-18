@@ -555,6 +555,23 @@ function countGoalsCoachMemberAnswers(messages) {
   }, 0);
 }
 
+function finalizeGoalsCoachResponse(result, fallbackProfile) {
+  var reply = result.reply || "Tell me a little more about that.";
+  var phase = result.phase || "assessment";
+  var safetyStop = Boolean(result.safetyStop);
+  var isSummaryMessage = !safetyStop && phase === "summary";
+
+  if (isSummaryMessage) reply = ensureGoalsCoachSummaryEnding(reply);
+
+  return {
+    reply: reply,
+    phase: phase,
+    profile: result.profile || fallbackProfile || {},
+    readyToGenerate: !safetyStop && !isSummaryMessage && Boolean(result.readyToGenerate),
+    safetyStop: safetyStop,
+  };
+}
+
 var COACH_SYSTEM =
   "You are Goals Coach, the digital coaching experience for Ultimate Goals Fitness,\n" +
   "a friendly and approachable 24/7 gym community in the Black Hills of South Dakota.\n" +
@@ -717,17 +734,7 @@ app.post("/coach-message", coachMessageLimiter, async function (req, res) {
     });
 
     var result = JSON.parse(completion.choices[0].message.content || "{}");
-    var reply = result.reply || "Tell me a little more about that.";
-    var phase = result.phase || "assessment";
-    var isSummaryMessage = phase === "summary";
-    if (isSummaryMessage) reply = ensureGoalsCoachSummaryEnding(reply);
-    return res.json({
-      reply: reply,
-      phase: phase,
-      profile: result.profile || profile || {},
-      readyToGenerate: isSummaryMessage ? false : Boolean(result.readyToGenerate),
-      safetyStop: Boolean(result.safetyStop),
-    });
+    return res.json(finalizeGoalsCoachResponse(result, profile));
   } catch (err) {
     console.error("[UGF] coach-message error:", err.message);
     return res.status(500).json({ error: "The coach is temporarily unavailable." });
