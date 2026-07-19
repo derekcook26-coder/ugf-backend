@@ -6,6 +6,7 @@ const {
   publicTurnStatus,
   serializeTurnSummary,
 } = require("./phase1b-contracts");
+const { createVoiceCapability } = require("./phase1c-contracts");
 const { conflict, notFound, withTransaction } = require("./repository");
 const { encodeCursor } = require("./validation");
 
@@ -69,6 +70,8 @@ function createAlphaGoalsCoachService(options) {
   const configuration = options.applicationConfiguration;
   const coachingCapability = options.coachingCapability
     || createCoachingCapability(null);
+  const voiceCapability = options.voiceCapability
+    || createVoiceCapability(null);
 
   async function phase1bSchemaAvailability(client) {
     const result = await client.query(
@@ -357,6 +360,7 @@ function createAlphaGoalsCoachService(options) {
           : { displayName: null, reference: "one of our coaches" },
         coachingMode: "phase_1a_test_only",
         coachingCapability,
+        voiceCapability,
         workoutState,
       };
     });
