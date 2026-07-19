@@ -23,6 +23,7 @@ var {
   loadAlphaApplicationConfiguration,
 } = require("./src/goals-coach/alpha-config");
 var { createAlphaGoalsCoachRouter } = require("./src/goals-coach/alpha-routes");
+var { createApplicationJsonParser } = require("./src/goals-coach/transcription-route");
 var { createPhase1bStartup } = require("./src/goals-coach/phase1b-startup");
 var { createPhase1cStartup } = require("./src/goals-coach/phase1c-startup");
 var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
@@ -32,7 +33,10 @@ var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
 // so Express exposes the client address to express-rate-limit.
 app.set("trust proxy", 1);
-app.use(express.json());
+// Only the exact canonical transcription path (or exact missing-ID fallback)
+// owns a bounded raw-body parser after its capability gate. Every other path
+// retains the existing JSON parser.
+app.use(createApplicationJsonParser());
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 

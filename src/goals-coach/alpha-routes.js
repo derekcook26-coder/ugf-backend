@@ -4,6 +4,7 @@ const { createCoachingCapability } = require("./phase1b-contracts");
 const { createVoiceCapability } = require("./phase1c-contracts");
 const { createPhase1bCoachingService } = require("./phase1b-service");
 const { createAlphaRateLimits } = require("./alpha-rate-limits");
+const { createTranscriptionRoute } = require("./transcription-route");
 const {
   alphaMessageInput,
   consentInput,
@@ -47,6 +48,11 @@ function createAlphaGoalsCoachRouter(options) {
     })
     : null);
   const rateLimits = options.rateLimits || createAlphaRateLimits();
+  const transcriptionRoute = createTranscriptionRoute({
+    db: options.db,
+    phase1cStartup: options.phase1cStartup,
+    transcriptionService: options.transcriptionService,
+  });
 
   if (typeof requireCurrentConsent !== "function") {
     throw new Error("Alpha Goals Coach routes require current-consent authorization");
@@ -70,6 +76,15 @@ function createAlphaGoalsCoachRouter(options) {
   });
 
   router.use(requireCurrentConsent);
+
+  router.post(
+    "/conversations/:conversationId/transcriptions/:requestId",
+    transcriptionRoute
+  );
+  router.post(
+    "/conversations/:conversationId/transcriptions",
+    transcriptionRoute
+  );
 
   router.get("/profile", rateLimits.read, async (req, res, next) => {
     try {
