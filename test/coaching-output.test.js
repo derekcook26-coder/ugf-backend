@@ -170,6 +170,129 @@ test("review-required and safety output cannot silently mutate workout state", (
   ]);
 });
 
+test("safety_stop rejects incomplete, inverse, and non-urgent safety combinations", () => {
+  const review = {
+    required: true,
+    priority: "urgent",
+    category: "safety",
+    reason: "Synthetic urgent safety review",
+  };
+  const stoppedConversation = { workoutActive: false, awaitingMemberCompletion: false };
+  rejectsEvery([
+    validOutput({
+      mode: "safety_stop",
+      conversationState: stoppedConversation,
+      stateTransition: { type: "no_change" },
+      review,
+      safety: { stopNormalCoaching: false, severity: "urgent" },
+    }),
+    validOutput({
+      mode: "safety_stop",
+      conversationState: stoppedConversation,
+      stateTransition: { type: "no_change" },
+      review,
+      safety: { stopNormalCoaching: false, severity: "none" },
+    }),
+    validOutput({
+      mode: "safety_stop",
+      conversationState: stoppedConversation,
+      stateTransition: { type: "no_change" },
+      review,
+      safety: { stopNormalCoaching: false, severity: "modify" },
+    }),
+    validOutput({
+      mode: "safety_stop",
+      conversationState: stoppedConversation,
+      stateTransition: { type: "no_change" },
+      safety: { stopNormalCoaching: true, severity: "urgent" },
+    }),
+    validOutput({
+      mode: "exercise_help",
+      stateTransition: { type: "no_change" },
+      review,
+      safety: { stopNormalCoaching: true, severity: "urgent" },
+    }),
+    validOutput({
+      mode: "exercise_help",
+      stateTransition: { type: "no_change" },
+      review,
+      safety: { stopNormalCoaching: false, severity: "urgent" },
+    }),
+  ]);
+});
+
+test("human_review requires complete review metadata and cannot stop normal coaching", () => {
+  rejectsEvery([
+    validOutput({
+      mode: "human_review",
+      stateTransition: { type: "no_change" },
+    }),
+    validOutput({
+      mode: "human_review",
+      stateTransition: { type: "no_change" },
+      review: {
+        required: true,
+        priority: "routine",
+        category: "member_request",
+        reason: "Synthetic review recommendation",
+      },
+      safety: { stopNormalCoaching: true, severity: "urgent" },
+    }),
+    validOutput({
+      mode: "human_review",
+      stateTransition: { type: "advance", expectedVersion: 1 },
+      review: {
+        required: true,
+        priority: "routine",
+        category: "member_request",
+        reason: "Synthetic review recommendation",
+      },
+    }),
+  ]);
+});
+
+test("valid urgent safety, human review, and prompt-review safety remain supported", () => {
+  const cases = [
+    validOutput({
+      mode: "safety_stop",
+      conversationState: { workoutActive: false, awaitingMemberCompletion: false },
+      stateTransition: { type: "no_change" },
+      review: {
+        required: true,
+        priority: "urgent",
+        category: "safety",
+        reason: "Synthetic urgent safety review",
+      },
+      safety: { stopNormalCoaching: true, severity: "urgent" },
+    }),
+    validOutput({
+      mode: "human_review",
+      stateTransition: { type: "request_information" },
+      review: {
+        required: true,
+        priority: "routine",
+        category: "member_request",
+        reason: "Synthetic human review recommendation",
+      },
+      safety: { stopNormalCoaching: false, severity: "none" },
+    }),
+    validOutput({
+      mode: "exercise_help",
+      stateTransition: { type: "no_change" },
+      review: {
+        required: true,
+        priority: "priority",
+        category: "pain_or_injury",
+        reason: "Synthetic prompt-review recommendation",
+      },
+      safety: { stopNormalCoaching: false, severity: "prompt_review" },
+    }),
+  ];
+  for (const value of cases) {
+    assert.doesNotThrow(() => validateStructuredCoachingOutput(value, configuration));
+  }
+});
+
 test("uncertainty and completed or stopped conversation state must be internally consistent", () => {
   rejectsEvery([
     validOutput({ uncertainty: { missingContext: true, reason: null } }),

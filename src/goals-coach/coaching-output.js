@@ -233,17 +233,37 @@ function validateStructuredCoachingOutput(raw, configuration) {
     ["none", "modify", "prompt_review", "urgent"]
   );
   const stopNormalCoaching = boolean(safety.stopNormalCoaching, "safety.stopNormalCoaching");
-  if ((safetySeverity === "urgent") !== stopNormalCoaching) {
-    throw new CoachingOutputValidationError("urgent safety output must stop normal coaching");
+  const nonMutatingTransition = ["no_change", "request_information"].includes(transitionType);
+  if (mode === "safety_stop"
+    && (!stopNormalCoaching
+      || safetySeverity !== "urgent"
+      || !reviewRequired
+      || !nonMutatingTransition)) {
+    throw new CoachingOutputValidationError(
+      "safety_stop mode requires urgent safety, required review, and a non-mutating transition"
+    );
   }
-  if (safetySeverity === "urgent" && mode !== "safety_stop") {
-    throw new CoachingOutputValidationError("urgent safety output requires safety_stop mode");
+  if (stopNormalCoaching && (mode !== "safety_stop" || safetySeverity !== "urgent")) {
+    throw new CoachingOutputValidationError(
+      "stopped coaching requires urgent safety_stop mode"
+    );
+  }
+  if (safetySeverity === "urgent"
+    && (mode !== "safety_stop" || !stopNormalCoaching || !reviewRequired)) {
+    throw new CoachingOutputValidationError(
+      "urgent safety requires stopped safety_stop mode and required review"
+    );
+  }
+  if (mode === "human_review"
+    && (!reviewRequired || !nonMutatingTransition || stopNormalCoaching)) {
+    throw new CoachingOutputValidationError(
+      "human_review mode requires review, a non-mutating transition, and active normal safety handling"
+    );
   }
   if (["prompt_review", "urgent"].includes(safetySeverity) && !reviewRequired) {
     throw new CoachingOutputValidationError("review-level safety output requires a review recommendation");
   }
-  if (["human_review", "safety_stop"].includes(mode)
-    && !["no_change", "request_information"].includes(transitionType)) {
+  if (["human_review", "safety_stop"].includes(mode) && !nonMutatingTransition) {
     throw new CoachingOutputValidationError("review and safety-stop modes cannot mutate workout state");
   }
 
