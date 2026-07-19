@@ -24,6 +24,7 @@ var {
 } = require("./src/goals-coach/alpha-config");
 var { createAlphaGoalsCoachRouter } = require("./src/goals-coach/alpha-routes");
 var { createPhase1bStartup } = require("./src/goals-coach/phase1b-startup");
+var { createPhase1cStartup } = require("./src/goals-coach/phase1c-startup");
 var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
 var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
 
@@ -49,6 +50,10 @@ var alphaApplicationConfiguration = loadAlphaApplicationConfiguration();
 // but coaching remains unavailable unless an approved provider is explicitly
 // supplied to the startup composition in a separately authorized release.
 var phase1bStartup = createPhase1bStartup();
+// Phase 1C has no production transcription adapter or approved consent version.
+// Startup remains healthy, but voice capability cannot become ready from
+// environment values alone.
+var phase1cStartup = createPhase1cStartup({ phase1bStartup: phase1bStartup });
 app.use("/alpha/goals-coach", createAlphaOriginGuard(alphaAuthConfiguration));
 
 var memberCors = cors({
@@ -1681,6 +1686,7 @@ app.use(
     requireCurrentConsent: alphaMemberAuthorization.requireCurrentAlphaConsent,
     coachingEngine: phase1bStartup.engine,
     phase1bStartup: phase1bStartup,
+    phase1cStartup: phase1cStartup,
   })
 );
 

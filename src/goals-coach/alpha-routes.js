@@ -1,6 +1,7 @@
 const express = require("express");
 const { createAlphaGoalsCoachService } = require("./alpha-service");
 const { createCoachingCapability } = require("./phase1b-contracts");
+const { createVoiceCapability } = require("./phase1c-contracts");
 const { createPhase1bCoachingService } = require("./phase1b-service");
 const { createAlphaRateLimits } = require("./alpha-rate-limits");
 const {
@@ -33,6 +34,7 @@ function createAlphaGoalsCoachRouter(options) {
     db: options.db,
     applicationConfiguration: options.applicationConfiguration,
     coachingCapability: createCoachingCapability(capabilityStartup),
+    voiceCapability: createVoiceCapability(options.phase1cStartup),
   });
   const requireCurrentConsent = options.requireCurrentConsent;
   const testOnlyResponder = options.testOnlyResponder || null;
