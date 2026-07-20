@@ -60,6 +60,34 @@ Capability semantics are server authoritative:
 
 Production startup does not add a provider adapter in this change. Its capability therefore cannot become ready merely because configuration strings exist.
 
+## Message submission
+
+`POST /alpha/goals-coach/conversations/:conversationId/messages` accepts a strict JSON object. A typed message remains backward compatible:
+
+```json
+{
+  "content": "Typed message",
+  "clientMessageId": "7d25d744-a1e5-4caf-aac1-0f263e6ecbef"
+}
+```
+
+Omitted `inputMethod` means `text`. An explicit `"inputMethod": "text"` is also accepted, but text input cannot include `transcriptionId`. A reviewed Phase 1C transcript uses:
+
+```json
+{
+  "content": "Reviewed transcript, possibly edited",
+  "clientMessageId": "7d25d744-a1e5-4caf-aac1-0f263e6ecbef",
+  "inputMethod": "voice",
+  "transcriptionId": "4a53bfa5-51a7-4ccc-9a0d-f1696eb8e021"
+}
+```
+
+The body may contain only `content`, `clientMessageId`, `inputMethod`, and the conditionally required `transcriptionId`. Browser-supplied member, mapping, session, conversation, plan, provider, model, attempt, or other fields are rejected before mutation. `content` must be an actual JSON string before trimming; numbers, booleans, arrays, objects, and `null` are rejected without coercion. The trimmed string must contain 1 through 8,000 characters; identifiers must be canonical UUIDs, and the transcription UUID must be lowercase.
+
+Voice submission also requires an explicitly injected ready Phase 1C startup composition and server-only transcription binding key. Authenticated session identity comes separately from server authentication state and is never accepted from JSON. Production composes neither requirement, so environment values alone cannot activate voice submission. Typed submission retains its independent Migration 001–004 SQL path and never queries Migration 005 storage.
+
+Voice staging uses the global overlapping lock order: active mapping and consent, authoritative conversation, coaching-turn target/table, then transcription attempt. Phase 1B provider finalization follows the same prefix by locking mapping/consent and the authoritative conversation before its coaching turn. It locks and fully validates the supplied attempt before considering an unrelated pending coaching turn. Unknown, cross-scope, non-completed, expired, or improperly consumed attempts therefore share the same concealed `404 TRANSCRIPTION_NOT_FOUND`; only an otherwise eligible attempt can be rejected with `409 COACHING_TURN_IN_PROGRESS`. A completed attempt that expires during the transaction is committed as `expired` before the concealed response.
+
 ## Turn reconciliation
 
 `GET /alpha/goals-coach/conversations/:conversationId/turns/:clientMessageId`
@@ -120,11 +148,11 @@ This procedure requires no browser persistence of protected conversation or work
 
 ## Safe retry procedure
 
-1. If message submission returns `COACHING_TEMPORARILY_UNAVAILABLE` with `messageSaved: true` and `retrySafe: true`, retain the same content and `clientMessageId` for the retry.
+1. If message submission returns `COACHING_TEMPORARILY_UNAVAILABLE` with `messageSaved: true` and `retrySafe: true`, retain the same normalized content, `clientMessageId`, and input method for the retry. Voice retries also retain the exact `transcriptionId`.
 2. After refresh, discover the server-backed `clientMessageId` and turn summary in message history.
 3. Reconcile the latest attempt through the turn endpoint.
 4. Retry only when the authoritative response is `retryable_failure` with `retrySafe: true`.
-5. Submit the exact original content and same `clientMessageId`. Different content returns `409 CLIENT_MESSAGE_ID_CONFLICT`.
+5. Submit the exact original content and same `clientMessageId`. Different content, transcription identity, or text/voice conversion returns `409 CLIENT_MESSAGE_ID_CONFLICT`.
 6. A completed retry returns the existing logical member message with the new completed attempt; duplicate completed requests return the existing result without duplicating workout state or provenance.
 
 ## Human-review boundary

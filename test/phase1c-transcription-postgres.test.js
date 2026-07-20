@@ -3,7 +3,16 @@ const crypto = require("node:crypto");
 const test = require("node:test");
 const { runMigration } = require("../migrate_005");
 const { runRollback } = require("../rollback_005");
-const { createTranscriptionService } = require("../src/goals-coach/transcription-service");
+const {
+  APPROVED_ALPHA_CONSENT_VERSION,
+} = require("../src/goals-coach/alpha-config");
+const {
+  createPhase1bCoachingService,
+} = require("../src/goals-coach/phase1b-service");
+const {
+  createTranscriptionService,
+  sessionDigest,
+} = require("../src/goals-coach/transcription-service");
 const {
   seedAlphaMapping,
   seedMemberAndPlan,
@@ -16,6 +25,14 @@ const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0
   ? "embedded PostgreSQL refuses to run as root; run this suite as an unprivileged user"
   : false;
+
+const NATIVE_BINDING_KEY = "synthetic-native-lock-order-binding-key";
+const NATIVE_SESSION_ID = "synthetic-native-lock-order-session";
+const NATIVE_APPLICATION_CONFIGURATION = Object.freeze({
+  valid: true,
+  consentVersion: APPROVED_ALPHA_CONSENT_VERSION,
+  alphaEnvironment: "test",
+});
 
 function deferred() {
   let resolve;
@@ -86,6 +103,87 @@ async function countRelationLocks(pool, expected) {
   )).rows[0].count);
 }
 
+async function relationLocksForBackend(pool, relationName, backendPid) {
+  return (await pool.query(
+    `SELECT locks.mode, locks.granted
+     FROM pg_locks AS locks
+     JOIN pg_class AS relation ON relation.oid = locks.relation
+     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = 'public'
+       AND relation.relname = $1
+       AND locks.pid = $2
+     ORDER BY locks.granted DESC, locks.mode`,
+    [relationName, backendPid]
+  )).rows;
+}
+
+async function waitForBackendLockWait(pool, backendPid) {
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const activity = await pool.query(
+      `SELECT pid::int AS pid, state, wait_event_type, wait_event
+       FROM pg_stat_activity
+       WHERE pid = $1`,
+      [backendPid]
+    );
+    if (activity.rows[0] && activity.rows[0].wait_event_type === "Lock") {
+      return activity.rows[0];
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for backend ${backendPid} to wait on a lock`);
+}
+
+async function waitForBlockingPid(pool, blockedPid, blockingPid) {
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const result = await pool.query(
+      `SELECT pg_blocking_pids($1)::int[] AS blocking_pids`,
+      [blockedPid]
+    );
+    const blockingPids = result.rows[0].blocking_pids.map(Number);
+    if (blockingPids.includes(blockingPid)) return blockingPids;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(
+    `Timed out waiting for backend ${blockedPid} to be blocked by ${blockingPid}`
+  );
+}
+
+async function backendLockEvidence(pool, backendPid, relationNames) {
+  return (await pool.query(
+    `SELECT locks.locktype,
+            relation.relname AS relation,
+            locks.mode,
+            locks.granted
+     FROM pg_locks AS locks
+     LEFT JOIN pg_class AS relation ON relation.oid = locks.relation
+     LEFT JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+     WHERE locks.pid = $1
+       AND (
+         (namespace.nspname = 'public' AND relation.relname = ANY($2::text[]))
+         OR locks.granted = FALSE
+       )
+     ORDER BY locks.granted DESC, relation.relname NULLS LAST, locks.locktype, locks.mode`,
+    [backendPid, relationNames]
+  )).rows.map((row) => ({
+    lockType: row.locktype,
+    relation: row.relation,
+    mode: row.mode,
+    granted: row.granted,
+  }));
+}
+
+async function assertNoLeakedTransactions(pool) {
+  const result = await pool.query(
+    `SELECT pid::int AS pid, state
+     FROM pg_stat_activity
+     WHERE datname = current_database()
+       AND usename = current_user
+       AND pid <> pg_backend_pid()
+       AND state IN ('idle in transaction', 'idle in transaction (aborted)')`
+  );
+  assert.deepEqual(result.rows, []);
+}
+
 async function releaseClients(clients) {
   for (const client of clients) {
     try {
@@ -115,6 +213,98 @@ async function seedFixture(pool, suffix) {
       authProvider: mapping.auth_provider,
       authSubject: mapping.auth_subject,
     },
+  };
+}
+
+async function acceptFixtureConsent(pool, fixture) {
+  await pool.query(
+    `INSERT INTO goals_coach_alpha_consents
+      (member_id, auth_mapping_id, consent_version, environment, status, accepted_at)
+     VALUES ($1, $2, $3, 'test', 'accepted', NOW())`,
+    [fixture.member.memberId, fixture.mapping.id, APPROVED_ALPHA_CONSENT_VERSION]
+  );
+}
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+async function insertCompletedVoiceAttempt(pool, fixture, content) {
+  return (await pool.query(
+    `INSERT INTO goals_coach_transcription_attempts
+      (id, request_id, attempt_number, member_id, auth_mapping_id,
+       auth_session_digest, conversation_id, plan_id, status, mime_type,
+       audio_byte_count, audio_duration_ms, audio_digest, transcript_digest,
+       provider_identifier, model_identifier, provider_started_at,
+       provider_completed_at, expires_at, created_at)
+     VALUES ($1, $2, 1, $3, $4, $5, $6, $7, 'completed',
+       'audio/webm;codecs=opus', 32, 1200, $8, $9,
+       'synthetic-native-provider', 'synthetic-native-model',
+       NOW() - INTERVAL '2 seconds', NOW() - INTERVAL '1 second',
+       NOW() + INTERVAL '10 minutes', NOW() - INTERVAL '3 seconds')
+     RETURNING *`,
+    [
+      crypto.randomUUID(),
+      crypto.randomUUID(),
+      fixture.member.memberId,
+      fixture.mapping.id,
+      sessionDigest(NATIVE_BINDING_KEY, NATIVE_SESSION_ID),
+      fixture.conversation.id,
+      fixture.plan.id,
+      sha256("synthetic native voice audio"),
+      sha256(content),
+    ]
+  )).rows[0];
+}
+
+function nativeCoachingOutput(configuration) {
+  return {
+    reply: "Synthetic native lock-order response.",
+    mode: "start_today",
+    nextAction: null,
+    conversationState: { workoutActive: false, awaitingMemberCompletion: false },
+    stateTransition: { type: "no_change", expectedVersion: null, changes: {} },
+    review: { required: false, priority: null, category: null, reason: null },
+    safety: { stopNormalCoaching: false, severity: "none" },
+    uncertainty: { missingContext: false, reason: null },
+    promptVersion: configuration.promptVersion,
+    schemaVersion: configuration.structuredOutputVersion,
+  };
+}
+
+function nativeVoiceService(pool, transactionHooks, onProviderCall) {
+  const configuration = Object.freeze({
+    providerIdentifier: "synthetic-native-coaching-provider",
+    modelIdentifier: "synthetic-native-coaching-model",
+    promptVersion: "GC-PROMPT-1B-1.0",
+    structuredOutputVersion: "GC-OUTPUT-1B-1.0",
+    safetyRuleVersion: "GC-SAFETY-PLACEHOLDER-1B",
+    providerTimeoutMs: 15000,
+  });
+  return createPhase1bCoachingService({
+    db: pool,
+    applicationConfiguration: NATIVE_APPLICATION_CONFIGURATION,
+    phase1cStartup: { status: "ready" },
+    transcriptionBindingKey: NATIVE_BINDING_KEY,
+    transactionHooks,
+    pendingPollIntervalMs: 2,
+    pendingWaitTimeoutMs: 20000,
+    engine: {
+      configuration,
+      async generateTurn() {
+        if (onProviderCall) await onProviderCall();
+        return { output: nativeCoachingOutput(configuration) };
+      },
+    },
+  });
+}
+
+function nativeVoiceInput(attempt, clientMessageId = crypto.randomUUID()) {
+  return {
+    content: "Synthetic native reviewed transcript",
+    clientMessageId,
+    inputMethod: "voice",
+    transcriptionId: attempt.id,
   };
 }
 
@@ -234,13 +424,14 @@ async function linkAttemptTargetFirst(client, fixture, turnId) {
   return { attempt, linkedTurn };
 }
 
-function service(pool, deterministic) {
+function service(pool, deterministic, options = {}) {
   return createTranscriptionService({
     db: pool,
     adapter: deterministic.adapter,
     bindingKey: "synthetic-real-postgres-binding-key",
     providerTimeoutMs: 500,
     operationTimeoutMs: 1000,
+    ...options,
   });
 }
 
@@ -931,3 +1122,520 @@ test("two concurrent request IDs for one member allow only one provider-owned at
     "SELECT COUNT(*)::int AS count FROM goals_coach_transcription_attempts"
   )).rows[0].count, 1);
 });
+
+test(
+  "voice staging and transcription finalization preserve mapping-conversation-attempt lock order",
+  { skip: skipForRoot, timeout: 30000 },
+  async (t) => {
+    const disposable = await createRealDisposablePostgres({ phase1b: true });
+    const providerEntered = deferred();
+    const releaseTranscriptionProvider = deferred();
+    const voiceOwnsEarlierLocks = deferred();
+    const releaseVoiceAttemptStage = deferred();
+    const finalizerStarted = deferred();
+    let transcription;
+    let voice;
+    t.after(async () => {
+      releaseTranscriptionProvider.resolve();
+      releaseVoiceAttemptStage.resolve();
+      await Promise.allSettled(
+        [transcription, voice].filter(Boolean).map((tracked) => tracked.promise)
+      );
+      await disposable.close();
+    });
+    await runMigration({ pool: disposable.pool });
+    const fixture = await seedFixture(disposable.pool, "postgres-global-lock-order-two-way");
+    await acceptFixtureConsent(disposable.pool, fixture);
+
+    const finalTranscript = "Synthetic native finalization transcript";
+    const transcriptionRequestId = crypto.randomUUID();
+    const deterministic = createDeterministicTranscriptionAdapter({
+      text: finalTranscript,
+      durationMs: 1400,
+      async onCall() {
+        providerEntered.resolve();
+        await releaseTranscriptionProvider.promise;
+      },
+    });
+    const transcriptionService = service(disposable.pool, deterministic, {
+      bindingKey: NATIVE_BINDING_KEY,
+      providerTimeoutMs: 15000,
+      operationTimeoutMs: 20000,
+      transactionHooks: {
+        beforeFinalizeOwnershipLocks({ backendPid }) {
+          finalizerStarted.resolve(backendPid);
+        },
+      },
+    });
+    transcription = trackSettlement(
+      transcriptionService.transcribe({
+        ...input(fixture, transcriptionRequestId),
+        authenticatedSessionId: NATIVE_SESSION_ID,
+      })
+    );
+    await providerEntered.promise;
+
+    const pendingAttempts = await disposable.pool.query(
+      `SELECT *
+       FROM goals_coach_transcription_attempts
+       WHERE request_id = $1
+       ORDER BY attempt_number`,
+      [transcriptionRequestId]
+    );
+    assert.equal(pendingAttempts.rows.length, 1);
+    const sharedAttempt = pendingAttempts.rows[0];
+    assert.equal(sharedAttempt.status, "pending");
+    assert.equal(sharedAttempt.attempt_number, 1);
+    let coachingProviderCalls = 0;
+    const voiceService = nativeVoiceService(
+      disposable.pool,
+      {
+        async afterVoiceTurnLock({ backendPid }) {
+          voiceOwnsEarlierLocks.resolve(backendPid);
+          await releaseVoiceAttemptStage.promise;
+        },
+      },
+      async () => { coachingProviderCalls += 1; }
+    );
+    voice = trackSettlement(voiceService.sendMessage(
+      fixture.member,
+      String(fixture.conversation.id),
+      nativeVoiceInput(sharedAttempt),
+      { authenticatedSessionId: NATIVE_SESSION_ID }
+    ));
+    const voicePid = await voiceOwnsEarlierLocks.promise;
+    const voiceGrantedLocks = [];
+    for (const [relation, mode] of [
+      ["goals_coach_member_auth_mappings", "RowShareLock"],
+      ["coaching_conversations", "RowShareLock"],
+      ["goals_coach_coaching_turns", "RowExclusiveLock"],
+    ]) {
+      const granted = await waitForRelationLock(disposable.pool, {
+        relation,
+        pid: voicePid,
+        mode,
+        granted: true,
+      });
+      assert.equal(granted.granted, true);
+      voiceGrantedLocks.push({ relation, mode, granted: granted.granted });
+    }
+    assert.deepEqual(
+      await relationLocksForBackend(
+        disposable.pool,
+        "goals_coach_transcription_attempts",
+        voicePid
+      ),
+      []
+    );
+
+    releaseTranscriptionProvider.resolve();
+    const finalizerPid = await finalizerStarted.promise;
+    const finalizerWait = await waitForBackendLockWait(disposable.pool, finalizerPid);
+    assert.equal(finalizerWait.wait_event_type, "Lock");
+    assert.ok(finalizerWait.wait_event);
+    const finalizerBlockingPids = await waitForBlockingPid(
+      disposable.pool,
+      finalizerPid,
+      voicePid
+    );
+    assert.ok(finalizerBlockingPids.includes(voicePid));
+    assert.deepEqual(
+      await relationLocksForBackend(
+        disposable.pool,
+        "goals_coach_transcription_attempts",
+        finalizerPid
+      ),
+      [],
+      "finalization must not lock the attempt before its authoritative mapping/conversation"
+    );
+    const relevantRelations = [
+      "goals_coach_member_auth_mappings",
+      "coaching_conversations",
+      "goals_coach_coaching_turns",
+      "goals_coach_transcription_attempts",
+    ];
+    const voiceLockEvidence = await backendLockEvidence(
+      disposable.pool,
+      voicePid,
+      relevantRelations
+    );
+    const finalizerLockEvidence = await backendLockEvidence(
+      disposable.pool,
+      finalizerPid,
+      relevantRelations
+    );
+    assert.equal(transcription.isSettled(), false);
+
+    releaseVoiceAttemptStage.resolve();
+    const [voiceResult, transcriptionResult] = await Promise.allSettled([
+      voice.promise,
+      transcription.promise,
+    ]);
+    for (const result of [voiceResult, transcriptionResult]) {
+      if (result.status === "rejected") {
+        assert.notEqual(result.reason && result.reason.code, "40P01");
+        assert.notEqual(result.reason && result.reason.code, "55P03");
+      }
+    }
+    assert.equal(voiceResult.status, "rejected");
+    assert.equal(voiceResult.reason.statusCode, 404);
+    assert.equal(voiceResult.reason.code, "TRANSCRIPTION_NOT_FOUND");
+    assert.equal(voiceResult.reason.message, "Transcription not found");
+    assert.equal(
+      transcriptionResult.status,
+      "fulfilled",
+      transcriptionResult.reason && transcriptionResult.reason.message
+    );
+    assert.equal(deterministic.getCallCount(), 1);
+    assert.equal(coachingProviderCalls, 0);
+    assert.equal(transcriptionResult.value.transcriptionId, sharedAttempt.id);
+    assert.equal(transcriptionResult.value.transcript, finalTranscript);
+    assert.equal(transcriptionResult.value.attemptNumber, 1);
+
+    const attemptStates = await disposable.pool.query(
+      `SELECT id, request_id, attempt_number, status, consumed_at,
+              consumed_member_message_id
+       FROM goals_coach_transcription_attempts
+       ORDER BY id`
+    );
+    assert.deepEqual(attemptStates.rows, [{
+      id: sharedAttempt.id,
+      request_id: transcriptionRequestId,
+      attempt_number: 1,
+      status: "completed",
+      consumed_at: null,
+      consumed_member_message_id: null,
+    }]);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM coaching_messages"
+    )).rows[0].count, 0);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_coaching_turns"
+    )).rows[0].count, 0);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count FROM goals_coach_coaching_turns
+       WHERE transcription_attempt_id IS NOT NULL`
+    )).rows[0].count, 0);
+    await assertNoLeakedTransactions(disposable.pool);
+    t.diagnostic(JSON.stringify({
+      evidence: "postgres-lock-order",
+      race: "same-attempt voice-staging versus transcription-finalization",
+      voicePid,
+      finalizerPid,
+      relevantRelations,
+      voiceGrantedLocks,
+      voiceLocks: voiceLockEvidence,
+      finalizerLocks: finalizerLockEvidence,
+      finalizerBlockingPids,
+      finalAttemptId: sharedAttempt.id,
+      finalAttemptLifecycle: "completed-unconsumed",
+      deadlockObserved: false,
+      lockTimeoutObserved: false,
+      statementTimeoutObserved: false,
+      retryObserved: false,
+    }));
+  }
+);
+
+test(
+  "voice staging, finalization, and Rollback 005 form no three-way deadlock cycle",
+  { skip: skipForRoot, timeout: 30000 },
+  async (t) => {
+    const disposable = await createRealDisposablePostgres({ phase1b: true });
+    const providerEntered = deferred();
+    const releaseTranscriptionProvider = deferred();
+    const rollbackOwnsTurnTable = deferred();
+    const releaseRollbackSecondLock = deferred();
+    const voiceReachedTurnLock = deferred();
+    const finalizerStarted = deferred();
+    let transcription;
+    let rollback;
+    let voice;
+    t.after(async () => {
+      releaseTranscriptionProvider.resolve();
+      releaseRollbackSecondLock.resolve();
+      await Promise.allSettled(
+        [transcription, rollback, voice].filter(Boolean).map((tracked) => tracked.promise)
+      );
+      await disposable.close();
+    });
+    await runMigration({ pool: disposable.pool });
+    const fixture = await seedFixture(disposable.pool, "postgres-global-lock-order-three-way");
+    await acceptFixtureConsent(disposable.pool, fixture);
+
+    const finalTranscript = "Synthetic native three-way finalization transcript";
+    const transcriptionRequestId = crypto.randomUUID();
+    const deterministic = createDeterministicTranscriptionAdapter({
+      text: finalTranscript,
+      durationMs: 1500,
+      async onCall() {
+        providerEntered.resolve();
+        await releaseTranscriptionProvider.promise;
+      },
+    });
+    const transcriptionService = service(disposable.pool, deterministic, {
+      providerTimeoutMs: 15000,
+      operationTimeoutMs: 20000,
+      transactionHooks: {
+        beforeFinalizeOwnershipLocks({ backendPid }) {
+          finalizerStarted.resolve(backendPid);
+        },
+      },
+    });
+    transcription = trackSettlement(
+      transcriptionService.transcribe(input(fixture, transcriptionRequestId))
+    );
+    await providerEntered.promise;
+    const finalizerAttempts = await disposable.pool.query(
+      `SELECT *
+       FROM goals_coach_transcription_attempts
+       WHERE request_id = $1
+       ORDER BY attempt_number`,
+      [transcriptionRequestId]
+    );
+    assert.equal(finalizerAttempts.rows.length, 1);
+    const finalizerAttempt = finalizerAttempts.rows[0];
+    assert.equal(finalizerAttempt.status, "pending");
+    assert.equal(finalizerAttempt.attempt_number, 1);
+    const voiceAttempt = await insertCompletedVoiceAttempt(
+      disposable.pool,
+      fixture,
+      "Synthetic native reviewed transcript"
+    );
+
+    rollback = trackSettlement(runRollback({
+      pool: disposable.pool,
+      skipConfirmation: true,
+      async afterFirstTableLock({ backendPid }) {
+        rollbackOwnsTurnTable.resolve(backendPid);
+        await releaseRollbackSecondLock.promise;
+      },
+    }));
+    const rollbackPid = await rollbackOwnsTurnTable.promise;
+    const rollbackTurnLock = await waitForRelationLock(disposable.pool, {
+      relation: "goals_coach_coaching_turns",
+      pid: rollbackPid,
+      mode: "AccessExclusiveLock",
+      granted: true,
+    });
+    assert.equal(rollbackTurnLock.granted, true);
+    assert.deepEqual(
+      await relationLocksForBackend(
+        disposable.pool,
+        "goals_coach_transcription_attempts",
+        rollbackPid
+      ),
+      []
+    );
+
+    let coachingProviderCalls = 0;
+    const voiceService = nativeVoiceService(
+      disposable.pool,
+      {
+        beforeVoiceTurnLock({ backendPid }) {
+          voiceReachedTurnLock.resolve(backendPid);
+        },
+      },
+      async () => { coachingProviderCalls += 1; }
+    );
+    voice = trackSettlement(voiceService.sendMessage(
+      fixture.member,
+      String(fixture.conversation.id),
+      nativeVoiceInput(voiceAttempt),
+      { authenticatedSessionId: NATIVE_SESSION_ID }
+    ));
+    const voicePid = await voiceReachedTurnLock.promise;
+    const waitingVoiceTurnLock = await waitForRelationLock(disposable.pool, {
+      relation: "goals_coach_coaching_turns",
+      pid: voicePid,
+      mode: "RowExclusiveLock",
+      granted: false,
+    });
+    assert.equal(waitingVoiceTurnLock.granted, false);
+    const voiceBlockingPids = await waitForBlockingPid(
+      disposable.pool,
+      voicePid,
+      rollbackPid
+    );
+    assert.ok(voiceBlockingPids.includes(rollbackPid));
+    for (const relation of [
+      "goals_coach_member_auth_mappings",
+      "coaching_conversations",
+    ]) {
+      const earlierLock = await waitForRelationLock(disposable.pool, {
+        relation,
+        pid: voicePid,
+        mode: "RowShareLock",
+        granted: true,
+      });
+      assert.equal(earlierLock.granted, true);
+    }
+    assert.deepEqual(
+      await relationLocksForBackend(
+        disposable.pool,
+        "goals_coach_transcription_attempts",
+        voicePid
+      ),
+      []
+    );
+
+    releaseTranscriptionProvider.resolve();
+    const finalizerPid = await finalizerStarted.promise;
+    const finalizerWait = await waitForBackendLockWait(disposable.pool, finalizerPid);
+    assert.equal(finalizerWait.wait_event_type, "Lock");
+    const finalizerBlockingPids = await waitForBlockingPid(
+      disposable.pool,
+      finalizerPid,
+      voicePid
+    );
+    assert.ok(finalizerBlockingPids.includes(voicePid));
+    assert.deepEqual(
+      await relationLocksForBackend(
+        disposable.pool,
+        "goals_coach_transcription_attempts",
+        finalizerPid
+      ),
+      [],
+      "the rejected attempt-first finalizer would hold a RowShareLock here"
+    );
+    const relevantRelations = [
+      "goals_coach_member_auth_mappings",
+      "coaching_conversations",
+      "goals_coach_coaching_turns",
+      "goals_coach_transcription_attempts",
+    ];
+    const rollbackLockEvidence = await backendLockEvidence(
+      disposable.pool,
+      rollbackPid,
+      relevantRelations
+    );
+    const voiceLockEvidence = await backendLockEvidence(
+      disposable.pool,
+      voicePid,
+      relevantRelations
+    );
+    const finalizerLockEvidence = await backendLockEvidence(
+      disposable.pool,
+      finalizerPid,
+      relevantRelations
+    );
+    assert.equal(rollback.isSettled(), false);
+    assert.equal(voice.isSettled(), false);
+    assert.equal(transcription.isSettled(), false);
+
+    releaseRollbackSecondLock.resolve();
+    const rollbackError = await captureRejection(rollback.promise);
+    assert.notEqual(rollbackError.code, "40P01");
+    assert.notEqual(rollbackError.code, "55P03");
+    assert.equal(rollbackError.code, "23514");
+    assert.equal(
+      rollbackError.constraint,
+      "goals_coach_transcription_rollback_preservation_required"
+    );
+
+    const [voiceResult, transcriptionResult] = await Promise.allSettled([
+      voice.promise,
+      transcription.promise,
+    ]);
+    for (const result of [voiceResult, transcriptionResult]) {
+      if (result.status === "rejected") {
+        assert.notEqual(result.reason && result.reason.code, "40P01");
+        assert.notEqual(result.reason && result.reason.code, "55P03");
+      }
+      assert.equal(result.status, "fulfilled", result.reason && result.reason.message);
+    }
+    assert.equal(deterministic.getCallCount(), 1);
+    assert.equal(coachingProviderCalls, 1);
+    assert.equal(transcriptionResult.value.transcriptionId, finalizerAttempt.id);
+    assert.equal(transcriptionResult.value.transcript, finalTranscript);
+    assert.equal(transcriptionResult.value.attemptNumber, 1);
+
+    assert.equal((await disposable.pool.query(
+      "SELECT to_regclass('public.goals_coach_transcription_attempts') AS name"
+    )).rows[0].name, "goals_coach_transcription_attempts");
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'goals_coach_coaching_turns'
+         AND column_name = 'transcription_attempt_id'`
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count FROM app_schema_migrations
+       WHERE version = '005_goals_coach_voice_transcription_provenance'`
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings
+       WHERE id = $1 AND active = TRUE`,
+      [fixture.mapping.id]
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count FROM coaching_conversations
+       WHERE id = $1 AND status = 'active'`,
+      [fixture.conversation.id]
+    )).rows[0].count, 1);
+    const voiceState = (await disposable.pool.query(
+      `SELECT status, consumed_member_message_id
+       FROM goals_coach_transcription_attempts WHERE id = $1`,
+      [voiceAttempt.id]
+    )).rows[0];
+    assert.equal(voiceState.status, "consumed");
+    assert.ok(voiceState.consumed_member_message_id);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count FROM goals_coach_coaching_turns
+       WHERE transcription_attempt_id = $1 AND provider_status = 'completed'`,
+      [voiceAttempt.id]
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM coaching_messages"
+    )).rows[0].count, 2);
+    const finalizerState = (await disposable.pool.query(
+      `SELECT id, request_id, attempt_number, status, transcript_digest,
+              consumed_at, consumed_member_message_id, failure_category
+       FROM goals_coach_transcription_attempts
+       WHERE id = $1`,
+      [finalizerAttempt.id]
+    )).rows[0];
+    assert.deepEqual(finalizerState, {
+      id: finalizerAttempt.id,
+      request_id: transcriptionRequestId,
+      attempt_number: 1,
+      status: "completed",
+      transcript_digest: sha256(finalTranscript),
+      consumed_at: null,
+      consumed_member_message_id: null,
+      failure_category: null,
+    });
+    assert.ok(finalizerState.transcript_digest);
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM goals_coach_transcription_attempts
+       WHERE request_id = $1`,
+      [transcriptionRequestId]
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_transcription_attempts"
+    )).rows[0].count, 2);
+    await assertNoLeakedTransactions(disposable.pool);
+    t.diagnostic(JSON.stringify({
+      evidence: "postgres-lock-order",
+      race: "voice-staging versus transcription-finalization versus rollback-005",
+      rollbackPid,
+      voicePid,
+      finalizerPid,
+      relevantRelations,
+      rollbackLocks: rollbackLockEvidence,
+      voiceLocks: voiceLockEvidence,
+      finalizerLocks: finalizerLockEvidence,
+      voiceBlockingPids,
+      finalizerBlockingPids,
+      finalAttemptId: finalizerAttempt.id,
+      finalAttemptLifecycle: "completed-unconsumed",
+      rollbackResult: "preservation-refusal-23514",
+      deadlockObserved: false,
+      lockTimeoutObserved: false,
+      statementTimeoutObserved: false,
+      retryObserved: false,
+    }));
+  }
+);

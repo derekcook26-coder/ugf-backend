@@ -172,12 +172,32 @@ test("Phase 1B route returns validated structured output and replays one logical
     [other.member.id, other.plan.id]
   )).rows[0];
 
+  const clientMessageId = crypto.randomUUID();
+  const rejected = await request(fixture.running, messagePath(fixture), {
+    method: "POST",
+    body: {
+      content: "Where do I start today?",
+      clientMessageId,
+      memberId: other.member.id,
+      planId: other.plan.id,
+      workoutStateId: "999999",
+    },
+  });
+  assert.equal(rejected.response.status, 400);
+  assert.equal(rejected.body.error, "INVALID_REQUEST");
+  assert.deepEqual((await fixture.disposable.pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM coaching_messages WHERE member_id = $1) AS messages,
+       (SELECT COUNT(*)::int FROM goals_coach_coaching_turns WHERE member_id = $1) AS turns,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_sessions WHERE member_id = $1) AS sessions,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_state_events WHERE member_id = $1) AS events`,
+    [fixture.seeded.member.id]
+  )).rows[0], { messages: 0, turns: 0, sessions: 0, events: 0 });
+  assert.equal(providerCalls, 0);
+
   const body = {
     content: "Where do I start today?",
-    clientMessageId: crypto.randomUUID(),
-    memberId: other.member.id,
-    planId: other.plan.id,
-    workoutStateId: "999999",
+    clientMessageId,
   };
   const first = await request(fixture.running, messagePath(fixture), { method: "POST", body });
   const replay = await request(fixture.running, messagePath(fixture), { method: "POST", body });

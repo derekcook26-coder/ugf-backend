@@ -270,6 +270,51 @@ test("successful transcription persists only bounded provenance and returns auth
   assert.doesNotMatch(JSON.stringify(row), /synthetic-voice-audio/i);
 });
 
+test("finalization revalidates locked ownership and fails closed after an in-flight mapping change", async (t) => {
+  const { disposable, fixture } = await disposableFixture(t, "service-finalize-ownership-change");
+  let providerEntered;
+  let releaseProvider;
+  const entered = new Promise((resolve) => { providerEntered = resolve; });
+  const released = new Promise((resolve) => { releaseProvider = resolve; });
+  t.after(() => releaseProvider());
+  const deterministic = createDeterministicTranscriptionAdapter({
+    text: "Ownership must be revalidated after the provider returns",
+    durationMs: 1234,
+    async onCall() {
+      providerEntered();
+      await released;
+    },
+  });
+  const transcriptionService = service(disposable.pool, deterministic, {
+    providerTimeoutMs: 1000,
+    operationTimeoutMs: 2000,
+  });
+  const pending = transcriptionService.transcribe(request(fixture));
+  await entered;
+  await disposable.pool.query(
+    `UPDATE goals_coach_member_auth_mappings
+     SET active = FALSE
+     WHERE id = $1 AND member_id = $2`,
+    [fixture.mapping.id, fixture.member.memberId]
+  );
+  releaseProvider();
+  await assert.rejects(
+    pending,
+    (error) => error.statusCode === 404 && error.code === "TRANSCRIPTION_NOT_FOUND"
+  );
+  assert.equal(deterministic.getCallCount(), 1);
+  const stored = (await disposable.pool.query(
+    `SELECT status, failure_category, provider_completed_at,
+            transcript_digest, expires_at
+     FROM goals_coach_transcription_attempts`
+  )).rows[0];
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.failure_category, "provider_error");
+  assert.ok(stored.provider_completed_at);
+  assert.equal(stored.transcript_digest, null);
+  assert.equal(stored.expires_at, null);
+});
+
 test("completed duplicate is rejected without reconstructing a lost transcript response", async (t) => {
   const { disposable, fixture } = await disposableFixture(t, "service-completed-duplicate");
   const deterministic = createDeterministicTranscriptionAdapter();
