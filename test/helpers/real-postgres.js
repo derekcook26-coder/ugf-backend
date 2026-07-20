@@ -33,6 +33,7 @@ async function createRealDisposablePostgres(options = {}) {
     password: "local-disposable-only",
     port,
     persistent: false,
+    postgresFlags: ["-c", "unix_socket_directories="],
     onLog() {},
     onError() {},
   });
