@@ -14,7 +14,11 @@ const {
 
 function createGoalsCoachStaffRouter(options) {
   const router = express.Router();
-  const service = options.service || createGoalsCoachService({ db: options.db });
+  const phase1dEnabled = options.phase1dEnabled === true;
+  const service = options.service || createGoalsCoachService({
+    db: options.db,
+    phase1dEnabled,
+  });
   const requireAdmin = options.requireAdmin;
   const rateLimits = options.rateLimits || createGoalsCoachRateLimits();
 
@@ -101,6 +105,39 @@ function createGoalsCoachStaffRouter(options) {
       return next(error);
     }
   });
+
+  if (phase1dEnabled) {
+    router.post("/coaching-reviews/:reviewId/restrictions", rateLimits.staffMutation, async (req, res, next) => {
+      try {
+        const restriction = await service.addHumanRestriction(
+          req.staffUser,
+          positiveId(req.params.reviewId, "reviewId"),
+          {
+            restrictionType: enumValue(req.body && req.body.restrictionType, "restrictionType", [
+              "prohibited_exercise", "approved_substitution", "intensity_limit",
+              "paused_workout_category", "review_required_before_progression", "plan_reference",
+            ]),
+            instructionText: (() => {
+              const value = optionalText(req.body && req.body.instructionText, "instructionText", 2000);
+              if (!value) {
+                const error = new Error("instructionText is required");
+                error.statusCode = 400;
+                error.code = "INVALID_REQUEST";
+                throw error;
+              }
+              return value;
+            })(),
+            expiresAt: req.body && req.body.expiresAt === undefined
+              ? null
+              : optionalDate(req.body && req.body.expiresAt, "expiresAt"),
+          }
+        );
+        return res.status(201).json({ restriction });
+      } catch (error) {
+        return next(error);
+      }
+    });
+  }
 
   router.post("/member-coach-assignments", rateLimits.staffMutation, requireAdmin, async (req, res, next) => {
     try {

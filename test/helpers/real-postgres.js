@@ -47,6 +47,17 @@ async function createRealDisposablePostgres(options = {}) {
     database: "postgres",
     max: 10,
   });
+  let closing = false;
+  const unexpectedPoolErrors = [];
+  pool.on("error", (error) => {
+    if (
+      closing
+      && error.message === "terminating connection due to administrator command"
+    ) {
+      return;
+    }
+    unexpectedPoolErrors.push(error);
+  });
   const migration001 = fs.readFileSync(
     path.join(projectRoot, "migration_001_checkin_tables.sql"),
     "utf8"
@@ -58,8 +69,12 @@ async function createRealDisposablePostgres(options = {}) {
   return {
     pool,
     async close() {
+      closing = true;
       await pool.end();
       await postgres.stop();
+      if (unexpectedPoolErrors.length > 0) {
+        throw unexpectedPoolErrors[0];
+      }
     },
   };
 }

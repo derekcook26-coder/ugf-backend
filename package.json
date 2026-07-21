@@ -16,6 +16,8 @@
     "rollback:phase1b": "node rollback_004.js",
     "migrate:phase1c-transcription": "node migrate_005.js",
     "rollback:phase1c-transcription": "node rollback_005.js",
+    "migrate:phase1d-safety-review": "node migrate_006.js",
+    "rollback:phase1d-safety-review": "node rollback_006.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },
