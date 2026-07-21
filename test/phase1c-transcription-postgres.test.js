@@ -191,7 +191,11 @@ async function releaseClients(clients) {
     } catch (_) {
       // The disposable database may already be stopped after a failed assertion.
     }
-    client.release();
+    // Remove native-race clients from the pool instead of returning them idle.
+    // PostgreSQL can close an idle connection while the disposable instance is
+    // stopping, which otherwise surfaces as an unhandled pool error after the
+    // assertion that exercised the lock ordering has already completed.
+    client.release(true);
   }
 }
 
