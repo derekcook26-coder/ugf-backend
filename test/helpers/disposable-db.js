@@ -5,6 +5,7 @@ const { runMigration } = require("../../migrate_002");
 const { runMigration: runPhase1aMigration } = require("../../migrate_003");
 const { runMigration: runPhase1bMigration } = require("../../migrate_004");
 const { runMigration: runPhase1cTranscriptionMigration } = require("../../migrate_005");
+const { runMigration: runPhase1dSafetyMigration } = require("../../migrate_006");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
@@ -41,15 +42,17 @@ async function createDisposableDatabase(options = {}) {
     options.phase1a === true
     || options.phase1b === true
     || options.phase1cTranscription === true
+    || options.phase1dSafety === true
   ) {
     await runPhase1aMigration({ pool });
   }
-  if (options.phase1b === true || options.phase1cTranscription === true) {
+  if (options.phase1b === true || options.phase1cTranscription === true || options.phase1dSafety === true) {
     await runPhase1bMigration({ pool });
   }
-  if (options.phase1cTranscription === true) {
+  if (options.phase1cTranscription === true || options.phase1dSafety === true) {
     await runPhase1cTranscriptionMigration({ pool });
   }
+  if (options.phase1dSafety === true) await runPhase1dSafetyMigration({ pool });
   return {
     database,
     pool,

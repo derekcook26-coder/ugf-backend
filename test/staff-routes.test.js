@@ -84,6 +84,7 @@ async function createStaffApp(pool, staffByKey, options = {}) {
     db: pool,
     requireAdmin,
     rateLimits: options.rateLimits,
+    phase1dEnabled: options.phase1dEnabled,
   }));
   app.use(goalsCoachErrorHandler);
   return startApp(app);
@@ -257,6 +258,43 @@ test("Phase 2 exposes no plan-apply or message/review-event mutation routes", as
     const result = await jsonRequest(running.url, request.path, asStaff("admin", { method: request.method }));
     assert.equal(result.response.status, 404);
   }
+});
+
+test("Phase 1D owner-only restriction endpoint is absent by default and auditable when explicitly enabled", async (t) => {
+  const disposable = await createDisposableDatabase({ phase1dSafety: true });
+  t.after(() => disposable.close());
+  const seeded = await seedMemberAndPlan(disposable.pool, "staff-phase1d-restriction");
+  const admin = await seedStaff(disposable.pool, "staff-phase1d-admin", "admin", true);
+  const coach = await seedStaff(disposable.pool, "staff-phase1d-coach", "coach", true);
+  const reviewData = await seedReview(disposable.pool, seeded);
+  const disabled = await createStaffApp(disposable.pool, { admin, coach });
+  t.after(() => disabled.close());
+  const absent = await jsonRequest(
+    disabled.url,
+    `/staff/coaching-reviews/${reviewData.review.id}/restrictions`,
+    asStaff("admin", { method: "POST", body: { restrictionType: "prohibited_exercise", instructionText: "No loaded overhead pressing" } })
+  );
+  assert.equal(absent.response.status, 404);
+
+  const enabled = await createStaffApp(disposable.pool, { admin, coach }, { phase1dEnabled: true });
+  t.after(() => enabled.close());
+  const coachDenied = await jsonRequest(
+    enabled.url,
+    `/staff/coaching-reviews/${reviewData.review.id}/restrictions`,
+    asStaff("coach", { method: "POST", body: { restrictionType: "prohibited_exercise", instructionText: "No loaded overhead pressing" } })
+  );
+  assert.equal(coachDenied.response.status, 403);
+  const created = await jsonRequest(
+    enabled.url,
+    `/staff/coaching-reviews/${reviewData.review.id}/restrictions`,
+    asStaff("admin", { method: "POST", body: { restrictionType: "prohibited_exercise", instructionText: "No loaded overhead pressing" } })
+  );
+  assert.equal(created.response.status, 201);
+  assert.equal(created.body.restriction.restrictionType, "prohibited_exercise");
+  assert.deepEqual((await disposable.pool.query(
+    "SELECT event_type FROM coaching_review_events WHERE review_id = $1 ORDER BY id DESC LIMIT 1",
+    [reviewData.review.id]
+  )).rows, [{ event_type: "restriction_added" }]);
 });
 
 test("staff messages require idempotency keys, conceal member resources, and create one event", async (t) => {

@@ -124,6 +124,14 @@ function createPhase1bCoachingService(options) {
   const engine = options.engine;
   const applicationConfiguration = options.applicationConfiguration;
   const phase1cStartup = options.phase1cStartup || null;
+  // Phase 1D is opt-in while the private alpha remains disabled by default.
+  // A supplied safety service runs before the coaching provider and may only
+  // replace ordinary coaching with a safer, locally persisted response.
+  const safetyService = options.safetyService || null;
+  const reviewRouting = options.reviewRouting || null;
+  const safetyEnvironment = typeof options.safetyEnvironment === "string"
+    ? options.safetyEnvironment.slice(0, 100)
+    : "test";
   const transcriptionBindingKey = options.transcriptionBindingKey;
   const voiceSubmissionReady = Boolean(
     phase1cStartup
@@ -293,6 +301,25 @@ function createPhase1bCoachingService(options) {
         contextDigest: built.digest,
         stagedAt,
       };
+    });
+  }
+
+  async function authorizeSafetyAssessment(member, conversationId) {
+    return withTransaction(db, async (client) => {
+      await requireActiveMappingAndConsent(client, member, applicationConfiguration);
+      const conversation = await client.query(
+        `SELECT id, status
+         FROM coaching_conversations
+         WHERE id = $1 AND member_id = $2
+         FOR UPDATE`,
+        [conversationId, member.memberId]
+      );
+      if (!conversation.rows.length) {
+        throw notFound("CONVERSATION_NOT_FOUND", "Conversation not found");
+      }
+      if (conversation.rows[0].status !== "active") {
+        throw conflict("CONVERSATION_CLOSED", "This private-alpha conversation is complete");
+      }
     });
   }
 
@@ -546,6 +573,269 @@ function createPhase1bCoachingService(options) {
     return result;
   }
 
+  async function stageSafetyResponse(member, conversationId, input, assessment, options = {}) {
+    return withTransaction(db, async (client) => {
+      await requireActiveMappingAndConsent(client, member, applicationConfiguration);
+      const conversationResult = await client.query(
+        `SELECT *
+         FROM coaching_conversations
+         WHERE id = $1 AND member_id = $2
+         FOR UPDATE`,
+        [conversationId, member.memberId]
+      );
+      if (!conversationResult.rows.length) {
+        throw notFound("CONVERSATION_NOT_FOUND", "Conversation not found");
+      }
+      const conversation = conversationResult.rows[0];
+      if (conversation.status !== "active") {
+        throw conflict("CONVERSATION_CLOSED", "This private-alpha conversation is complete");
+      }
+
+      const existingMessage = await client.query(
+        `SELECT *
+         FROM coaching_messages
+         WHERE conversation_id = $1
+           AND member_id = $2
+           AND sender_type = 'member'
+           AND client_message_id = $3
+         LIMIT 1`,
+        [conversationId, member.memberId, input.clientMessageId]
+      );
+      let memberMessage = existingMessage.rows[0] || null;
+      if (memberMessage && memberMessage.content !== input.content) {
+        throw conflict(
+          "CLIENT_MESSAGE_ID_CONFLICT",
+          "That clientMessageId was already used for different content"
+        );
+      }
+
+      // A safety escalation always outranks an in-flight ordinary response,
+      // including a retry staged immediately before an idempotent safety replay.
+      await client.query(
+        `UPDATE goals_coach_coaching_turns
+         SET provider_status = 'failed',
+             failure_category = 'safety_review_required',
+             provider_completed_at = NOW()
+         WHERE conversation_id = $1
+           AND member_id = $2
+           AND provider_status = 'pending'`,
+        [conversationId, member.memberId]
+      );
+
+      if (memberMessage) {
+        const existingReview = await client.query(
+          `SELECT review.id AS review_id, review.status, review.routing_status,
+                  coach_message.id AS coach_message_id,
+                  coach_message.conversation_id AS coach_conversation_id,
+                  coach_message.member_id AS coach_member_id,
+                  coach_message.sender_type AS coach_sender_type,
+                  coach_message.content AS coach_content,
+                  coach_message.structured_response_json AS coach_structured_response_json,
+                  coach_message.created_at AS coach_created_at
+           FROM coaching_concerns concern
+           JOIN coaching_reviews review ON review.concern_id = concern.id
+           LEFT JOIN coaching_messages coach_message
+             ON coach_message.conversation_id = concern.conversation_id
+            AND coach_message.member_id = concern.member_id
+            AND coach_message.sender_type = 'goals_coach'
+            AND coach_message.structured_response_json->>'safetyReviewId' = review.id::text
+           WHERE concern.source_message_id = $1
+             AND concern.conversation_id = $2
+             AND concern.member_id = $3
+           LIMIT 1`,
+          [memberMessage.id, conversationId, member.memberId]
+        );
+        if (existingReview.rows.length) {
+          const row = existingReview.rows[0];
+          if (!row.review_id || !row.coach_message_id || !row.coach_content) {
+            throw new Error("Safety review replay is missing its protected response");
+          }
+          return {
+            type: "replay",
+            result: {
+              memberMessageId: String(memberMessage.id),
+              response: serializeCoachMessage({
+                id: row.coach_message_id,
+                conversation_id: row.coach_conversation_id,
+                member_id: row.coach_member_id,
+                sender_type: row.coach_sender_type,
+                content: row.coach_content,
+                structured_response_json: row.coach_structured_response_json,
+                created_at: row.coach_created_at,
+              }),
+              workoutState: null,
+              turn: null,
+              review: {
+                id: String(row.review_id),
+                status: row.status,
+                routingStatus: row.routing_status,
+              },
+              idempotentReplay: true,
+            },
+          };
+        }
+        if (!options.allowExistingPendingMessage) {
+          throw conflict(
+            "CLIENT_MESSAGE_ID_CONFLICT",
+            "That clientMessageId was already used for a different coaching result"
+          );
+        }
+      }
+
+      if (!memberMessage) {
+        const insertedMessage = await client.query(
+          `INSERT INTO coaching_messages
+            (conversation_id, member_id, sender_type, content, client_message_id)
+           VALUES ($1, $2, 'member', $3, $4)
+           RETURNING *`,
+          [conversationId, member.memberId, input.content, input.clientMessageId]
+        );
+        memberMessage = insertedMessage.rows[0];
+      }
+      const concern = await client.query(
+        `INSERT INTO coaching_concerns
+          (member_id, conversation_id, source_message_id, plan_id,
+           concern_category, safety_level, concerning_signals_json,
+           stop_exercise, member_follow_up_required, member_follow_up_status,
+           safety_rule_version, safety_classifier_version,
+           classification_result_json, member_response, environment)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, 'not_required',
+                 $9, $10, $11, $12, $13)
+         RETURNING *`,
+        [
+          member.memberId,
+          conversationId,
+          memberMessage.id,
+          conversation.plan_id,
+          assessment.category,
+          assessment.priority,
+          [assessment.reasonCode],
+          Boolean(assessment.stopNormalCoaching),
+          assessment.ruleVersion,
+          assessment.classifierVersion,
+          {
+            decision: assessment.decision,
+            priority: assessment.priority,
+            category: assessment.category,
+            reasonCode: assessment.reasonCode,
+            classifierStatus: assessment.classifierStatus,
+          },
+          assessment.memberResponse,
+          safetyEnvironment,
+        ]
+      );
+      const review = await client.query(
+        `INSERT INTO coaching_reviews
+          (concern_id, member_id, conversation_id, plan_id, priority,
+           review_category, status, routing_status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'new', 'pending')
+         RETURNING *`,
+        [
+          concern.rows[0].id,
+          member.memberId,
+          conversationId,
+          conversation.plan_id,
+          assessment.priority,
+          assessment.category,
+        ]
+      );
+      await client.query(
+        `INSERT INTO coaching_review_events (review_id, member_id, event_type, event_details_json)
+         VALUES ($1, $2, 'created', $3)`,
+        [
+          review.rows[0].id,
+          member.memberId,
+          {
+            decision: assessment.decision,
+            priority: assessment.priority,
+            ruleVersion: assessment.ruleVersion,
+            classifierStatus: assessment.classifierStatus,
+          },
+        ]
+      );
+      const coachMessage = await client.query(
+        `INSERT INTO coaching_messages
+          (conversation_id, member_id, sender_type, content, structured_response_json)
+         VALUES ($1, $2, 'goals_coach', $3, $4)
+         RETURNING *`,
+        [
+          conversationId,
+          member.memberId,
+          assessment.memberResponse,
+          {
+            mode: assessment.stopNormalCoaching ? "safety_stop" : "human_review",
+            phase: "phase_1d",
+            safetyReviewId: String(review.rows[0].id),
+            decision: assessment.decision,
+            priority: assessment.priority,
+            reviewRequired: true,
+            routingConfirmed: false,
+          },
+        ]
+      );
+      return {
+        type: "created",
+        review: review.rows[0],
+        result: {
+          memberMessageId: String(memberMessage.id),
+          response: serializeCoachMessage(coachMessage.rows[0]),
+          workoutState: null,
+          turn: null,
+          review: {
+            id: String(review.rows[0].id),
+            status: review.rows[0].status,
+            routingStatus: review.rows[0].routing_status,
+          },
+          idempotentReplay: false,
+        },
+      };
+    });
+  }
+
+  async function activeHumanRestrictions(member, conversationId) {
+    if (!safetyService) return [];
+    return withTransaction(db, async (client) => {
+      await requireActiveMappingAndConsent(client, member, applicationConfiguration);
+      const conversation = await client.query(
+        `SELECT id
+         FROM coaching_conversations
+         WHERE id = $1 AND member_id = $2 AND status = 'active'
+         FOR UPDATE`,
+        [conversationId, member.memberId]
+      );
+      if (!conversation.rows.length) return [];
+      const restrictions = await client.query(
+        `SELECT id, restriction_type
+         FROM goals_coach_human_restrictions
+         WHERE member_id = $1
+           AND conversation_id = $2
+           AND status = 'active'
+           AND effective_at <= NOW()
+           AND (expires_at IS NULL OR expires_at > NOW())
+         ORDER BY effective_at DESC, id DESC`,
+        [member.memberId, conversationId]
+      );
+      return restrictions.rows;
+    });
+  }
+
+  function restrictionAssessment(restrictions) {
+    if (!restrictions.length) return null;
+    return Object.freeze({
+      decision: "review",
+      priority: "priority",
+      category: "technique_uncertainty",
+      stopNormalCoaching: true,
+      reviewRequired: true,
+      ruleVersion: "GC-SAFETY-1D-1",
+      classifierVersion: null,
+      classifierStatus: "not_configured",
+      reasonCode: "active_human_restriction",
+      memberResponse:
+        "A human-approved safety restriction applies to this activity. Stop the current movement and wait for review before continuing.",
+    });
+  }
+
   async function waitForExistingTurn(member, turnId) {
     const deadline = Date.now() + waitTimeoutMs;
     while (Date.now() <= deadline) {
@@ -695,9 +985,80 @@ function createPhase1bCoachingService(options) {
 
   async function sendMessage(member, conversationId, input, requestContext) {
     const inputMethod = input.inputMethod === undefined ? "text" : input.inputMethod;
-    const staged = inputMethod === "voice"
-      ? await stageVoiceTurn(member, conversationId, input, requestContext)
-      : await stageTextTurn(member, conversationId, input);
+    const safetyAssessmentAvailable = Boolean(
+      safetyService && typeof safetyService.assess === "function"
+    );
+    const assessSafety = async () => {
+      if (!safetyAssessmentAvailable) return null;
+      return safetyService.assess(input.content, {
+        memberId: String(member.memberId),
+        conversationId: String(conversationId),
+        inputMethod,
+      });
+    };
+    const routeSafety = async (assessment, options) => {
+      const protectedResult = await stageSafetyResponse(member, conversationId, input, assessment, options);
+      if (protectedResult.type === "created" && reviewRouting && typeof reviewRouting.route === "function") {
+        // Delivery is intentionally best-effort after durable local recording.
+        // The member response never claims routing succeeded.
+        try {
+          await reviewRouting.route(protectedResult.review);
+        } catch (_) {
+          // A missing receipt remains a protected local review; never resume coaching.
+        }
+      }
+      return protectedResult.result;
+    };
+
+    // Voice staging remains the certified Phase 1C provenance boundary.  It
+    // validates and consumes the exact completed attempt before safety can
+    // suppress ordinary generation.
+    if (inputMethod === "voice") {
+      const stagedVoice = await stageVoiceTurn(member, conversationId, input, requestContext);
+      if (stagedVoice.type === "completed") return stagedVoice.result;
+      if (stagedVoice.type === "pending") return waitForExistingTurn(member, stagedVoice.turnId);
+      const assessment = await assessSafety();
+      if (assessment && assessment.reviewRequired) {
+        return routeSafety(assessment, { allowExistingPendingMessage: true });
+      }
+      const restriction = restrictionAssessment(await activeHumanRestrictions(member, conversationId));
+      if (restriction) return routeSafety(restriction, { allowExistingPendingMessage: true });
+      let generated;
+      try {
+        generated = await engine.generateTurn({
+          context: stagedVoice.context,
+          memberMessage: input.content,
+          requestId: String(stagedVoice.turn.request_id),
+        });
+      } catch (error) {
+        const failureCategory = terminalFailureCategory(error);
+        await markFailed(stagedVoice.turn.id, failureCategory);
+        if (RETRYABLE_FAILURE_CATEGORIES.has(failureCategory)) {
+          throw unavailableError(failureCategory);
+        }
+        throw error;
+      }
+      try {
+        return await finalizeTurn(member, input, stagedVoice, generated);
+      } catch (error) {
+        await markFailed(stagedVoice.turn.id, terminalFailureCategory(error));
+        throw error;
+      }
+    }
+
+    // Classifier adapters are optional external boundaries. Revalidate the
+    // mapped member, current consent, and active conversation before content
+    // is supplied to one; stageSafetyResponse revalidates again before write.
+    if (safetyAssessmentAvailable) {
+      await authorizeSafetyAssessment(member, conversationId);
+    }
+    const assessment = await assessSafety();
+    if (assessment && assessment.reviewRequired) {
+      return routeSafety(assessment);
+    }
+    const restriction = restrictionAssessment(await activeHumanRestrictions(member, conversationId));
+    if (restriction) return routeSafety(restriction);
+    const staged = await stageTextTurn(member, conversationId, input);
     if (staged.type === "completed") return staged.result;
     if (staged.type === "pending") return waitForExistingTurn(member, staged.turnId);
 

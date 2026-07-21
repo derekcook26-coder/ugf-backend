@@ -157,7 +157,13 @@ This procedure requires no browser persistence of protected conversation or work
 
 ## Human-review boundary
 
-Phase 1B structured output may state that human review is required. This contract does not create, route, deliver, acknowledge, or complete a Phase 1D human-review record. Member-facing code must not claim that a human received, accepted, or reviewed the request. Review-required and safety-stop outputs cannot mutate workout state.
+When the separate Phase 1D private-alpha composition is explicitly injected,
+its deterministic safety boundary runs before ordinary Phase 1B provider
+generation and may create a protected concern/review response. Default startup
+does not inject that composition or configure a route. Member-facing code must
+not claim that a human received, accepted, or reviewed a request unless a
+configured protected destination returns a receipt. Review-required and
+safety-stop outputs cannot mutate workout state.
 
 ## Activation boundary
 

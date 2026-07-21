@@ -21,6 +21,15 @@ const {
 function createAlphaGoalsCoachRouter(options) {
   const router = express.Router();
   const transcriptionBindingKey = options.transcriptionBindingKey;
+  const phase1dStartup = options.phase1dStartup || null;
+  const phase1dReady = Boolean(
+    phase1dStartup
+    && phase1dStartup.status === "ready"
+    && phase1dStartup.safetyService
+    && typeof phase1dStartup.safetyService.assess === "function"
+    && phase1dStartup.reviewRouting
+    && typeof phase1dStartup.reviewRouting.route === "function"
+  );
   const voiceSubmissionReady = Boolean(
     options.phase1cStartup
     && options.phase1cStartup.status === "ready"
@@ -52,6 +61,11 @@ function createAlphaGoalsCoachRouter(options) {
       engine: options.coachingEngine,
       applicationConfiguration: options.applicationConfiguration,
       ...(options.phase1bServiceOptions || {}),
+      ...(phase1dReady ? {
+        safetyService: phase1dStartup.safetyService,
+        reviewRouting: phase1dStartup.reviewRouting,
+        safetyEnvironment: phase1dStartup.configuration.environment,
+      } : {}),
       phase1cStartup: options.phase1cStartup,
       transcriptionBindingKey,
     })

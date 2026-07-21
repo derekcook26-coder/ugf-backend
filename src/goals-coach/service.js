@@ -33,6 +33,15 @@ function serializeReview(row) {
     priority: row.priority,
     category: row.review_category,
     status: row.status,
+    routingStatus: row.routing_status || null,
+    routingAttemptCount: row.routing_attempt_count === undefined
+      ? null
+      : Number(row.routing_attempt_count),
+    routeDestinationType: row.route_destination_type || null,
+    lastRouteAttemptAt: row.last_route_attempt_at || null,
+    lastRouteSucceededAt: row.last_route_succeeded_at || null,
+    routingErrorCode: row.routing_error_code || null,
+    targetResponseAt: row.target_response_at || null,
     assignedStaffUserId: row.assigned_staff_user_id ? String(row.assigned_staff_user_id) : null,
     memberFollowUpRequired: row.member_follow_up_required,
     memberFollowUpStatus: row.member_follow_up_status,
@@ -79,6 +88,7 @@ function serializeCoachingRecord(row) {
 
 function createGoalsCoachService(options) {
   const db = options.db;
+  const phase1dEnabled = options.phase1dEnabled === true;
 
   async function resolveMember(client, claims) {
     const result = await client.query(
@@ -459,7 +469,29 @@ function createGoalsCoachService(options) {
         "SELECT * FROM coaching_review_events WHERE review_id = $1 ORDER BY created_at, id",
         [reviewId]
       );
-      return { review: serializeReview(review), events: events.rows.map(serializeReviewEvent) };
+      const concern = phase1dEnabled
+        ? await client.query(
+          `SELECT concern_category, safety_level, concerning_signals_json,
+                  stop_exercise, member_response, safety_rule_version,
+                  safety_classifier_version, classification_result_json
+           FROM coaching_concerns WHERE id = $1`,
+          [review.concern_id]
+        )
+        : { rows: [] };
+      return {
+        review: serializeReview(review),
+        concern: concern.rows.length ? {
+          category: concern.rows[0].concern_category,
+          safetyLevel: concern.rows[0].safety_level,
+          signals: concern.rows[0].concerning_signals_json || [],
+          stopExercise: concern.rows[0].stop_exercise,
+          memberResponse: concern.rows[0].member_response || null,
+          safetyRuleVersion: concern.rows[0].safety_rule_version || null,
+          safetyClassifierVersion: concern.rows[0].safety_classifier_version || null,
+          classificationResult: concern.rows[0].classification_result_json || null,
+        } : null,
+        events: events.rows.map(serializeReviewEvent),
+      };
     });
   }
 
@@ -656,6 +688,58 @@ function createGoalsCoachService(options) {
       );
       await client.query("UPDATE coaching_conversations SET updated_at = NOW() WHERE id = $1", [conversationId]);
       return { message: serializeMessage(message.rows[0]), idempotentReplay: false };
+    });
+  }
+
+  async function addHumanRestriction(staffUser, reviewId, input) {
+    if (!phase1dEnabled) {
+      throw notFound("REVIEW_NOT_FOUND", "Coaching review not found");
+    }
+    if (staffUser.role !== "admin") {
+      throw forbidden("ADMIN_ACCESS_REQUIRED", "Only an owner administrator can add a human restriction");
+    }
+    return withTransaction(db, async (client) => {
+      const reviewResult = await client.query(
+        "SELECT * FROM coaching_reviews WHERE id = $1 FOR UPDATE",
+        [reviewId]
+      );
+      if (!reviewResult.rows.length) throw notFound("REVIEW_NOT_FOUND", "Coaching review not found");
+      const review = reviewResult.rows[0];
+      const restriction = await client.query(
+        `INSERT INTO goals_coach_human_restrictions
+          (member_id, conversation_id, review_id, author_staff_user_id,
+           restriction_type, instruction_text, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          review.member_id,
+          review.conversation_id,
+          review.id,
+          staffUser.id,
+          input.restrictionType,
+          input.instructionText,
+          input.expiresAt || null,
+        ]
+      );
+      await client.query(
+        `INSERT INTO coaching_review_events
+          (review_id, member_id, actor_staff_user_id, event_type, event_details_json)
+         VALUES ($1, $2, $3, 'restriction_added', $4)`,
+        [
+          review.id,
+          review.member_id,
+          staffUser.id,
+          { restrictionId: String(restriction.rows[0].id), restrictionType: input.restrictionType },
+        ]
+      );
+      return {
+        id: String(restriction.rows[0].id),
+        reviewId: String(review.id),
+        restrictionType: restriction.rows[0].restriction_type,
+        status: restriction.rows[0].status,
+        effectiveAt: restriction.rows[0].effective_at,
+        expiresAt: restriction.rows[0].expires_at,
+      };
     });
   }
 
@@ -883,6 +967,7 @@ function createGoalsCoachService(options) {
   }
 
   return {
+    addHumanRestriction,
     addStaffMessage,
     closeConversation,
     createAssignment,
