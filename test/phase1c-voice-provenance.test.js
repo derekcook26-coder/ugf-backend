@@ -661,10 +661,39 @@ test("non-consumable attempts are concealed and a completed expiry transition co
   });
   assert.equal(expiredResponse.response.status, 404);
 
-  const completedPastExpiry = await seedAttempt(fixture, {
-    status: "completed",
-    expired: true,
-  });
+  const completedPastExpiry = {
+    id: crypto.randomUUID(),
+    requestId: crypto.randomUUID(),
+    transcript: "Reviewed transcript",
+  };
+  const storedPastExpiry = (await fixture.disposable.pool.query(
+    `INSERT INTO goals_coach_transcription_attempts
+      (id, request_id, attempt_number, member_id, auth_mapping_id,
+       auth_session_digest, conversation_id, plan_id, status, mime_type,
+       audio_byte_count, audio_duration_ms, audio_digest, transcript_digest,
+       provider_identifier, model_identifier, provider_started_at,
+       provider_completed_at, expires_at, created_at)
+     VALUES ($1, $2, 1, $3, $4, $5, $6, $7, 'completed',
+       'audio/webm;codecs=opus', 19, 1234, $8, $9,
+       'synthetic-provider', 'synthetic-model', $10, $11, $12, $13)
+     RETURNING expires_at`,
+    [
+      completedPastExpiry.id,
+      completedPastExpiry.requestId,
+      fixture.seeded.member.id,
+      fixture.mapping.id,
+      sessionDigest(BINDING_KEY, AUTHENTICATED_SESSION_ID),
+      fixture.conversation.id,
+      fixture.seeded.plan.id,
+      sha256("synthetic raw audio"),
+      sha256(completedPastExpiry.transcript),
+      new Date(now.getTime() - 3000),
+      new Date(now.getTime() - 2000),
+      new Date(now.getTime() - 1000),
+      new Date(now.getTime() - 4000),
+    ]
+  )).rows[0];
+  assert.ok(new Date(storedPastExpiry.expires_at).getTime() < now.getTime());
   const transition = await request(fixture.running, messagePath(fixture), {
     method: "POST",
     body: {
