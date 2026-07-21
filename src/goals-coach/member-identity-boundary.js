@@ -30,7 +30,7 @@ function createMemberIdentityBoundaryReport(options = {}) {
     && plan.passwordHandling === OWNER_APPROVED_PASSWORD_TRANSIT
     && nonEmptyString(plan.ownerSecurityDecisionReference);
   if (!delegatedMethod && !approvedPasswordGrant) {
-    blockers.push("gymmaster_delegated_sign_in_contract_required");
+    blockers.push("gymmaster_supported_auth_contract_required");
   }
   if (plan.authorizationMethod === KNOWN_PROVIDER_PASSWORD_GRANT) {
     if (plan.passwordHandling !== OWNER_APPROVED_PASSWORD_TRANSIT) {

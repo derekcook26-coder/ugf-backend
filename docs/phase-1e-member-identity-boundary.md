@@ -18,18 +18,18 @@ session.
 
 ## Required GymMaster confirmation
 
-Before any integration is configured, GymMaster must provide written
-documentation for one supported delegated-authentication path:
+Before any integration is configured, the owner must retain written provider
+evidence for the exact supported authentication path. GymMaster's documented
+Member Portal password-grant endpoint is the selected path for this boundary;
+a future signed assertion or delegated OpenID Connect-style session could be
+reviewed separately if GymMaster offers one.
 
-1. a signed provider assertion that Goals Coach can verify server-side; or
-2. a delegated OpenID Connect-style session with exact issuer, audience,
-   signature verification, expiration, and subject rules.
-
-The confirmation must state how the integration proves an active membership,
-how logout or membership cancellation is reflected, and what immutable subject
-is available for authorization. The current email-template endpoint is not
-authentication documentation; it only sends a chosen template to an email
-address.
+The evidence must identify the exact endpoint, required key type, returned
+member ID, token lifetime, and failure behavior. Current membership is not
+accepted from the login response alone: Goals Coach independently checks the
+existing Gatekeeper membership policy using the returned immutable member ID.
+The email-template endpoint is not authentication documentation; it only sends
+a chosen template to an email address.
 
 ## Documented password-grant path
 
