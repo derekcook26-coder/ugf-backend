@@ -6,6 +6,8 @@ const {
   serializeCoachMessage,
 } = require("./phase1b-contracts");
 const { conflict, notFound, withTransaction } = require("./repository");
+const { canonicalUuid } = require("./transcription-adapter");
+const { sessionDigest } = require("./transcription-service");
 const { applyWorkoutTransition } = require("./workout-state");
 
 const COACHING_UNAVAILABLE_MESSAGE =
@@ -41,6 +43,30 @@ function storedFailureError(failureCategory) {
     ? failureCategory
     : "COACHING_TURN_FAILED";
   return error;
+}
+
+function voiceUnavailableError() {
+  const error = new Error("Transcription is not available.");
+  error.statusCode = 503;
+  error.code = "TRANSCRIPTION_NOT_AVAILABLE";
+  error.exposeMessage = true;
+  return error;
+}
+
+function concealedTranscriptionNotFound() {
+  return notFound("TRANSCRIPTION_NOT_FOUND", "Transcription not found");
+}
+
+function sameIdentifier(left, right) {
+  return String(left) === String(right);
+}
+
+function transcriptDigest(content) {
+  return crypto.createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function validBindingKey(value) {
+  return (typeof value === "string" || Buffer.isBuffer(value)) && value.length > 0;
 }
 
 async function requireActiveMappingAndConsent(client, member, configuration) {
@@ -97,6 +123,13 @@ function createPhase1bCoachingService(options) {
   const db = options.db;
   const engine = options.engine;
   const applicationConfiguration = options.applicationConfiguration;
+  const phase1cStartup = options.phase1cStartup || null;
+  const transcriptionBindingKey = options.transcriptionBindingKey;
+  const voiceSubmissionReady = Boolean(
+    phase1cStartup
+    && phase1cStartup.status === "ready"
+    && validBindingKey(transcriptionBindingKey)
+  );
   const clock = typeof options.now === "function" ? options.now : () => new Date();
   const pollIntervalMs = Number.isInteger(options.pendingPollIntervalMs)
     ? options.pendingPollIntervalMs
@@ -104,6 +137,7 @@ function createPhase1bCoachingService(options) {
   const waitTimeoutMs = Number.isInteger(options.pendingWaitTimeoutMs)
     ? options.pendingWaitTimeoutMs
     : engine.configuration.providerTimeoutMs + 2000;
+  const transactionHooks = options.transactionHooks || null;
 
   if (!db || typeof db.connect !== "function") {
     throw new Error("Phase 1B coaching service requires a database pool");
@@ -112,7 +146,14 @@ function createPhase1bCoachingService(options) {
     throw new Error("Phase 1B coaching service requires a configured coaching engine");
   }
 
-  async function stageTurn(member, conversationId, input) {
+  async function runTransactionHook(name, client) {
+    const hook = transactionHooks && transactionHooks[name];
+    if (typeof hook !== "function") return;
+    const backend = await client.query("SELECT pg_backend_pid()::int AS pid");
+    await hook({ backendPid: Number(backend.rows[0].pid) });
+  }
+
+  async function stageTextTurn(member, conversationId, input) {
     return withTransaction(db, async (client) => {
       await requireActiveMappingAndConsent(client, member, applicationConfiguration);
       const conversation = await client.query(
@@ -160,6 +201,12 @@ function createPhase1bCoachingService(options) {
         );
         if (previousTurn.rows.length) {
           const turn = previousTurn.rows[0];
+          if (turn.input_method !== "text") {
+            throw conflict(
+              "CLIENT_MESSAGE_ID_CONFLICT",
+              "That clientMessageId was already used for a different input method"
+            );
+          }
           if (turn.provider_status === "completed") {
             return {
               type: "completed",
@@ -249,6 +296,256 @@ function createPhase1bCoachingService(options) {
     });
   }
 
+  async function stageVoiceTurn(member, conversationId, input, requestContext) {
+    if (!voiceSubmissionReady) throw voiceUnavailableError();
+    if (
+      !canonicalUuid(input.transcriptionId)
+      || !requestContext
+      || typeof requestContext.authenticatedSessionId !== "string"
+      || requestContext.authenticatedSessionId.length < 1
+      || requestContext.authenticatedSessionId.length > 4096
+    ) {
+      throw concealedTranscriptionNotFound();
+    }
+
+    const authenticatedSessionDigest = sessionDigest(
+      transcriptionBindingKey,
+      requestContext.authenticatedSessionId
+    );
+    const result = await withTransaction(db, async (client) => {
+      await requireActiveMappingAndConsent(client, member, applicationConfiguration);
+      const conversation = await client.query(
+        `SELECT *
+         FROM coaching_conversations
+         WHERE id = $1 AND member_id = $2
+         FOR UPDATE`,
+        [conversationId, member.memberId]
+      );
+      if (!conversation.rows.length) {
+        throw notFound("CONVERSATION_NOT_FOUND", "Conversation not found");
+      }
+      if (conversation.rows[0].status !== "active") {
+        throw conflict("CONVERSATION_CLOSED", "This private-alpha conversation is complete");
+      }
+
+      // Match the certified rollback/write order: coaching turns before attempts.
+      await runTransactionHook("beforeVoiceTurnLock", client);
+      await client.query(
+        "LOCK TABLE goals_coach_coaching_turns IN ROW EXCLUSIVE MODE"
+      );
+      await runTransactionHook("afterVoiceTurnLock", client);
+
+      const existingMessage = await client.query(
+        `SELECT *
+         FROM coaching_messages
+         WHERE conversation_id = $1
+           AND member_id = $2
+           AND sender_type = 'member'
+           AND client_message_id = $3
+         LIMIT 1`,
+        [conversationId, member.memberId, input.clientMessageId]
+      );
+      let memberMessage = existingMessage.rows[0] || null;
+      if (memberMessage && memberMessage.content !== input.content) {
+        throw conflict(
+          "CLIENT_MESSAGE_ID_CONFLICT",
+          "That clientMessageId was already used for different content"
+        );
+      }
+
+      let previousTurns = [];
+      if (memberMessage) {
+        const turnResult = await client.query(
+          `SELECT *
+           FROM goals_coach_coaching_turns
+           WHERE member_message_id = $1
+             AND conversation_id = $2
+             AND member_id = $3
+           ORDER BY attempt_number ASC`,
+          [memberMessage.id, conversationId, member.memberId]
+        );
+        previousTurns = turnResult.rows;
+        const firstTurn = previousTurns[0];
+        if (
+          !firstTurn
+          || previousTurns.some((turn) => turn.input_method !== "voice")
+          || !sameIdentifier(firstTurn.transcription_attempt_id, input.transcriptionId)
+        ) {
+          throw conflict(
+            "CLIENT_MESSAGE_ID_CONFLICT",
+            "That clientMessageId was already used for different voice provenance"
+          );
+        }
+      }
+
+      const attemptResult = await client.query(
+        `SELECT *
+         FROM goals_coach_transcription_attempts
+         WHERE id = $1
+         FOR UPDATE`,
+        [input.transcriptionId]
+      );
+      if (!attemptResult.rows.length) throw concealedTranscriptionNotFound();
+      const transcriptionAttempt = attemptResult.rows[0];
+      const authoritativeScopeMatches =
+        sameIdentifier(transcriptionAttempt.member_id, member.memberId)
+        && sameIdentifier(transcriptionAttempt.auth_mapping_id, member.mappingId)
+        && transcriptionAttempt.auth_session_digest === authenticatedSessionDigest
+        && sameIdentifier(transcriptionAttempt.conversation_id, conversationId)
+        && sameIdentifier(transcriptionAttempt.plan_id, conversation.rows[0].plan_id);
+      if (!authoritativeScopeMatches) throw concealedTranscriptionNotFound();
+
+      const stagedAt = clock();
+      const expiresAt = new Date(transcriptionAttempt.expires_at);
+      if (
+        transcriptionAttempt.status === "completed"
+        && !Number.isNaN(expiresAt.getTime())
+        && expiresAt.getTime() <= stagedAt.getTime()
+      ) {
+        await client.query(
+          `UPDATE goals_coach_transcription_attempts
+           SET status = 'expired'
+           WHERE id = $1 AND status = 'completed'`,
+          [transcriptionAttempt.id]
+        );
+        return { type: "expired" };
+      }
+
+      if (memberMessage) {
+        if (
+          transcriptionAttempt.status !== "consumed"
+          || !sameIdentifier(
+            transcriptionAttempt.consumed_member_message_id,
+            memberMessage.id
+          )
+        ) {
+          throw concealedTranscriptionNotFound();
+        }
+        const latestTurn = previousTurns[previousTurns.length - 1];
+        if (latestTurn.provider_status === "completed") {
+          return {
+            type: "completed",
+            result: await loadCompletedTurnResult(client, latestTurn, true),
+          };
+        }
+        if (latestTurn.provider_status === "pending") {
+          return { type: "pending", turnId: String(latestTurn.id) };
+        }
+      } else {
+        if (
+          transcriptionAttempt.status !== "completed"
+          || transcriptionAttempt.consumed_at !== null
+          || transcriptionAttempt.consumed_member_message_id !== null
+        ) {
+          throw concealedTranscriptionNotFound();
+        }
+      }
+
+      const otherPending = await client.query(
+        `SELECT id
+         FROM goals_coach_coaching_turns
+         WHERE conversation_id = $1
+           AND member_id = $2
+           AND provider_status = 'pending'
+           AND ($3::bigint IS NULL OR member_message_id <> $3)
+         LIMIT 1`,
+        [conversationId, member.memberId, memberMessage ? memberMessage.id : null]
+      );
+      if (otherPending.rows.length) {
+        throw conflict(
+          "COACHING_TURN_IN_PROGRESS",
+          "Another coaching turn is still being processed"
+        );
+      }
+
+      if (!memberMessage) {
+        const inserted = await client.query(
+          `INSERT INTO coaching_messages
+            (conversation_id, member_id, sender_type, content, client_message_id)
+           VALUES ($1, $2, 'member', $3, $4)
+           RETURNING *`,
+          [conversationId, member.memberId, input.content, input.clientMessageId]
+        );
+        memberMessage = inserted.rows[0];
+      }
+
+      const built = await buildCoachingContext({
+        client,
+        member,
+        conversationId,
+        memberMessage: input.content,
+        now: stagedAt,
+      });
+      const attemptNumber = await client.query(
+        `SELECT COALESCE(MAX(attempt_number), 0)::int + 1 AS next_attempt
+         FROM goals_coach_coaching_turns
+         WHERE member_message_id = $1`,
+        [memberMessage.id]
+      );
+      const firstVoiceTurn = previousTurns.length === 0;
+      const requestId = crypto.randomUUID();
+      const turn = await client.query(
+        `INSERT INTO goals_coach_coaching_turns
+          (member_id, conversation_id, plan_id, member_message_id,
+           provider_identifier, model_identifier, prompt_version,
+           structured_output_version, safety_rule_version, request_id,
+           attempt_number, input_method, transcription_attempt_id, context_digest)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'voice', $12, $13)
+         RETURNING *`,
+        [
+          member.memberId,
+          conversationId,
+          built.conversation.plan_id,
+          memberMessage.id,
+          engine.configuration.providerIdentifier,
+          engine.configuration.modelIdentifier,
+          engine.configuration.promptVersion,
+          engine.configuration.structuredOutputVersion,
+          engine.configuration.safetyRuleVersion,
+          requestId,
+          attemptNumber.rows[0].next_attempt,
+          firstVoiceTurn ? transcriptionAttempt.id : null,
+          built.digest,
+        ]
+      );
+
+      if (firstVoiceTurn) {
+        const consumed = await client.query(
+          `UPDATE goals_coach_transcription_attempts
+           SET status = 'consumed',
+               consumed_at = $1,
+               consumed_member_message_id = $2,
+               transcript_edited = $3
+           WHERE id = $4
+             AND status = 'completed'
+             AND consumed_at IS NULL
+             AND consumed_member_message_id IS NULL
+           RETURNING id`,
+          [
+            stagedAt,
+            memberMessage.id,
+            transcriptDigest(input.content) !== transcriptionAttempt.transcript_digest,
+            transcriptionAttempt.id,
+          ]
+        );
+        if (!consumed.rows.length) throw concealedTranscriptionNotFound();
+      }
+
+      return {
+        type: "generate",
+        turn: turn.rows[0],
+        memberMessage,
+        context: built.context,
+        contextDigest: built.digest,
+        stagedAt,
+      };
+    });
+
+    // The expiry transition must commit before the concealed response is raised.
+    if (result.type === "expired") throw concealedTranscriptionNotFound();
+    return result;
+  }
+
   async function waitForExistingTurn(member, turnId) {
     const deadline = Date.now() + waitTimeoutMs;
     while (Date.now() <= deadline) {
@@ -292,6 +589,23 @@ function createPhase1bCoachingService(options) {
   async function finalizeTurn(member, input, staged, generated) {
     return withTransaction(db, async (client) => {
       await requireActiveMappingAndConsent(client, member, applicationConfiguration);
+      const conversationResult = await client.query(
+        `SELECT id, plan_id, status
+         FROM coaching_conversations
+         WHERE id = $1 AND member_id = $2
+         FOR UPDATE`,
+        [staged.turn.conversation_id, member.memberId]
+      );
+      if (
+        !conversationResult.rows.length
+        || conversationResult.rows[0].status !== "active"
+        || !sameIdentifier(conversationResult.rows[0].plan_id, staged.turn.plan_id)
+      ) {
+        throw conflict(
+          "COACHING_CONTEXT_CHANGED",
+          "Your coaching context changed while this response was being prepared"
+        );
+      }
       const turnResult = await client.query(
         `SELECT *
          FROM goals_coach_coaching_turns
@@ -379,8 +693,11 @@ function createPhase1bCoachingService(options) {
     });
   }
 
-  async function sendMessage(member, conversationId, input) {
-    const staged = await stageTurn(member, conversationId, input);
+  async function sendMessage(member, conversationId, input, requestContext) {
+    const inputMethod = input.inputMethod === undefined ? "text" : input.inputMethod;
+    const staged = inputMethod === "voice"
+      ? await stageVoiceTurn(member, conversationId, input, requestContext)
+      : await stageTextTurn(member, conversationId, input);
     if (staged.type === "completed") return staged.result;
     if (staged.type === "pending") return waitForExistingTurn(member, staged.turnId);
 

@@ -20,6 +20,13 @@ const {
 
 function createAlphaGoalsCoachRouter(options) {
   const router = express.Router();
+  const transcriptionBindingKey = options.transcriptionBindingKey;
+  const voiceSubmissionReady = Boolean(
+    options.phase1cStartup
+    && options.phase1cStartup.status === "ready"
+    && (typeof transcriptionBindingKey === "string" || Buffer.isBuffer(transcriptionBindingKey))
+    && transcriptionBindingKey.length > 0
+  );
   const capabilityStartup = options.phase1bStartup || (options.coachingEngine
     ? {
       status: "ready",
@@ -45,6 +52,8 @@ function createAlphaGoalsCoachRouter(options) {
       engine: options.coachingEngine,
       applicationConfiguration: options.applicationConfiguration,
       ...(options.phase1bServiceOptions || {}),
+      phase1cStartup: options.phase1cStartup,
+      transcriptionBindingKey,
     })
     : null);
   const rateLimits = options.rateLimits || createAlphaRateLimits();
@@ -178,8 +187,19 @@ function createAlphaGoalsCoachRouter(options) {
     try {
       const conversationId = positiveId(req.params.conversationId, "conversationId");
       const input = alphaMessageInput(req.body);
+      if (input.inputMethod === "voice" && (!voiceSubmissionReady || !phase1bService)) {
+        return res.status(503).json({
+          error: "TRANSCRIPTION_NOT_AVAILABLE",
+          message: "Transcription is not available.",
+        });
+      }
       const result = phase1bService
-        ? await phase1bService.sendMessage(req.alphaMember, conversationId, input)
+        ? await phase1bService.sendMessage(
+          req.alphaMember,
+          conversationId,
+          input,
+          { authenticatedSessionId: req.alphaMemberIdentity.sessionId }
+        )
         : await service.sendTestMessage(
           req.alphaMember,
           conversationId,

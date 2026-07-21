@@ -64,6 +64,12 @@ function sameIdentifier(left, right) {
   return String(left) === String(right);
 }
 
+function sameTimestamp(left, right) {
+  const leftTime = new Date(left).getTime();
+  const rightTime = new Date(right).getTime();
+  return !Number.isNaN(leftTime) && leftTime === rightTime;
+}
+
 function validateInput(input) {
   if (!input || typeof input !== "object") {
     throw serviceError(400, "TRANSCRIPTION_REQUEST_INVALID", "Invalid transcription request");
@@ -144,6 +150,26 @@ function ownsAttempt(row, context) {
     && row.auth_session_digest === context.authSessionDigest
     && sameIdentifier(row.conversation_id, context.conversationId)
     && sameIdentifier(row.plan_id, context.planId);
+}
+
+function isExactPendingAttempt(row, attempt, context) {
+  return Boolean(row)
+    && row.status === "pending"
+    && sameIdentifier(row.id, attempt.id)
+    && ownsAttempt(row, context)
+    && sameIdentifier(row.member_id, attempt.member_id)
+    && sameIdentifier(row.auth_mapping_id, attempt.auth_mapping_id)
+    && row.auth_session_digest === attempt.auth_session_digest
+    && sameIdentifier(row.conversation_id, attempt.conversation_id)
+    && sameIdentifier(row.plan_id, attempt.plan_id)
+    && sameIdentifier(row.request_id, attempt.request_id)
+    && Number(row.attempt_number) === Number(attempt.attempt_number)
+    && row.mime_type === attempt.mime_type
+    && Number(row.audio_byte_count) === Number(attempt.audio_byte_count)
+    && row.audio_digest === attempt.audio_digest
+    && row.provider_identifier === attempt.provider_identifier
+    && row.model_identifier === attempt.model_identifier
+    && sameTimestamp(row.provider_started_at, attempt.provider_started_at);
 }
 
 function adapterFailureResponse(failureCategory) {
@@ -230,6 +256,14 @@ function createTranscriptionService(options = {}) {
     throw new Error("maximumPerDay must be at least maximumPerMinute");
   }
   const clock = typeof options.now === "function" ? options.now : () => new Date();
+  const transactionHooks = options.transactionHooks || null;
+
+  async function runTransactionHook(name, client) {
+    const hook = transactionHooks && transactionHooks[name];
+    if (typeof hook !== "function") return;
+    const backend = await client.query("SELECT pg_backend_pid()::int AS pid");
+    await hook({ backendPid: Number(backend.rows[0].pid) });
+  }
 
   async function requireOwnership(client, context) {
     const mapping = await client.query(
@@ -449,6 +483,51 @@ function createTranscriptionService(options = {}) {
 
   async function finalizeAttempt(attempt, context, result, completedAt, operationDeadline) {
     return withTransaction(db, async (client) => {
+      await runTransactionHook("beforeFinalizeOwnershipLocks", client);
+      if (!(await requireOwnership(client, context))) {
+        const failed = await client.query(
+          `UPDATE goals_coach_transcription_attempts
+           SET status = 'failed',
+               failure_category = 'provider_error',
+               provider_completed_at = $1
+           WHERE id = $2
+             AND member_id = $3
+             AND auth_mapping_id = $4
+             AND auth_session_digest = $5
+             AND conversation_id = $6
+             AND plan_id = $7
+             AND request_id = $8
+             AND attempt_number = $9
+             AND mime_type = $10
+             AND audio_byte_count = $11
+             AND audio_digest = $12
+             AND provider_identifier = $13
+             AND model_identifier = $14
+             AND provider_started_at = $15
+             AND status = 'pending'
+           RETURNING id`,
+          [
+            completedAt,
+            attempt.id,
+            attempt.member_id,
+            attempt.auth_mapping_id,
+            attempt.auth_session_digest,
+            attempt.conversation_id,
+            attempt.plan_id,
+            attempt.request_id,
+            attempt.attempt_number,
+            attempt.mime_type,
+            attempt.audio_byte_count,
+            attempt.audio_digest,
+            attempt.provider_identifier,
+            attempt.model_identifier,
+            attempt.provider_started_at,
+          ]
+        );
+        return failed.rows.length ? { type: "ownership_changed" } : { type: "lost" };
+      }
+      await runTransactionHook("afterFinalizeOwnershipLocks", client);
+
       const selected = await client.query(
         `SELECT *
          FROM goals_coach_transcription_attempts
@@ -456,26 +535,8 @@ function createTranscriptionService(options = {}) {
          FOR UPDATE`,
         [attempt.id]
       );
-      if (
-        !selected.rows.length
-        || selected.rows[0].status !== "pending"
-        || !ownsAttempt(selected.rows[0], context)
-        || !sameIdentifier(selected.rows[0].request_id, attempt.request_id)
-        || Number(selected.rows[0].attempt_number) !== Number(attempt.attempt_number)
-      ) {
+      if (!isExactPendingAttempt(selected.rows[0], attempt, context)) {
         return { type: "lost" };
-      }
-      if (!(await requireOwnership(client, context))) {
-        const failed = await client.query(
-          `UPDATE goals_coach_transcription_attempts
-           SET status = 'failed',
-               failure_category = 'provider_error',
-               provider_completed_at = $1
-           WHERE id = $2 AND status = 'pending'
-           RETURNING id`,
-          [completedAt, attempt.id]
-        );
-        return failed.rows.length ? { type: "ownership_changed" } : { type: "lost" };
       }
 
       if (Date.now() >= operationDeadline) {

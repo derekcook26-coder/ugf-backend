@@ -1,4 +1,12 @@
 const { enumValue, optionalText, positiveId, requiredClientMessageId } = require("./validation");
+const { canonicalUuid } = require("./transcription-adapter");
+
+const ALPHA_MESSAGE_FIELDS = new Set([
+  "content",
+  "clientMessageId",
+  "inputMethod",
+  "transcriptionId",
+]);
 
 function invalid(message) {
   const error = new Error(message);
@@ -11,6 +19,17 @@ function requiredText(value, fieldName, maxLength) {
   const normalized = String(value || "").trim();
   if (!normalized || normalized.length > maxLength) {
     invalid(`${fieldName} must contain 1 to ${maxLength} characters`);
+  }
+  return normalized;
+}
+
+function requiredMessageContent(value) {
+  if (typeof value !== "string") {
+    invalid("content must be a string");
+  }
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 8000) {
+    invalid("content must contain 1 to 8000 characters");
   }
   return normalized;
 }
@@ -96,10 +115,33 @@ function feedbackInput(body) {
 }
 
 function alphaMessageInput(body) {
-  return {
-    content: requiredText(body && body.content, "content", 8000),
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    invalid("Message body must be an object");
+  }
+  for (const field of Object.keys(body)) {
+    if (!ALPHA_MESSAGE_FIELDS.has(field)) {
+      invalid(`Unknown message field: ${field}`);
+    }
+  }
+
+  const inputMethod = body.inputMethod === undefined
+    ? "text"
+    : enumValue(body.inputMethod, "inputMethod", ["text", "voice"]);
+  const input = {
+    content: requiredMessageContent(body.content),
     clientMessageId: requiredClientMessageId(body && body.clientMessageId),
+    inputMethod,
   };
+  if (inputMethod === "text") {
+    if (body.transcriptionId !== undefined) {
+      invalid("transcriptionId is not permitted for text input");
+    }
+    return input;
+  }
+  if (!canonicalUuid(body.transcriptionId)) {
+    invalid("transcriptionId must be a canonical lowercase UUID");
+  }
+  return { ...input, transcriptionId: body.transcriptionId };
 }
 
 module.exports = {
