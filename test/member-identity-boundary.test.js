@@ -20,16 +20,16 @@ function safePlan(overrides = {}) {
   };
 }
 
-test("GymMaster member identity stays pending until a delegated sign-in contract is documented", () => {
+test("GymMaster member identity stays pending until a supported sign-in contract is documented", () => {
   const report = createMemberIdentityBoundaryReport();
   assert.equal(report.status, "provider_contract_pending");
   assert.equal(report.activationPermitted, false);
   assert.equal(report.externalCallsPermitted, false);
   assert.equal(report.passwordCollectionPermitted, false);
-  assert.ok(report.blockers.includes("gymmaster_delegated_sign_in_contract_required"));
+  assert.ok(report.blockers.includes("gymmaster_supported_auth_contract_required"));
 });
 
-test("member passwords can never be collected by the Goals Coach boundary", () => {
+test("delegated sign-in plans must keep member passwords provider-hosted", () => {
   const report = createMemberIdentityBoundaryReport({
     plan: safePlan({ passwordHandling: "goals_coach_collects_password" }),
   });
@@ -42,7 +42,7 @@ test("an email alone is not treated as an authenticated GymMaster session", () =
   const report = createMemberIdentityBoundaryReport({
     plan: safePlan({ authorizationMethod: "email_lookup" }),
   });
-  assert.ok(report.blockers.includes("gymmaster_delegated_sign_in_contract_required"));
+  assert.ok(report.blockers.includes("gymmaster_supported_auth_contract_required"));
 });
 
 test("the documented GymMaster password-grant login remains blocked pending an owner security decision", () => {
