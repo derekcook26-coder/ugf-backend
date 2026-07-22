@@ -25,6 +25,7 @@ function createGymMasterMemberLoginHandler(options = {}) {
   const loginService = options.loginService;
   const sessionService = options.sessionService;
   const authorizeIdentity = options.authorizeIdentity;
+  const authorizeOwner = options.authorizeOwner === undefined ? null : options.authorizeOwner;
   const attemptLimiter = options.attemptLimiter;
 
   return async function loginGymMasterMember(req, res) {
@@ -36,6 +37,7 @@ function createGymMasterMemberLoginHandler(options = {}) {
       || !sessionService
       || typeof sessionService.issue !== "function"
       || typeof authorizeIdentity !== "function"
+      || (authorizeOwner !== null && typeof authorizeOwner !== "function")
       || !attemptLimiter
       || typeof attemptLimiter.allow !== "function"
     ) {
@@ -52,6 +54,9 @@ function createGymMasterMemberLoginHandler(options = {}) {
       const identity = await loginService.authenticate(req.body);
       const activeMember = await authorizeIdentity(identity);
       if (!activeMember || activeMember.active !== true) {
+        return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
+      }
+      if (authorizeOwner !== null && await authorizeOwner(identity) !== true) {
         return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
       }
       const session = sessionService.issue(identity);

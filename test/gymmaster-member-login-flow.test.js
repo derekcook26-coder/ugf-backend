@@ -78,3 +78,14 @@ test("proposed login flow refuses a GymMaster-inactive member without a session"
   assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
   assert.equal(res.headers["Set-Cookie"], undefined);
 });
+
+test("proposed login flow refuses a non-owner before issuing a session when owner-only authorization is composed", async () => {
+  const res = response();
+  const handler = createFlow({
+    handler: { authorizeOwner: async () => false },
+  });
+  await handler(request(), res);
+  assert.equal(res.statusCode, 401);
+  assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
+  assert.equal(res.headers["Set-Cookie"], undefined);
+});
