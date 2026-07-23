@@ -38,7 +38,7 @@ function positiveMemberId(value) {
 }
 
 function positiveExpiry(value) {
-  return Number.isInteger(value) && value >= 1 && value <= 24 * 60 * 60
+  return Number.isSafeInteger(value) && value >= 1
     ? value
     : null;
 }

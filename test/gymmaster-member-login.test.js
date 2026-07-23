@@ -2,7 +2,10 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { createGymMasterMemberLoginService } = require("../src/goals-coach/gymmaster-member-login");
+const {
+  createGymMasterMemberLoginService,
+  positiveExpiry,
+} = require("../src/goals-coach/gymmaster-member-login");
 
 function service(overrides = {}) {
   return createGymMasterMemberLoginService({
@@ -47,6 +50,23 @@ test("a successful injected provider response exposes only the verified identity
   });
   assert.equal(JSON.stringify(identity).includes("token"), false);
   assert.equal(JSON.stringify(identity).includes("password"), false);
+});
+
+test("expiry validation accepts only positive JavaScript safe integers", () => {
+  for (const value of [1, 3600, 86400, 86401, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(positiveExpiry(value), value);
+  }
+  for (const value of [
+    "1",
+    "3600",
+    0,
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.MIN_SAFE_INTEGER - 1,
+  ]) {
+    assert.equal(positiveExpiry(value), null);
+  }
 });
 
 test("login validation never calls the provider for invalid input", async () => {
