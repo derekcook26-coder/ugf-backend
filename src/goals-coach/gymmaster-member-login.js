@@ -1,11 +1,12 @@
 "use strict";
 
+const { MEMBER_PORTAL_FAILURE_STAGES } = require("./gymmaster-member-portal-client");
+
 const GYMMASTER_AUTH_PROVIDER = "gymmaster";
 const GYMMASTER_AUTH_SUBJECT_PREFIX = "gymmaster:";
 const MAXIMUM_EMAIL_LENGTH = 320;
 const MAXIMUM_PASSWORD_LENGTH = 1024;
 const MEMBER_PORTAL_REQUEST_FAILURE = "member_portal_request_failure";
-const MEMBER_PORTAL_INVALID_ENVELOPE = "member_portal_invalid_envelope";
 
 function loginError(code, memberPortalFailureStage) {
   const error = new Error("Member login could not be completed");
@@ -73,10 +74,31 @@ function createGymMasterMemberLoginService(options = {}) {
     }
 
     const result = response && typeof response === "object" ? response.result : null;
-    const memberId = result && positiveMemberId(result.memberid);
-    const expiresInSeconds = result && positiveExpiry(result.expires);
-    if (!memberId || !expiresInSeconds || typeof result.token !== "string" || !result.token) {
-      throw loginError("GYMMASTER_MEMBER_LOGIN_FAILED", MEMBER_PORTAL_INVALID_ENVELOPE);
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      throw loginError(
+        "GYMMASTER_MEMBER_LOGIN_FAILED",
+        MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult
+      );
+    }
+    if (typeof result.token !== "string" || !result.token) {
+      throw loginError(
+        "GYMMASTER_MEMBER_LOGIN_FAILED",
+        MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeToken
+      );
+    }
+    const expiresInSeconds = positiveExpiry(result.expires);
+    if (!expiresInSeconds) {
+      throw loginError(
+        "GYMMASTER_MEMBER_LOGIN_FAILED",
+        MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeExpires
+      );
+    }
+    const memberId = positiveMemberId(result.memberid);
+    if (!memberId) {
+      throw loginError(
+        "GYMMASTER_MEMBER_LOGIN_FAILED",
+        MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeMemberId
+      );
     }
 
     // Deliberately omit the member password and provider token. A future session

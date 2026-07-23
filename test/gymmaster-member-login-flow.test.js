@@ -123,8 +123,32 @@ test("exactly enabled owner login diagnostic distinguishes fixed failure stages"
       },
     },
     {
-      stage: "member_portal_invalid_envelope",
+      stage: "member_portal_invalid_envelope_result",
       overrides: { loginService: { loginClient: async () => ({ error: null, result: null }) } },
+    },
+    {
+      stage: "member_portal_invalid_envelope_token",
+      overrides: {
+        loginService: {
+          loginClient: async () => ({ result: { token: "", expires: 3600, memberid: 10482 } }),
+        },
+      },
+    },
+    {
+      stage: "member_portal_invalid_envelope_expires",
+      overrides: {
+        loginService: {
+          loginClient: async () => ({ result: { token: "provider-token", expires: null, memberid: 10482 } }),
+        },
+      },
+    },
+    {
+      stage: "member_portal_invalid_envelope_memberid",
+      overrides: {
+        loginService: {
+          loginClient: async () => ({ result: { token: "provider-token", expires: 3600, memberid: null } }),
+        },
+      },
     },
     {
       stage: "local_mapping",
@@ -194,4 +218,52 @@ test("owner login diagnostic output cannot contain sensitive login or provider v
     assert.equal(output.join("\n").includes(sensitive), false);
   }
   assert.equal(JSON.stringify(res.body), JSON.stringify({ error: "MEMBER_LOGIN_FAILED" }));
+});
+
+test("invalid-envelope diagnostics emit only fixed structural labels without provider values", async () => {
+  const sensitiveValues = [
+    "member-password",
+    "member@example.com",
+    "never-returned-provider-token",
+    "members-key",
+    "10482",
+    "https://ugf.gymmasteronline.com/portal/api/v1/login",
+    "Unauthorized",
+    "raw response body",
+    "raw provider error",
+  ];
+  const cases = [
+    {
+      stage: "member_portal_invalid_envelope_result",
+      result: sensitiveValues.join(" "),
+    },
+    {
+      stage: "member_portal_invalid_envelope_token",
+      result: { token: { detail: sensitiveValues.join(" ") }, expires: 3600, memberid: 10482 },
+    },
+    {
+      stage: "member_portal_invalid_envelope_expires",
+      result: { token: "never-returned-provider-token", expires: sensitiveValues.join(" "), memberid: 10482 },
+    },
+    {
+      stage: "member_portal_invalid_envelope_memberid",
+      result: { token: "never-returned-provider-token", expires: 3600, memberid: sensitiveValues.join(" ") },
+    },
+  ];
+
+  for (const { stage, result } of cases) {
+    const output = [];
+    const res = response();
+    await createFlow({
+      loginService: { loginClient: async () => ({ result }) },
+      ownerLoginStageDiagnostic: "true",
+      diagnosticSink: (line) => output.push(line),
+    })(request(), res);
+    assert.equal(res.statusCode, 401);
+    assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
+    assert.deepEqual(output, [`[UGF] goals_coach_owner_login_stage=${stage}`]);
+    for (const sensitive of sensitiveValues) {
+      assert.equal(output.join("\n").includes(sensitive), false);
+    }
+  }
 });

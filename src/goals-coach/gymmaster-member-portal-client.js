@@ -5,7 +5,10 @@ const MEMBER_PORTAL_FAILURE_STAGES = Object.freeze({
   request: "member_portal_request_failure",
   nonSuccessResponse: "member_portal_non_success_response",
   provider: "member_portal_provider_failure",
-  invalidEnvelope: "member_portal_invalid_envelope",
+  invalidEnvelopeResult: "member_portal_invalid_envelope_result",
+  invalidEnvelopeToken: "member_portal_invalid_envelope_token",
+  invalidEnvelopeExpires: "member_portal_invalid_envelope_expires",
+  invalidEnvelopeMemberId: "member_portal_invalid_envelope_memberid",
 });
 
 function memberPortalFailure(stage) {
@@ -63,14 +66,14 @@ function createGymMasterMemberPortalClient(options = {}) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
       }
       if (typeof response.json !== "function") {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelope);
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
       }
 
       let parsed;
       try {
         parsed = await response.json();
       } catch (_) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelope);
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
       }
       if (providerDeclaredFailure(parsed)) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.provider);
