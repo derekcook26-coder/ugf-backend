@@ -62,7 +62,7 @@ test("GymMaster client classifies only fixed request, status, provider, and enve
       }),
     },
     {
-      stage: "member_portal_invalid_envelope",
+      stage: "member_portal_invalid_envelope_result",
       fetchImpl: async () => ({ status: 200, json: async () => { throw new Error("raw JSON detail"); } }),
     },
   ];
