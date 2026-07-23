@@ -2,7 +2,7 @@
 
 This checkpoint prepares a deliberately narrow, disabled-by-default owner test path for the future Goals Coach member login.
 
-It does not mount a route in `server.js`, configure Railway, contact GymMaster, contact an AI provider, or enable coaching. A separate route-composition change and separate written owner authorization are still required before any request can reach this code.
+It conditionally composes a route in `server.js`, but configuration is absent by default, so no route exists in the running service. It does not configure Railway, contact GymMaster, contact an AI provider, or enable coaching. Separate written owner authorization and deliberate deployment configuration are still required before any request can reach this code.
 
 ## Required configuration for a future owner test
 
@@ -17,12 +17,14 @@ The member ID is deployment configuration, not source code, browser data, or a v
 
 ## Narrow behavior
 
-When separately composed in the future, the router exposes only:
+Only when every requirement above is valid, the running backend mounts the router at `/goalscoach` with a separate exact-origin CORS policy. The router exposes only:
 
 - `POST /login` — the existing Members-key password-login handler; it issues no session unless GymMaster login, Gatekeeper membership verification, the active local mapping, and the owner-ID comparison all succeed.
 - `GET /session` — returns only owner-only status after validating a short-lived, host-only session cookie.
 
 There are no conversation, message, workout, voice, safety, provider, or activation routes in this checkpoint. A non-owner receives the same generic login failure as any other failed login attempt, so the route does not disclose whether a GymMaster account belongs to the owner.
+
+If the exact owner-only flag is missing or differs from the lowercase string `true`, the owner member ID is absent or invalid, or any required Member Portal/Gatekeeper/session/origin prerequisite is missing, the route is not mounted. Requests to `/goalscoach/login` and `/goalscoach/session` therefore receive the ordinary 404 response and cannot reach GymMaster.
 
 ## Security limits
 

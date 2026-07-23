@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { createGymMasterMemberLoginHandler } = require("../src/goals-coach/gymmaster-member-login-route");
+const { createGymMasterMemberLoginHandler, exactHttpsOrigin } = require("../src/goals-coach/gymmaster-member-login-route");
 
 const ORIGIN = "https://ultimategoalsfitness.com";
 const identity = {
@@ -83,6 +83,18 @@ test("login route refuses malformed or non-HTTPS origins during composition", as
   await handler({ origin: "http://ultimategoalsfitness.com" })(request(), res);
   assert.equal(res.statusCode, 503);
   assert.deepEqual(res.body, { error: "MEMBER_LOGIN_NOT_AVAILABLE" });
+});
+
+test("login route rejects wildcard origins before any request can be sent", async () => {
+  assert.equal(exactHttpsOrigin("https://*.ultimategoalsfitness.com"), null);
+  let providerCalls = 0;
+  const res = response();
+  await handler({
+    origin: "https://*.ultimategoalsfitness.com",
+    loginService: { authenticate: async () => { providerCalls += 1; return identity; } },
+  })(request(), res);
+  assert.equal(res.statusCode, 503);
+  assert.equal(providerCalls, 0);
 });
 
 test("login never forwards an attempt after the local rate limit is reached", async () => {

@@ -39,6 +39,12 @@ test("member-login startup rejects incomplete or unsafe configuration", () => {
   assert.equal(configuration.valid, false);
   assert.ok(configuration.blockers.includes("exact_https_member_login_origin_required"));
   assert.ok(configuration.blockers.includes("member_api_key_required"));
+
+  const wildcard = loadGymMasterMemberLoginConfiguration(completeEnvironment({
+    GOALS_COACH_MEMBER_LOGIN_ORIGIN: "https://*.ultimategoalsfitness.com",
+  }));
+  assert.equal(wildcard.valid, false);
+  assert.ok(wildcard.blockers.includes("exact_https_member_login_origin_required"));
 });
 
 test("ready startup only composes injected services and performs no external work", () => {

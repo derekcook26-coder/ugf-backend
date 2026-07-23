@@ -124,6 +124,8 @@ test("actual backend startup remains healthy and external-service-free with test
 
   const health = await waitForHealth(child, port);
   assert.deepEqual(health, { ok: true });
+  const ownerOnlyRoute = await fetch(`http://127.0.0.1:${port}/goalscoach/session`);
+  assert.equal(ownerOnlyRoute.status, 404);
   assert.equal(child.exitCode, null);
   assert.equal(stderr, "");
 });

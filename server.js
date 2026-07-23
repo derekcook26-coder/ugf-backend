@@ -28,6 +28,8 @@ var { createPhase1bStartup } = require("./src/goals-coach/phase1b-startup");
 var { createPhase1cStartup } = require("./src/goals-coach/phase1c-startup");
 var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes");
 var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
+var { createGymMasterOwnerOnlyStartup } = require("./src/goals-coach/gymmaster-owner-only-startup");
+var { composeGymMasterOwnerOnlyRoutes } = require("./src/goals-coach/gymmaster-owner-only-route-composition");
 
 var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
@@ -83,6 +85,10 @@ var memberCors = cors({
 app.use(function (req, res, next) {
   if (req.path === "/staff" || req.path.startsWith("/staff/")) return next();
   if (req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/")) return next();
+  // If the disabled owner-only route is ever deliberately composed, it owns
+  // its own exact-origin CORS policy. It must never inherit this broader
+  // legacy-member allowlist.
+  if (req.path === "/goalscoach" || req.path.startsWith("/goalscoach/")) return next();
   return memberCors(req, res, next);
 });
 
@@ -92,6 +98,16 @@ var db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// Owner-only member login has no default route. It is mounted only after all
+// independent Member Portal, Gatekeeper, session, exact-origin, owner-ID, and
+// exact-flag checks succeed. With the current unset deployment variables, this
+// leaves /goalscoach absent and performs no external work at startup.
+var ownerOnlyStartup = createGymMasterOwnerOnlyStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterOwnerOnlyRoutes(app, ownerOnlyStartup);
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
 

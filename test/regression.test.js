@@ -52,6 +52,14 @@ test("production startup never imports the test-only responder", () => {
   }
 });
 
+test("owner-only GymMaster login is conditionally composed and cannot replace existing member routes", () => {
+  assert.match(serverSource, /createGymMasterOwnerOnlyStartup\(\{\s*db: db,\s*fetchImpl: fetch,\s*\}\)/);
+  assert.match(serverSource, /composeGymMasterOwnerOnlyRoutes\(app, ownerOnlyStartup\)/);
+  assert.match(serverSource, /req\.path === "\/goalscoach" \|\| req\.path\.startsWith\("\/goalscoach\/"\)/);
+  assert.match(serverSource, /app\.use\(\s*"\/goals-coach"/);
+  assert.equal(serverSource.includes('app.use("/goalscoach"'), false);
+});
+
 test("Phase 2 uses no required Clerk audience variable", () => {
   const authSource = fs.readFileSync(
     path.join(projectRoot, "src", "auth", "clerk-staff-auth.js"),
