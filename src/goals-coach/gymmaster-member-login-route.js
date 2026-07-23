@@ -3,7 +3,7 @@
 const { buildGymMasterSessionCookie } = require("./gymmaster-member-session");
 
 function exactHttpsOrigin(value) {
-  if (typeof value !== "string" || !value) return null;
+  if (typeof value !== "string" || !value || value.includes("*")) return null;
   try {
     const parsed = new URL(value);
     if (

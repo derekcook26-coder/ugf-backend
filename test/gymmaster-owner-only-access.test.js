@@ -45,6 +45,7 @@ test("owner-only startup remains disabled by default and cannot perform external
   const startup = createGymMasterOwnerOnlyStartup({ environment: {} });
   assert.equal(startup.status, "disabled");
   assert.equal(startup.router, null);
+  assert.equal(startup.origin, null);
   assert.equal(startup.activationPermitted, false);
   assert.equal(startup.externalCallsPermitted, false);
 });
@@ -69,6 +70,7 @@ test("ready owner-only startup only prepares an unmounted router and makes no ex
   });
   assert.equal(startup.status, "ready_for_separate_route_composition");
   assert.equal(typeof startup.router, "function");
+  assert.equal(startup.origin, "https://ultimategoalsfitness.com");
   assert.equal(startup.activationPermitted, false);
   assert.equal(startup.externalCallsPermitted, false);
   assert.equal(fetchCalls, 0);

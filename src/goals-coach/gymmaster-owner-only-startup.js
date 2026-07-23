@@ -26,6 +26,7 @@ function createGymMasterOwnerOnlyStartup(options = {}) {
   const common = {
     status: enabled ? "not_ready" : "disabled",
     router: null,
+    origin: null,
     activationPermitted: false,
     externalCallsPermitted: false,
   };
@@ -52,6 +53,7 @@ function createGymMasterOwnerOnlyStartup(options = {}) {
     ...common,
     status: "ready_for_separate_route_composition",
     router,
+    origin: memberLoginStartup.configuration.origin,
   });
 }
 
