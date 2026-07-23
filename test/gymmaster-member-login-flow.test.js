@@ -92,11 +92,39 @@ test("proposed login flow refuses a non-owner before issuing a session when owne
   assert.equal(res.headers["Set-Cookie"], undefined);
 });
 
-test("exactly enabled owner login diagnostic distinguishes only the four fixed failure stages", async () => {
+test("exactly enabled owner login diagnostic distinguishes fixed failure stages", async () => {
   const cases = [
     {
-      stage: "member_portal",
-      overrides: { loginService: { loginClient: async () => { throw new Error("raw provider failure"); } } },
+      stage: "member_portal_request_failure",
+      overrides: { loginService: { loginClient: async () => { throw new Error("raw request failure"); } } },
+    },
+    {
+      stage: "member_portal_non_success_response",
+      overrides: {
+        loginService: {
+          loginClient: async () => {
+            const error = new Error("raw status detail");
+            error.memberPortalFailureStage = "member_portal_non_success_response";
+            throw error;
+          },
+        },
+      },
+    },
+    {
+      stage: "member_portal_provider_failure",
+      overrides: {
+        loginService: {
+          loginClient: async () => {
+            const error = new Error("raw provider detail");
+            error.memberPortalFailureStage = "member_portal_provider_failure";
+            throw error;
+          },
+        },
+      },
+    },
+    {
+      stage: "member_portal_invalid_envelope",
+      overrides: { loginService: { loginClient: async () => ({ error: null, result: null }) } },
     },
     {
       stage: "local_mapping",
@@ -161,7 +189,7 @@ test("owner login diagnostic output cannot contain sensitive login or provider v
     ownerLoginStageDiagnostic: "true",
     diagnosticSink: (line) => output.push(line),
   })(request(), res);
-  assert.deepEqual(output, ["[UGF] goals_coach_owner_login_stage=member_portal"]);
+  assert.deepEqual(output, ["[UGF] goals_coach_owner_login_stage=member_portal_request_failure"]);
   for (const sensitive of sensitiveValues) {
     assert.equal(output.join("\n").includes(sensitive), false);
   }

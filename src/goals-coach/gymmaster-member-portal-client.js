@@ -1,6 +1,24 @@
 "use strict";
 
 const MEMBER_LOGIN_PATH = "/portal/api/v1/login";
+const MEMBER_PORTAL_FAILURE_STAGES = Object.freeze({
+  request: "member_portal_request_failure",
+  nonSuccessResponse: "member_portal_non_success_response",
+  provider: "member_portal_provider_failure",
+  invalidEnvelope: "member_portal_invalid_envelope",
+});
+
+function memberPortalFailure(stage) {
+  const error = new Error("GymMaster member login failed");
+  error.memberPortalFailureStage = stage;
+  return error;
+}
+
+function providerDeclaredFailure(response) {
+  if (!response || typeof response !== "object") return false;
+  const value = response.error;
+  return value !== undefined && value !== null && value !== false && value !== "";
+}
 
 function validatedLoginEndpoint(value) {
   if (typeof value !== "string" || !value) throw new Error("GymMaster login endpoint is required");
@@ -30,22 +48,42 @@ function createGymMasterMemberPortalClient(options = {}) {
         email: request.email,
         password: request.password,
       });
-      const response = await fetchImpl(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body,
-        redirect: "error",
-      });
-      if (!response || !response.ok || typeof response.json !== "function") {
-        throw new Error("GymMaster member login failed");
+      let response;
+      try {
+        response = await fetchImpl(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+          redirect: "error",
+        });
+      } catch (_) {
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
       }
-      return response.json();
+      if (!response || response.status !== 200) {
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
+      }
+      if (typeof response.json !== "function") {
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelope);
+      }
+
+      let parsed;
+      try {
+        parsed = await response.json();
+      } catch (_) {
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelope);
+      }
+      if (providerDeclaredFailure(parsed)) {
+        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.provider);
+      }
+      return parsed;
     },
   });
 }
 
 module.exports = {
   MEMBER_LOGIN_PATH,
+  MEMBER_PORTAL_FAILURE_STAGES,
   createGymMasterMemberPortalClient,
+  providerDeclaredFailure,
   validatedLoginEndpoint,
 };

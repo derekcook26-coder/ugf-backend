@@ -5,7 +5,10 @@ const { buildGymMasterSessionCookie } = require("./gymmaster-member-session");
 
 const OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG = "GOALS_COACH_OWNER_LOGIN_STAGE_DIAGNOSTIC";
 const OWNER_LOGIN_STAGES = Object.freeze(new Set([
-  "member_portal",
+  "member_portal_request_failure",
+  "member_portal_non_success_response",
+  "member_portal_provider_failure",
+  "member_portal_invalid_envelope",
   "local_mapping",
   "gatekeeper",
   "owner_authorization",
@@ -77,7 +80,7 @@ function createGymMasterMemberLoginHandler(options = {}) {
       return res.status(429).json({ error: "MEMBER_LOGIN_RATE_LIMITED" });
     }
 
-    let failureStage = "member_portal";
+    let failureStage = "member_portal_request_failure";
     try {
       const identity = await loginService.authenticate(req.body);
       failureStage = "local_mapping";
@@ -98,8 +101,12 @@ function createGymMasterMemberLoginHandler(options = {}) {
       const session = sessionService.issue(identity);
       res.setHeader("Set-Cookie", buildGymMasterSessionCookie(session));
       return res.status(204).send();
-    } catch (_) {
-      reportFailureStage(failureStage);
+    } catch (error) {
+      reportFailureStage(
+        OWNER_LOGIN_STAGES.has(error && error.memberPortalFailureStage)
+          ? error.memberPortalFailureStage
+          : failureStage
+      );
       return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
     }
   };

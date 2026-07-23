@@ -27,7 +27,7 @@ test("GymMaster client uses only the documented member password form fields", as
     endpoint: ENDPOINT,
     fetchImpl: async (url, options) => {
       called = { url, options };
-      return { ok: true, json: async () => ({ result: { token: "transient", expires: 3600, memberid: 10482 } }) };
+      return { status: 200, json: async () => ({ result: { token: "transient", expires: 3600, memberid: 10482 } }) };
     },
   });
   const result = await client.login({
@@ -41,13 +41,38 @@ test("GymMaster client uses only the documented member password form fields", as
   assert.deepEqual(result, { result: { token: "transient", expires: 3600, memberid: 10482 } });
 });
 
-test("GymMaster client never follows redirects or accepts an unsuccessful response", async () => {
-  const client = createGymMasterMemberPortalClient({
-    endpoint: ENDPOINT,
-    fetchImpl: async () => ({ ok: false, json: async () => ({ error: "detail" }) }),
-  });
-  await assert.rejects(
-    () => client.login({ memberApiKey: "key", email: "member@example.com", password: "member-password" }),
-    /GymMaster member login failed/
-  );
+test("GymMaster client classifies only fixed request, status, provider, and envelope failures", async () => {
+  const cases = [
+    {
+      stage: "member_portal_request_failure",
+      fetchImpl: async () => { throw new Error("raw request failure"); },
+    },
+    {
+      stage: "member_portal_non_success_response",
+      fetchImpl: async () => ({ status: 201, ok: true, json: async () => ({ result: {} }) }),
+    },
+    {
+      stage: "member_portal_provider_failure",
+      fetchImpl: async () => ({
+        status: 200,
+        json: async () => ({
+          error: "raw provider detail",
+          result: { token: "must-not-win", expires: 3600, memberid: 10482 },
+        }),
+      }),
+    },
+    {
+      stage: "member_portal_invalid_envelope",
+      fetchImpl: async () => ({ status: 200, json: async () => { throw new Error("raw JSON detail"); } }),
+    },
+  ];
+
+  for (const { stage, fetchImpl } of cases) {
+    const client = createGymMasterMemberPortalClient({ endpoint: ENDPOINT, fetchImpl });
+    await assert.rejects(
+      () => client.login({ memberApiKey: "key", email: "member@example.com", password: "member-password" }),
+      (error) => error.message === "GymMaster member login failed"
+        && error.memberPortalFailureStage === stage
+    );
+  }
 });
