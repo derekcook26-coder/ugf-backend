@@ -1,6 +1,17 @@
 "use strict";
 
 const GATEKEEPER_MEMBERS_PATH = "/gatekeeper_api/v2/members";
+const memberAccessFailureStages = new WeakMap();
+
+function inactiveMemberAccess(stage) {
+  const result = Object.freeze({ active: false });
+  memberAccessFailureStages.set(result, stage);
+  return result;
+}
+
+function memberAccessFailureStage(result) {
+  return result && memberAccessFailureStages.get(result) || null;
+}
 
 function validMemberId(value) {
   return /^(?:[1-9]\d*)$/.test(String(value || ""));
@@ -83,11 +94,25 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
 
   return Object.freeze({
     async authorizeIdentity(identity) {
-      const mapping = await mappingAuthorizer.authorizeIdentity(identity);
-      if (!mapping || mapping.active !== true) return Object.freeze({ active: false });
+      let mapping;
+      try {
+        mapping = await mappingAuthorizer.authorizeIdentity(identity);
+      } catch (_) {
+        return inactiveMemberAccess("local_mapping");
+      }
+      if (!mapping || mapping.active !== true) {
+        return inactiveMemberAccess("local_mapping");
+      }
       const subjectMemberId = String(identity.authSubject).slice("gymmaster:".length);
-      const membership = await membershipVerifier.verifyActiveMember(subjectMemberId);
-      if (!membership || membership.active !== true) return Object.freeze({ active: false });
+      let membership;
+      try {
+        membership = await membershipVerifier.verifyActiveMember(subjectMemberId);
+      } catch (_) {
+        return inactiveMemberAccess("gatekeeper");
+      }
+      if (!membership || membership.active !== true) {
+        return inactiveMemberAccess("gatekeeper");
+      }
       return mapping;
     },
   });
@@ -99,6 +124,7 @@ module.exports = {
   createGymMasterMemberAccessAuthorizer,
   exactGatekeeperMembersEndpoint,
   matchingMember,
+  memberAccessFailureStage,
   membershipIsActive,
   validMemberId,
 };
