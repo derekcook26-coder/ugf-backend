@@ -53,6 +53,8 @@ function createFlow(overrides = {}) {
       randomBytes: () => Buffer.alloc(32, 7),
     }),
     attemptLimiter: createGymMasterMemberLoginRateLimiter({ now: () => 0 }),
+    ownerLoginStageDiagnostic: overrides.ownerLoginStageDiagnostic,
+    diagnosticSink: overrides.diagnosticSink,
     ...overrides.handler,
   });
 }
@@ -88,4 +90,80 @@ test("proposed login flow refuses a non-owner before issuing a session when owne
   assert.equal(res.statusCode, 401);
   assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
   assert.equal(res.headers["Set-Cookie"], undefined);
+});
+
+test("exactly enabled owner login diagnostic distinguishes only the four fixed failure stages", async () => {
+  const cases = [
+    {
+      stage: "member_portal",
+      overrides: { loginService: { loginClient: async () => { throw new Error("raw provider failure"); } } },
+    },
+    {
+      stage: "local_mapping",
+      overrides: { access: { mappingAuthorizer: { authorizeIdentity: async () => ({ active: false }) } } },
+    },
+    {
+      stage: "gatekeeper",
+      overrides: { access: { membershipVerifier: { verifyActiveMember: async () => ({ active: false }) } } },
+    },
+    {
+      stage: "owner_authorization",
+      overrides: { handler: { authorizeOwner: async () => false } },
+    },
+  ];
+
+  for (const { stage, overrides } of cases) {
+    const output = [];
+    const res = response();
+    await createFlow({
+      ...overrides,
+      ownerLoginStageDiagnostic: "true",
+      diagnosticSink: (line) => output.push(line),
+    })(request(), res);
+    assert.equal(res.statusCode, 401);
+    assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
+    assert.deepEqual(output, [`[UGF] goals_coach_owner_login_stage=${stage}`]);
+  }
+});
+
+test("owner login diagnostic remains disabled for every non-exact flag value", async () => {
+  for (const value of [undefined, "True", " true", "true ", "1", true]) {
+    const output = [];
+    const res = response();
+    await createFlow({
+      loginService: { loginClient: async () => { throw new Error("provider failure"); } },
+      ownerLoginStageDiagnostic: value,
+      diagnosticSink: (line) => output.push(line),
+    })(request(), res);
+    assert.equal(res.statusCode, 401);
+    assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
+    assert.deepEqual(output, []);
+  }
+});
+
+test("owner login diagnostic output cannot contain sensitive login or provider values", async () => {
+  const sensitiveValues = [
+    "member-password",
+    "member@example.com",
+    "never-returned-provider-token",
+    "members-key",
+    "10482",
+    "203.0.113.10",
+  ];
+  const output = [];
+  const res = response();
+  await createFlow({
+    loginService: {
+      loginClient: async () => {
+        throw new Error(`raw ${sensitiveValues.join(" ")}`);
+      },
+    },
+    ownerLoginStageDiagnostic: "true",
+    diagnosticSink: (line) => output.push(line),
+  })(request(), res);
+  assert.deepEqual(output, ["[UGF] goals_coach_owner_login_stage=member_portal"]);
+  for (const sensitive of sensitiveValues) {
+    assert.equal(output.join("\n").includes(sensitive), false);
+  }
+  assert.equal(JSON.stringify(res.body), JSON.stringify({ error: "MEMBER_LOGIN_FAILED" }));
 });

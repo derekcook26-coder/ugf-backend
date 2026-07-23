@@ -2,7 +2,11 @@
 
 const { createGymMasterGatekeeperMembershipVerifier, createGymMasterMemberAccessAuthorizer } = require("./gymmaster-gatekeeper-membership");
 const { createGymMasterMemberAuthorization } = require("./gymmaster-member-authorization");
-const { createGymMasterMemberLoginHandler, exactHttpsOrigin } = require("./gymmaster-member-login-route");
+const {
+  OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG,
+  createGymMasterMemberLoginHandler,
+  exactHttpsOrigin,
+} = require("./gymmaster-member-login-route");
 const { createGymMasterMemberLoginRateLimiter } = require("./gymmaster-member-login-rate-limit");
 const { createGymMasterMemberLoginService } = require("./gymmaster-member-login");
 const { createGymMasterMemberPortalClient, validatedLoginEndpoint } = require("./gymmaster-member-portal-client");
@@ -103,6 +107,8 @@ function createGymMasterMemberLoginStartup(options = {}) {
     authorizeIdentity: accessAuthorizer.authorizeIdentity,
     ...(typeof options.authorizeOwner === "function" ? { authorizeOwner: options.authorizeOwner } : {}),
     attemptLimiter: options.attemptLimiter || createGymMasterMemberLoginRateLimiter(),
+    ownerLoginStageDiagnostic: environment[OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG],
+    ...(typeof options.diagnosticSink === "function" ? { diagnosticSink: options.diagnosticSink } : {}),
   });
   return Object.freeze({
     ...common,
