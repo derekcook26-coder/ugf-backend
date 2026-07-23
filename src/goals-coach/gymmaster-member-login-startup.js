@@ -65,6 +65,7 @@ function createGymMasterMemberLoginStartup(options = {}) {
     status: configuration.enabled ? "not_ready" : "disabled",
     configuration,
     handler: null,
+    sessionService: null,
     activationPermitted: false,
     externalCallsPermitted: false,
   };
@@ -100,12 +101,14 @@ function createGymMasterMemberLoginStartup(options = {}) {
     loginService,
     sessionService,
     authorizeIdentity: accessAuthorizer.authorizeIdentity,
+    ...(typeof options.authorizeOwner === "function" ? { authorizeOwner: options.authorizeOwner } : {}),
     attemptLimiter: options.attemptLimiter || createGymMasterMemberLoginRateLimiter(),
   });
   return Object.freeze({
     ...common,
     status: "ready_for_separate_route_composition",
     handler,
+    sessionService,
   });
 }
 
