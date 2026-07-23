@@ -267,3 +267,32 @@ test("invalid-envelope diagnostics emit only fixed structural labels without pro
     }
   }
 });
+
+test("invalid expiry values remain generic and emit only the fixed expiry label when exactly enabled", async () => {
+  for (const expires of [
+    "1",
+    "3600",
+    0,
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.MIN_SAFE_INTEGER - 1,
+  ]) {
+    const output = [];
+    const res = response();
+    await createFlow({
+      loginService: {
+        loginClient: async () => ({
+          result: { token: "provider-token", expires, memberid: 10482 },
+        }),
+      },
+      ownerLoginStageDiagnostic: "true",
+      diagnosticSink: (line) => output.push(line),
+    })(request(), res);
+    assert.equal(res.statusCode, 401);
+    assert.deepEqual(res.body, { error: "MEMBER_LOGIN_FAILED" });
+    assert.deepEqual(output, [
+      "[UGF] goals_coach_owner_login_stage=member_portal_invalid_envelope_expires",
+    ]);
+  }
+});
