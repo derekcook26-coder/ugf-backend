@@ -47,6 +47,9 @@ function createGymMasterOwnerOnlyRouter(options = {}) {
       externalCallsPermitted: false,
     });
   });
+  if (typeof options.workoutTrackingRouter === "function") {
+    router.use(options.workoutTrackingRouter);
+  }
   return router;
 }
 

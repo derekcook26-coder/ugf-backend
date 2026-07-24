@@ -11,6 +11,11 @@ const {
   createGymMasterOwnerOnlyRouter,
   ownerMemberId,
 } = require("./gymmaster-owner-only-access");
+const {
+  OWNER_WORKOUT_TRACKING_FLAG,
+  createOwnerWorkoutTrackingRouter,
+  ownerWorkoutTrackingEnabled,
+} = require("./owner-workout-tracking");
 
 const OWNER_ONLY_ENABLE_FLAG = "GOALS_COACH_OWNER_ONLY_ALPHA_ENABLED";
 const OWNER_MEMBER_ID = "GOALS_COACH_OWNER_GYMMASTER_MEMBER_ID";
@@ -48,6 +53,21 @@ function createGymMasterOwnerOnlyStartup(options = {}) {
       sessionService: memberLoginStartup.sessionService,
     }),
     authorizeOwner: ownerAuthorizer.authorizeOwner,
+    ...(ownerWorkoutTrackingEnabled(environment[OWNER_WORKOUT_TRACKING_FLAG])
+      ? {
+        workoutTrackingRouter: createOwnerWorkoutTrackingRouter({
+          db: options.db,
+          authenticateSession: createGymMasterMemberSessionAuthenticator({
+            sessionService: memberLoginStartup.sessionService,
+          }),
+          authorizeOwner: ownerAuthorizer.authorizeOwner,
+          origin: memberLoginStartup.configuration.origin,
+          ...(options.workoutTrackingRateLimits
+            ? { rateLimits: options.workoutTrackingRateLimits }
+            : {}),
+        }),
+      }
+      : {}),
   });
   return Object.freeze({
     ...common,
