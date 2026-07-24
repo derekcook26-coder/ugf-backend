@@ -77,7 +77,7 @@ test("ready owner-only startup only prepares an unmounted router and makes no ex
   assert.equal(dbCalls, 0);
 });
 
-test("owner-only router exposes only the login and non-coaching session status routes", () => {
+test("owner-only router exposes only login and session when workout tracking is disabled", () => {
   const router = createGymMasterOwnerOnlyRouter({
     loginHandler: () => {},
     authenticateSession: () => {},

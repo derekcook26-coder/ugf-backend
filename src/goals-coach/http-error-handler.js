@@ -4,6 +4,7 @@ function goalsCoachErrorHandler(error, req, res, next) {
     !(req.path === "/staff" || req.path.startsWith("/staff/"))
     && !(req.path === "/goals-coach" || req.path.startsWith("/goals-coach/"))
     && !(req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/"))
+    && !(req.path === "/goalscoach" || req.path.startsWith("/goalscoach/"))
   ) {
     return next(error);
   }
