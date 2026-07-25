@@ -16,12 +16,27 @@ const {
   createOwnerWorkoutTrackingRouter,
   ownerWorkoutTrackingEnabled,
 } = require("./owner-workout-tracking");
+const {
+  OWNER_EDITABLE_WORKOUT_SESSIONS_FLAG,
+  createOwnerEditableWorkoutSessionsRouter,
+  ownerEditableWorkoutSessionsEnabled,
+} = require("./owner-editable-workout-sessions");
 
 const OWNER_ONLY_ENABLE_FLAG = "GOALS_COACH_OWNER_ONLY_ALPHA_ENABLED";
 const OWNER_MEMBER_ID = "GOALS_COACH_OWNER_GYMMASTER_MEMBER_ID";
 
 function ownerOnlyEnabled(value) {
   return value === "true";
+}
+
+function createOwnerCapabilityRouter(capabilities) {
+  return function routeOwnerCapability(req, res, next) {
+    const capability = capabilities.find(({ paths }) => (
+      paths.some((path) => req.path === path || req.path.startsWith(`${path}/`))
+    ));
+    if (!capability) return next();
+    return capability.router(req, res, next);
+  };
 }
 
 function createGymMasterOwnerOnlyStartup(options = {}) {
@@ -47,26 +62,49 @@ function createGymMasterOwnerOnlyStartup(options = {}) {
     return Object.freeze(common);
   }
 
+  const authenticateSession = createGymMasterMemberSessionAuthenticator({
+    sessionService: memberLoginStartup.sessionService,
+  });
+  const capabilities = [];
+  if (ownerWorkoutTrackingEnabled(environment[OWNER_WORKOUT_TRACKING_FLAG])) {
+    capabilities.push({
+      paths: ["/workout-logs", "/achievements"],
+      router: createOwnerWorkoutTrackingRouter({
+        db: options.db,
+        authenticateSession,
+        authorizeOwner: ownerAuthorizer.authorizeOwner,
+        origin: memberLoginStartup.configuration.origin,
+        ...(options.workoutTrackingRateLimits
+          ? { rateLimits: options.workoutTrackingRateLimits }
+          : {}),
+      }),
+    });
+  }
+  if (
+    ownerEditableWorkoutSessionsEnabled(
+      environment[OWNER_EDITABLE_WORKOUT_SESSIONS_FLAG]
+    )
+  ) {
+    capabilities.push({
+      paths: ["/tracked-workout-sessions"],
+      router: createOwnerEditableWorkoutSessionsRouter({
+        db: options.db,
+        authenticateSession,
+        authorizeOwner: ownerAuthorizer.authorizeOwner,
+        origin: memberLoginStartup.configuration.origin,
+        ...(options.editableWorkoutSessionsRateLimits
+          ? { rateLimits: options.editableWorkoutSessionsRateLimits }
+          : {}),
+      }),
+    });
+  }
+
   const router = createGymMasterOwnerOnlyRouter({
     loginHandler: memberLoginStartup.handler,
-    authenticateSession: createGymMasterMemberSessionAuthenticator({
-      sessionService: memberLoginStartup.sessionService,
-    }),
+    authenticateSession,
     authorizeOwner: ownerAuthorizer.authorizeOwner,
-    ...(ownerWorkoutTrackingEnabled(environment[OWNER_WORKOUT_TRACKING_FLAG])
-      ? {
-        workoutTrackingRouter: createOwnerWorkoutTrackingRouter({
-          db: options.db,
-          authenticateSession: createGymMasterMemberSessionAuthenticator({
-            sessionService: memberLoginStartup.sessionService,
-          }),
-          authorizeOwner: ownerAuthorizer.authorizeOwner,
-          origin: memberLoginStartup.configuration.origin,
-          ...(options.workoutTrackingRateLimits
-            ? { rateLimits: options.workoutTrackingRateLimits }
-            : {}),
-        }),
-      }
+    ...(capabilities.length
+      ? { workoutTrackingRouter: createOwnerCapabilityRouter(capabilities) }
       : {}),
   });
   return Object.freeze({

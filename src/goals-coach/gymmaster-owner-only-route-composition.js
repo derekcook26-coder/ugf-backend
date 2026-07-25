@@ -16,7 +16,7 @@ function createOwnerOnlyCors(origin) {
       return callback(null, false);
     },
     credentials: true,
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "PUT"],
     allowedHeaders: ["Content-Type"],
   });
 }
