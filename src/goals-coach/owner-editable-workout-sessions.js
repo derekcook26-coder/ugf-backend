@@ -366,16 +366,18 @@ function createRateLimits() {
   };
 }
 
-function createOwnerEditableWorkoutSessionsRouter(options = {}) {
+function createEditableWorkoutSessionsRouter(options = {}) {
   const db = options.db;
   const authenticateSession = options.authenticateSession;
-  const authorizeOwner = options.authorizeOwner;
+  const authorizeMember = options.authorizeMember;
+  const authorizationProperty = options.authorizationProperty || "ownerEditableWorkoutMemberId";
+  const originFailureCode = options.originFailureCode || "OWNER_ORIGIN_NOT_ALLOWED";
   const expectedOrigin = options.origin;
   if (!db || typeof db.query !== "function" || typeof db.connect !== "function") {
     throw new Error("Editable workout sessions require a transactional database");
   }
-  if (typeof authenticateSession !== "function" || typeof authorizeOwner !== "function") {
-    throw new Error("Editable workout sessions require owner session authorization");
+  if (typeof authenticateSession !== "function" || typeof authorizeMember !== "function") {
+    throw new Error("Editable workout sessions require member session authorization");
   }
   if (typeof expectedOrigin !== "string" || !expectedOrigin) {
     throw new Error("Editable workout sessions require one exact origin");
@@ -387,21 +389,21 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
 
   router.use((req, res, next) => {
     if (req.headers.origin !== expectedOrigin) {
-      return res.status(403).json({ error: "OWNER_ORIGIN_NOT_ALLOWED" });
+      return res.status(403).json({ error: originFailureCode });
     }
     return next();
   });
   router.use(authenticateSession);
   router.use(async (req, res, next) => {
     try {
-      if (authorizeOwner(req.alphaMemberIdentity) !== true) {
+      if (authorizeMember(req.alphaMemberIdentity) !== true) {
         return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" });
       }
       const authorization = await mappingAuthorization.authorizeIdentity(req.alphaMemberIdentity);
       if (!authorization.active) {
         return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" });
       }
-      req.ownerEditableWorkoutMemberId = authorization.memberId;
+      req[authorizationProperty] = authorization.memberId;
       return next();
     } catch (error) {
       return next(error);
@@ -421,7 +423,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
            ON CONFLICT (member_id, client_request_id) DO NOTHING
            RETURNING id, version`,
           [
-            req.ownerEditableWorkoutMemberId, input.clientRequestId,
+            req[authorizationProperty], input.clientRequestId,
             hash, input.workoutName, input.notes,
           ]
         );
@@ -430,7 +432,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
             `SELECT id, client_request_hash
              FROM goals_coach_tracked_workout_sessions
              WHERE member_id = $1 AND client_request_id = $2`,
-            [req.ownerEditableWorkoutMemberId, input.clientRequestId]
+            [req[authorizationProperty], input.clientRequestId]
           );
           if (!existing.rows.length || existing.rows[0].client_request_hash !== hash) {
             throw httpError(
@@ -444,7 +446,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
             session: await fetchOwnedSession(
               client,
               String(existing.rows[0].id),
-              req.ownerEditableWorkoutMemberId
+              req[authorizationProperty]
             ),
           };
         }
@@ -453,7 +455,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
         await insertRevision(
           client,
           sessionId,
-          req.ownerEditableWorkoutMemberId,
+          req[authorizationProperty],
           version,
           input.exercises
         );
@@ -461,14 +463,14 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
           `INSERT INTO goals_coach_tracked_workout_events
             (session_id, member_id, event_type, session_version, event_data)
            VALUES ($1, $2, 'created', $3, '{"source":"manual"}'::jsonb)`,
-          [sessionId, req.ownerEditableWorkoutMemberId, version]
+          [sessionId, req[authorizationProperty], version]
         );
         return {
           created: true,
           session: await fetchOwnedSession(
             client,
             sessionId,
-            req.ownerEditableWorkoutMemberId
+            req[authorizationProperty]
           ),
         };
       });
@@ -497,7 +499,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
          ORDER BY created_at DESC, id DESC
          LIMIT $4`,
         [
-          req.ownerEditableWorkoutMemberId,
+          req[authorizationProperty],
           input.cursorCreatedAt,
           input.cursorId,
           input.limit + 1,
@@ -519,7 +521,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
       const session = await fetchOwnedSession(
         db,
         parseSessionId(req.params.id),
-        req.ownerEditableWorkoutMemberId
+        req[authorizationProperty]
       );
       if (!session) {
         throw httpError(404, "TRACKED_WORKOUT_SESSION_NOT_FOUND", "Workout session not found");
@@ -543,7 +545,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
              FROM goals_coach_tracked_workout_sessions
              WHERE id = $1 AND member_id = $2
              FOR UPDATE`,
-            [sessionId, req.ownerEditableWorkoutMemberId]
+            [sessionId, req[authorizationProperty]]
           );
           if (!current.rows.length) {
             throw httpError(
@@ -574,14 +576,14 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
              SET workout_name = $3, notes = $4, version = $5, updated_at = NOW()
              WHERE id = $1 AND member_id = $2`,
             [
-              sessionId, req.ownerEditableWorkoutMemberId,
+              sessionId, req[authorizationProperty],
               input.workoutName, input.notes, nextVersion,
             ]
           );
           await insertRevision(
             client,
             sessionId,
-            req.ownerEditableWorkoutMemberId,
+            req[authorizationProperty],
             nextVersion,
             input.exercises
           );
@@ -591,7 +593,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
              VALUES ($1, $2, 'draft_replaced', $3, $4::jsonb)`,
             [
               sessionId,
-              req.ownerEditableWorkoutMemberId,
+              req[authorizationProperty],
               nextVersion,
               JSON.stringify({ previousVersion: input.version }),
             ]
@@ -599,7 +601,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
           return fetchOwnedSession(
             client,
             sessionId,
-            req.ownerEditableWorkoutMemberId
+            req[authorizationProperty]
           );
         });
         return res.status(200).json({ workoutSession: session });
@@ -622,7 +624,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
              FROM goals_coach_tracked_workout_sessions
              WHERE id = $1 AND member_id = $2
              FOR UPDATE`,
-            [sessionId, req.ownerEditableWorkoutMemberId]
+            [sessionId, req[authorizationProperty]]
           );
           if (!current.rows.length) {
             throw httpError(
@@ -646,7 +648,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
               session: await fetchOwnedSession(
                 client,
                 sessionId,
-                req.ownerEditableWorkoutMemberId
+                req[authorizationProperty]
               ),
             };
           }
@@ -655,7 +657,7 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
              FROM goals_coach_tracked_workout_exercises
              WHERE session_id = $1 AND member_id = $2
                AND session_version = $3 AND state = 'planned'`,
-            [sessionId, req.ownerEditableWorkoutMemberId, input.version]
+            [sessionId, req[authorizationProperty], input.version]
           );
           if (Number(planned.rows[0].count) !== 0) {
             throw httpError(
@@ -668,20 +670,20 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
             `UPDATE goals_coach_tracked_workout_sessions
              SET status = 'completed', completed_at = NOW(), updated_at = NOW()
              WHERE id = $1 AND member_id = $2`,
-            [sessionId, req.ownerEditableWorkoutMemberId]
+            [sessionId, req[authorizationProperty]]
           );
           await client.query(
             `INSERT INTO goals_coach_tracked_workout_events
               (session_id, member_id, event_type, session_version, event_data)
              VALUES ($1, $2, 'completed', $3, '{"completion":"explicit"}'::jsonb)`,
-            [sessionId, req.ownerEditableWorkoutMemberId, input.version]
+            [sessionId, req[authorizationProperty], input.version]
           );
           return {
             replay: false,
             session: await fetchOwnedSession(
               client,
               sessionId,
-              req.ownerEditableWorkoutMemberId
+              req[authorizationProperty]
             ),
           };
         });
@@ -698,8 +700,18 @@ function createOwnerEditableWorkoutSessionsRouter(options = {}) {
   return router;
 }
 
+function createOwnerEditableWorkoutSessionsRouter(options = {}) {
+  return createEditableWorkoutSessionsRouter({
+    ...options,
+    authorizeMember: options.authorizeOwner,
+    authorizationProperty: "ownerEditableWorkoutMemberId",
+    originFailureCode: "OWNER_ORIGIN_NOT_ALLOWED",
+  });
+}
+
 module.exports = {
   OWNER_EDITABLE_WORKOUT_SESSIONS_FLAG,
+  createEditableWorkoutSessionsRouter,
   createOwnerEditableWorkoutSessionsRouter,
   ownerEditableWorkoutSessionsEnabled,
   parseCompletion,
