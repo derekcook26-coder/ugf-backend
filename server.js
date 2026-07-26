@@ -30,6 +30,8 @@ var { createGoalsCoachMemberRouter } = require("./src/goals-coach/member-routes"
 var { createGoalsCoachStaffRouter } = require("./src/goals-coach/staff-routes");
 var { createGymMasterOwnerOnlyStartup } = require("./src/goals-coach/gymmaster-owner-only-startup");
 var { composeGymMasterOwnerOnlyRoutes } = require("./src/goals-coach/gymmaster-owner-only-route-composition");
+var { createGymMasterMemberEditableWorkoutSessionsStartup } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-startup");
+var { composeGymMasterMemberEditableWorkoutSessionsRoutes } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-route-composition");
 
 var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
@@ -108,6 +110,14 @@ var ownerOnlyStartup = createGymMasterOwnerOnlyStartup({
   fetchImpl: fetch,
 });
 composeGymMasterOwnerOnlyRoutes(app, ownerOnlyStartup);
+
+// Member editable-workout routes are a separately gated alpha.  They neither
+// inherit the owner flag nor activate AI, voice, coaching, or plan generation.
+var memberEditableWorkoutSessionsStartup = createGymMasterMemberEditableWorkoutSessionsStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterMemberEditableWorkoutSessionsRoutes(app, memberEditableWorkoutSessionsStartup);
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
 
