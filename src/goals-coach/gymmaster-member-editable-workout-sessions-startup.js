@@ -15,6 +15,13 @@ const {
   createGymMasterMemberEditableWorkoutSessionsRouter,
   memberEditableWorkoutSessionsEnabled,
 } = require("./gymmaster-member-editable-workout-sessions");
+const {
+  MEMBER_SAFETY_INTAKE_FLAG,
+  MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION,
+  approvedNoticeVersion,
+  createGymMasterMemberSafetyIntakeRouter,
+  memberSafetyIntakeEnabled,
+} = require("./gymmaster-member-safety-intake");
 
 function createGymMasterMemberEditableWorkoutSessionsStartup(options = {}) {
   const environment = options.environment || process.env;
@@ -51,8 +58,30 @@ function createGymMasterMemberEditableWorkoutSessionsStartup(options = {}) {
       ? { rateLimits: options.editableWorkoutSessionsRateLimits }
       : {}),
   });
+  const safetyIntakeNoticeVersion = approvedNoticeVersion(
+    environment[MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION]
+  );
+  const safetyIntakeReady = memberSafetyIntakeEnabled(
+    environment[MEMBER_SAFETY_INTAKE_FLAG]
+  ) && Boolean(safetyIntakeNoticeVersion);
+  const safetyIntakeRouter = safetyIntakeReady
+    ? createGymMasterMemberSafetyIntakeRouter({
+      db: options.db,
+      authenticateSession,
+      origin: memberLoginStartup.configuration.origin,
+      mappingAuthorization,
+      noticeVersion: safetyIntakeNoticeVersion,
+      ...(options.safetyIntakeRateLimits
+        ? { rateLimits: options.safetyIntakeRateLimits }
+        : {}),
+    })
+    : null;
   const router = express.Router();
   router.use((req, res, next) => {
+    if (safetyIntakeReady && req.path === "/safety-intake") {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    }
     if (req.headers.origin !== memberLoginStartup.configuration.origin) {
       return res.status(403).json({ error: "MEMBER_ORIGIN_NOT_ALLOWED" });
     }
@@ -75,7 +104,16 @@ function createGymMasterMemberEditableWorkoutSessionsStartup(options = {}) {
       return next(error);
     }
   });
-  router.use(capabilityRouter);
+  if (safetyIntakeRouter) router.use(safetyIntakeRouter);
+  router.use((req, res, next) => {
+    if (
+      req.path === "/tracked-workout-sessions"
+      || req.path.startsWith("/tracked-workout-sessions/")
+    ) {
+      return capabilityRouter(req, res, next);
+    }
+    return next();
+  });
 
   return Object.freeze({
     ...common,
@@ -87,5 +125,6 @@ function createGymMasterMemberEditableWorkoutSessionsStartup(options = {}) {
 
 module.exports = {
   MEMBER_EDITABLE_WORKOUT_SESSIONS_FLAG,
+  MEMBER_SAFETY_INTAKE_FLAG,
   createGymMasterMemberEditableWorkoutSessionsStartup,
 };

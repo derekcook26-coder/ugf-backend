@@ -4,6 +4,9 @@ const {
   SUPPORTED_TRANSCRIPTION_MIME_TYPES,
   canonicalUuid,
 } = require("./transcription-adapter");
+const {
+  MAXIMUM_SAFETY_INTAKE_JSON_BYTES,
+} = require("./gymmaster-member-safety-intake");
 
 const canonicalContentLength = /^(?:0|[1-9][0-9]*)$/;
 const canonicalDatabaseId = /^[1-9][0-9]{0,15}$/;
@@ -13,6 +16,7 @@ const supportedMimeTypes = new Set(SUPPORTED_TRANSCRIPTION_MIME_TYPES);
 const functionalTranscriptionPath = /^\/alpha\/goals-coach\/conversations\/([^/]+)\/transcriptions\/([^/]+)$/;
 const missingRequestIdPath = /^\/alpha\/goals-coach\/conversations\/([^/]+)\/transcriptions$/;
 const encodedPathSeparator = /%(?:2f|5c)/i;
+const memberSafetyIntakePath = "/goalscoach/member/safety-intake";
 const serviceResultFields = Object.freeze([
   "transcriptionId",
   "requestId",
@@ -101,8 +105,19 @@ function isTranscriptionRouteRequest(req) {
 
 function createApplicationJsonParser() {
   const applicationJsonParser = express.json();
+  const memberSafetyIntakeJsonParser = express.json({
+    inflate: false,
+    limit: MAXIMUM_SAFETY_INTAKE_JSON_BYTES,
+    strict: true,
+  });
   return function parseApplicationJson(req, res, next) {
     if (isTranscriptionRouteRequest(req)) return next();
+    const originalUrl = typeof req.originalUrl === "string" ? req.originalUrl : "";
+    const queryOffset = originalUrl.indexOf("?");
+    const rawPath = queryOffset === -1 ? originalUrl : originalUrl.slice(0, queryOffset);
+    if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
+      return memberSafetyIntakeJsonParser(req, res, next);
+    }
     return applicationJsonParser(req, res, next);
   };
 }
