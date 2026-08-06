@@ -19,7 +19,9 @@
     "migrate:phase1d-safety-review": "node migrate_006.js",
     "migrate:owner-workout-tracking": "node migrate_007.js",
     "migrate:owner-editable-workout-sessions": "node migrate_008.js",
+    "migrate:member-safety-intake": "node migrate_009.js",
     "rollback:phase1d-safety-review": "node rollback_006.js",
+    "rollback:member-safety-intake": "node rollback_009.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },

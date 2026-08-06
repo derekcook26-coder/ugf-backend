@@ -9,6 +9,35 @@ function goalsCoachErrorHandler(error, req, res, next) {
     return next(error);
   }
 
+  if (req.path === "/goalscoach/member/safety-intake") {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (error && error.type === "entity.too.large") {
+      return res.status(413).json({
+        error: "SAFETY_INTAKE_BODY_TOO_LARGE",
+        message: "The safety intake request is too large.",
+      });
+    }
+    if (
+      error
+      && [
+        "encoding.unsupported",
+        "entity.parse.failed",
+        "request.aborted",
+        "request.size.invalid",
+      ].includes(error.type)
+    ) {
+      return res.status(error.type === "encoding.unsupported" ? 415 : 400).json({
+        error: error.type === "encoding.unsupported"
+          ? "SAFETY_INTAKE_MEDIA_TYPE_UNSUPPORTED"
+          : "SAFETY_INTAKE_INVALID",
+        message: error.type === "encoding.unsupported"
+          ? "Safety intake requires uncompressed application/json."
+          : "Invalid safety intake request.",
+      });
+    }
+  }
+
   if (error && error.code === "23503") {
     return res.status(409).json({ error: "OWNERSHIP_CONSTRAINT_FAILED" });
   }
