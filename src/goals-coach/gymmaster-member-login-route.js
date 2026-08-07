@@ -45,6 +45,9 @@ function createGymMasterMemberLoginHandler(options = {}) {
   const sessionService = options.sessionService;
   const authorizeIdentity = options.authorizeIdentity;
   const authorizeOwner = options.authorizeOwner === undefined ? null : options.authorizeOwner;
+  const completePendingEnrollment = options.completePendingEnrollment === undefined
+    ? null
+    : options.completePendingEnrollment;
   const attemptLimiter = options.attemptLimiter;
   const diagnosticEnabled = ownerLoginStageDiagnosticEnabled(options.ownerLoginStageDiagnostic);
   const diagnosticSink = typeof options.diagnosticSink === "function"
@@ -71,6 +74,10 @@ function createGymMasterMemberLoginHandler(options = {}) {
       || typeof sessionService.issue !== "function"
       || typeof authorizeIdentity !== "function"
       || (authorizeOwner !== null && typeof authorizeOwner !== "function")
+      || (
+        completePendingEnrollment !== null
+        && typeof completePendingEnrollment !== "function"
+      )
       || !attemptLimiter
       || typeof attemptLimiter.allow !== "function"
     ) {
@@ -87,11 +94,19 @@ function createGymMasterMemberLoginHandler(options = {}) {
     try {
       const identity = await loginService.authenticate(req.body);
       failureStage = "local_mapping";
-      const activeMember = await authorizeIdentity(identity);
+      let activeMember = await authorizeIdentity(identity);
+      const accessFailureStage = memberAccessFailureStage(activeMember);
+      if (
+        (!activeMember || activeMember.active !== true)
+        && completePendingEnrollment !== null
+        && accessFailureStage === "local_mapping"
+      ) {
+        activeMember = await completePendingEnrollment(identity);
+      }
       if (!activeMember || activeMember.active !== true) {
         reportFailureStage(
-          OWNER_LOGIN_STAGES.has(memberAccessFailureStage(activeMember))
-            ? memberAccessFailureStage(activeMember)
+          OWNER_LOGIN_STAGES.has(accessFailureStage)
+            ? accessFailureStage
             : "local_mapping"
         );
         return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
