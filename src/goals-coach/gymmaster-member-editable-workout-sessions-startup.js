@@ -40,6 +40,9 @@ function createGymMasterMemberEditableWorkoutSessionsStartup(options = {}) {
   const memberLoginStartup = createGymMasterMemberLoginStartup({
     ...options,
     environment,
+    ...(typeof options.completePendingEnrollment === "function"
+      ? { completePendingEnrollment: options.completePendingEnrollment }
+      : {}),
   });
   if (memberLoginStartup.status !== "ready_for_separate_route_composition") {
     return Object.freeze(common);

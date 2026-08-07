@@ -105,6 +105,9 @@ function createGymMasterMemberLoginStartup(options = {}) {
     loginService,
     sessionService,
     authorizeIdentity: accessAuthorizer.authorizeIdentity,
+    ...(typeof options.completePendingEnrollment === "function"
+      ? { completePendingEnrollment: options.completePendingEnrollment }
+      : {}),
     ...(typeof options.authorizeOwner === "function" ? { authorizeOwner: options.authorizeOwner } : {}),
     attemptLimiter: options.attemptLimiter || createGymMasterMemberLoginRateLimiter(),
     ownerLoginStageDiagnostic: environment[OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG],

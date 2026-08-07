@@ -32,6 +32,7 @@ var { createGymMasterOwnerOnlyStartup } = require("./src/goals-coach/gymmaster-o
 var { composeGymMasterOwnerOnlyRoutes } = require("./src/goals-coach/gymmaster-owner-only-route-composition");
 var { createGymMasterMemberEditableWorkoutSessionsStartup } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-startup");
 var { composeGymMasterMemberEditableWorkoutSessionsRoutes } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-route-composition");
+var { createGymMasterMemberPendingEnrollmentStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-startup");
 
 var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
@@ -101,6 +102,15 @@ var db = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// Pending enrollment is disabled unless its exact flag is "true". Startup only
+// composes injected database and Gatekeeper boundaries; it performs no provider
+// request or database mutation. Its service is shared by the existing member
+// login and existing authenticated staff boundaries only when fully ready.
+var memberPendingEnrollmentStartup = createGymMasterMemberPendingEnrollmentStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+
 // Owner-only member login has no default route. It is mounted only after all
 // independent Member Portal, Gatekeeper, session, exact-origin, owner-ID, and
 // exact-flag checks succeed. With the current unset deployment variables, this
@@ -116,6 +126,12 @@ composeGymMasterOwnerOnlyRoutes(app, ownerOnlyStartup);
 var memberEditableWorkoutSessionsStartup = createGymMasterMemberEditableWorkoutSessionsStartup({
   db: db,
   fetchImpl: fetch,
+  ...(memberPendingEnrollmentStartup.status === "ready_for_existing_boundaries"
+    ? {
+      completePendingEnrollment:
+        memberPendingEnrollmentStartup.service.completeAuthenticatedEnrollment,
+    }
+    : {}),
 });
 composeGymMasterMemberEditableWorkoutSessionsRoutes(app, memberEditableWorkoutSessionsStartup);
 
@@ -1735,6 +1751,9 @@ app.use(
   createGoalsCoachStaffRouter({
     db: db,
     requireAdmin: staffAuthorization.requireAdmin,
+    pendingEnrollmentEnabled:
+      memberPendingEnrollmentStartup.status === "ready_for_existing_boundaries",
+    pendingEnrollmentService: memberPendingEnrollmentStartup.service,
   })
 );
 

@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  authenticatedEmailForIdentity,
   createGymMasterMemberLoginService,
   positiveExpiry,
 } = require("../src/goals-coach/gymmaster-member-login");
@@ -50,6 +51,9 @@ test("a successful injected provider response exposes only the verified identity
   });
   assert.equal(JSON.stringify(identity).includes("token"), false);
   assert.equal(JSON.stringify(identity).includes("password"), false);
+  assert.equal(JSON.stringify(identity).includes("member@example.com"), false);
+  assert.equal(authenticatedEmailForIdentity(identity), "member@example.com");
+  assert.equal(authenticatedEmailForIdentity({ ...identity }), null);
 });
 
 test("expiry validation accepts only positive JavaScript safe integers", () => {

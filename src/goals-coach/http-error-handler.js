@@ -38,6 +38,35 @@ function goalsCoachErrorHandler(error, req, res, next) {
     }
   }
 
+  if (req.path === "/staff/member-pending-enrollments") {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (error && error.type === "entity.too.large") {
+      return res.status(413).json({
+        error: "MEMBER_PENDING_ENROLLMENT_BODY_TOO_LARGE",
+        message: "The member pending-enrollment request is too large.",
+      });
+    }
+    if (
+      error
+      && [
+        "encoding.unsupported",
+        "entity.parse.failed",
+        "request.aborted",
+        "request.size.invalid",
+      ].includes(error.type)
+    ) {
+      return res.status(error.type === "encoding.unsupported" ? 415 : 400).json({
+        error: error.type === "encoding.unsupported"
+          ? "MEMBER_PENDING_ENROLLMENT_MEDIA_TYPE_UNSUPPORTED"
+          : "MEMBER_PENDING_ENROLLMENT_INVALID",
+        message: error.type === "encoding.unsupported"
+          ? "Member pending enrollment requires uncompressed application/json."
+          : "Invalid member pending-enrollment request.",
+      });
+    }
+  }
+
   if (error && error.code === "23503") {
     return res.status(409).json({ error: "OWNERSHIP_CONSTRAINT_FAILED" });
   }

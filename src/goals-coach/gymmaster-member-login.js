@@ -7,6 +7,7 @@ const GYMMASTER_AUTH_SUBJECT_PREFIX = "gymmaster:";
 const MAXIMUM_EMAIL_LENGTH = 320;
 const MAXIMUM_PASSWORD_LENGTH = 1024;
 const MEMBER_PORTAL_REQUEST_FAILURE = "member_portal_request_failure";
+const authenticatedEmails = new WeakMap();
 
 function loginError(code, memberPortalFailureStage) {
   const error = new Error("Member login could not be completed");
@@ -41,6 +42,10 @@ function positiveExpiry(value) {
   return Number.isSafeInteger(value) && value >= 1
     ? value
     : null;
+}
+
+function authenticatedEmailForIdentity(identity) {
+  return identity && authenticatedEmails.get(identity) || null;
 }
 
 function createGymMasterMemberLoginService(options = {}) {
@@ -103,12 +108,18 @@ function createGymMasterMemberLoginService(options = {}) {
 
     // Deliberately omit the member password and provider token. A future session
     // layer may consume this verified identity, but must not expose either secret.
-    return Object.freeze({
+    const identity = Object.freeze({
       authProvider: GYMMASTER_AUTH_PROVIDER,
       authSubject: `${GYMMASTER_AUTH_SUBJECT_PREFIX}${memberId}`,
       memberId,
       expiresInSeconds,
     });
+    // The trimmed email is retained only in process memory and only for the
+    // lifetime of this successful-login identity object. It is deliberately
+    // absent from enumerable properties, JSON, sessions, cookies, responses,
+    // provider diagnostics, and logs.
+    authenticatedEmails.set(identity, email);
+    return identity;
   }
 
   return Object.freeze({ authenticate });
@@ -119,6 +130,7 @@ module.exports = {
   GYMMASTER_AUTH_SUBJECT_PREFIX,
   MAXIMUM_EMAIL_LENGTH,
   MAXIMUM_PASSWORD_LENGTH,
+  authenticatedEmailForIdentity,
   createGymMasterMemberLoginService,
   normalizedEmail,
   positiveExpiry,

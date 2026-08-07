@@ -2,6 +2,9 @@ const express = require("express");
 const { createGoalsCoachService } = require("./service");
 const { createGoalsCoachRateLimits } = require("./rate-limits");
 const {
+  createGymMasterMemberPendingEnrollmentRouter,
+} = require("./gymmaster-member-pending-enrollment");
+const {
   decodeCursor,
   enumValue,
   messageContent,
@@ -31,6 +34,18 @@ function createGoalsCoachStaffRouter(options) {
       },
     });
   });
+
+  if (
+    options.pendingEnrollmentEnabled === true
+    && options.pendingEnrollmentService
+    && typeof options.pendingEnrollmentService.createPendingEnrollment === "function"
+  ) {
+    router.use(createGymMasterMemberPendingEnrollmentRouter({
+      service: options.pendingEnrollmentService,
+      requireAdmin,
+      mutationRateLimit: rateLimits.staffMutation,
+    }));
+  }
 
   router.get("/coaching-reviews", rateLimits.staffRead, async (req, res, next) => {
     try {
