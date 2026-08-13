@@ -92,7 +92,7 @@ function createGoalsCoachService(options) {
 
   async function resolveMember(client, claims) {
     const result = await client.query(
-      `SELECT id, first_name, last_name
+      `SELECT id
        FROM coach_members
        WHERE gymmaster_member_id = $1
        LIMIT 1`,

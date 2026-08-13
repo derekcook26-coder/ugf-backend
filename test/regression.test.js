@@ -91,3 +91,81 @@ test("weekly check-in queries GymMaster by member ID", () => {
     /GYMMASTER_BASE \+ "\/members\?memberid=" \+ encodeURIComponent\(memberId\)/
   );
 });
+
+test("legacy protected conflicts use fixed concealed responses and log no raw member or provider state", () => {
+  const planStart = serverSource.indexOf(
+    'app.post("/generate-personalized-workout"'
+  );
+  const planEnd = serverSource.indexOf(
+    "// ═══════════════════════════════════════════════════════════════════════════════",
+    planStart
+  );
+  const planRoute = serverSource.slice(planStart, planEnd);
+  assert.match(planRoute, /res\.status\(500\)\.json\(\{ error: "Plan generation failed" \}\)/);
+  assert.doesNotMatch(planRoute, /console\.(?:error|log|warn)/);
+  assert.match(planRoute, /route\.terminalState\.responseAllowed\(\)/);
+  assert.match(planRoute, /res\.writableEnded/);
+  assert.match(planRoute, /res\.headersSent/);
+
+  const weeklyStart = serverSource.indexOf('app.post("/weekly-checkin/session"');
+  const weeklyEnd = serverSource.indexOf('app.get("/weekly-checkin/context"');
+  const weeklyRoute = serverSource.slice(weeklyStart, weeklyEnd);
+  assert.match(
+    weeklyRoute,
+    /res\.status\(500\)\.json\(\{ error: "Verification service error\. Please try again\." \}\)/
+  );
+  assert.doesNotMatch(weeklyRoute, /console\.(?:error|log|warn)/);
+
+  const legacySource = fs.readFileSync(
+    path.join(projectRoot, "src", "goals-coach", "legacy-member-provisioning.js"),
+    "utf8"
+  );
+  assert.doesNotMatch(legacySource, /console\.(?:error|log|warn)/);
+  assert.doesNotMatch(legacySource, /provider response|prompt.*log|profile.*log/i);
+});
+
+test("nameless weekly rows stop before AI, write, notification attempt, or webhook", () => {
+  const submitStart = serverSource.indexOf('app.post("/weekly-checkin/submit"');
+  const submitEnd = serverSource.indexOf(
+    "// ─── GET /admin/weekly-checkins",
+    submitStart
+  );
+  const submitRoute = serverSource.slice(submitStart, submitEnd);
+  const completePairCheck = submitRoute.indexOf("if (!completeNamePair(memberRow))");
+  assert.equal(completePairCheck >= 0, true);
+  for (const laterSideEffect of [
+    "var analysis = await analyzeCheckin",
+    '"INSERT INTO weekly_checkins "',
+    "trainer_notification_attempts = trainer_notification_attempts + 1",
+    "sendTrainerSummaryWebhook(webhookPayload)",
+  ]) {
+    assert.equal(
+      submitRoute.indexOf(laterSideEffect) > completePairCheck,
+      true,
+      `${laterSideEffect} must remain after the null-name refusal`
+    );
+  }
+
+  const retryStart = serverSource.indexOf(
+    'app.post("/admin/retry-trainer-notifications"'
+  );
+  const retryEnd = serverSource.indexOf(
+    "// ─── POST /verify-member",
+    retryStart
+  );
+  const retryRoute = serverSource.slice(retryStart, retryEnd);
+  const retryCheck = retryRoute.indexOf("if (!completeNamePair(row))");
+  const skipped = retryRoute.indexOf("skipped++;", retryCheck);
+  const continued = retryRoute.indexOf("continue;", skipped);
+  const attempted = retryRoute.indexOf("attempted++;", continued);
+  const attemptWrite = retryRoute.indexOf(
+    "trainer_notification_attempts = trainer_notification_attempts + 1",
+    attempted
+  );
+  const webhook = retryRoute.indexOf("sendTrainerSummaryWebhook(payload)", attempted);
+  assert.equal(retryCheck >= 0, true);
+  assert.equal(skipped > retryCheck && continued > skipped, true);
+  assert.equal(attempted > continued, true);
+  assert.equal(attemptWrite > attempted, true);
+  assert.equal(webhook > attemptWrite, true);
+});

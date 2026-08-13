@@ -178,6 +178,16 @@ test("unknown or incomplete context remains explicit instead of being fabricated
   t.after(() => disposable.close());
   await runPhase1bMigration({ pool: disposable.pool });
   const seeded = await seedMemberAndPlan(disposable.pool, "unknown");
+  await disposable.pool.query(
+    "ALTER TABLE coach_members ALTER COLUMN first_name DROP NOT NULL"
+  );
+  await disposable.pool.query(
+    "ALTER TABLE coach_members ALTER COLUMN last_name DROP NOT NULL"
+  );
+  await disposable.pool.query(
+    "UPDATE coach_members SET first_name = NULL, last_name = NULL WHERE id = $1",
+    [seeded.member.id]
+  );
   const conversation = (await disposable.pool.query(
     `INSERT INTO coaching_conversations (member_id, plan_id)
      VALUES ($1, $2) RETURNING *`,
@@ -193,6 +203,9 @@ test("unknown or incomplete context remains explicit instead of being fabricated
   });
 
   assert.equal(built.context.member.primaryGoal, null);
+  assert.equal(built.context.member.preferredName, null);
+  assert.equal(JSON.stringify(built.context).includes('"undefined"'), false);
+  assert.equal(JSON.stringify(built.context).includes('"null"'), false);
   assert.equal(built.context.member.timeZone, "UTC");
   assert.deepEqual(built.context.plan.exercises, []);
   assert.deepEqual(built.context.safetyRestrictions, []);

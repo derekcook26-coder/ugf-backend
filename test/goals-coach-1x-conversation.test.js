@@ -246,12 +246,11 @@ test("1.0 explicit current-safety denials remain non-blocking", () => {
 
 test("1.0 workout generation rechecks safety before model or database work", () => {
   const guardIndex = planRoute.indexOf("if (planSafetyState.active)");
-  const modelIndex = planRoute.indexOf("var client = getOpenAI()");
-  const databaseIndex = planRoute.indexOf("var dbClient = await db.connect()");
+  const protectedExecutionIndex = planRoute.indexOf("executePersonalizedPlan({");
 
   assert.notEqual(guardIndex, -1);
-  assert.ok(guardIndex < modelIndex);
-  assert.ok(guardIndex < databaseIndex);
+  assert.notEqual(protectedExecutionIndex, -1);
+  assert.ok(guardIndex < protectedExecutionIndex);
   assert.match(planRoute, /getGoalsCoachSafetyState\(messages, profile, req\.body\.safetyStop\)/);
   assert.match(planRoute, /res\.status\(409\)\.json/);
   assert.match(planRoute, /readyToGenerate: false/);

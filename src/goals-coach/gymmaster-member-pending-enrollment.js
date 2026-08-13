@@ -7,6 +7,16 @@ const {
 const {
   validGymMasterIdentity,
 } = require("./gymmaster-member-authorization");
+const {
+  createTerminalState,
+  deadlineAfter,
+  monotonicNow,
+  runBoundedPostgresTransaction,
+} = require("./bounded-postgres-transaction");
+const {
+  acquireGymMasterMemberProvisioningLock,
+  canonicalGymMasterMemberId,
+} = require("./gymmaster-member-provisioning-lock");
 
 const MEMBER_PENDING_ENROLLMENT_FLAG =
   "GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED";
@@ -81,12 +91,24 @@ function validMembershipVerifier(verifier) {
   return Boolean(verifier && typeof verifier.verifyActiveMember === "function");
 }
 
-function currentDate(now) {
-  const value = new Date(now());
+function currentDate(timestamp) {
+  const value = new Date(timestamp);
   if (!Number.isFinite(value.getTime())) {
     throw new Error("Member pending-enrollment clock is invalid");
   }
   return value;
+}
+
+async function readTransactionDate(client, injectedTransactionTimestamp) {
+  if (typeof injectedTransactionTimestamp === "function") {
+    return currentDate(await injectedTransactionTimestamp());
+  }
+  const result = await client.query(
+    "SELECT transaction_timestamp() AS transaction_now"
+  );
+  return currentDate(
+    result && result.rows && result.rows[0] && result.rows[0].transaction_now
+  );
 }
 
 function isoTimestamp(value) {
@@ -102,19 +124,24 @@ function inactiveAuthorization() {
 }
 
 async function withTransaction(db, action) {
-  const client = await db.connect();
+  const started = monotonicNow();
+  const terminalState = createTerminalState();
   try {
-    await client.query("BEGIN");
-    const result = await action(client);
-    await client.query("COMMIT");
-    return result;
+    const result = await runBoundedPostgresTransaction({
+      pool: db,
+      outerDeadlineNs: deadlineAfter(started, 5000),
+      terminalState,
+      phaseMilliseconds: 5000,
+      work: action,
+    });
+    return result.value;
   } catch (error) {
-    try { await client.query("ROLLBACK"); } catch (_) {}
+    if (error && error.code === "work_failed" && error.cause) throw error.cause;
     throw error;
-  } finally {
-    client.release();
   }
 }
+
+class CompletionRejected extends Error {}
 
 function replayResult(row) {
   return Object.freeze({
@@ -135,7 +162,7 @@ function createdResult(row) {
 function createGymMasterMemberPendingEnrollmentService(options = {}) {
   const db = options.db;
   const membershipVerifier = options.membershipVerifier;
-  const now = typeof options.now === "function" ? options.now : () => new Date();
+  const transactionTimestamp = options.transactionTimestamp;
   if (!db || typeof db.query !== "function" || typeof db.connect !== "function") {
     throw new Error("Member pending enrollment requires a transactional database");
   }
@@ -152,28 +179,7 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
       );
     }
     const parsed = parsePendingEnrollmentRequest(input);
-    const existingReplay = await db.query(
-      `SELECT member_id, gymmaster_member_id, requested_by_staff_user_id,
-              status, expires_at
-       FROM goals_coach_member_pending_enrollments
-       WHERE client_request_id = $1
-       LIMIT 1`,
-      [parsed.clientRequestId]
-    );
-    if (existingReplay.rows.length) {
-      const row = existingReplay.rows[0];
-      if (
-        row.gymmaster_member_id === parsed.gymmasterMemberId
-        && String(row.requested_by_staff_user_id) === String(staffUser.id)
-      ) {
-        return replayResult(row);
-      }
-      throw pendingEnrollmentError(
-        409,
-        "MEMBER_PENDING_ENROLLMENT_CONFLICT",
-        "The pending-enrollment request conflicts with existing enrollment state."
-      );
-    }
+    canonicalGymMasterMemberId(parsed.gymmasterMemberId);
 
     let membership;
     try {
@@ -195,26 +201,24 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
       );
     }
 
-    const createdAt = currentDate(now);
-    const expiresAt = new Date(
-      createdAt.getTime() + PENDING_ENROLLMENT_TTL_MILLISECONDS
-    );
     return withTransaction(db, async (client) => {
-      const member = await client.query(
-        `SELECT id
-         FROM coach_members
-         WHERE gymmaster_member_id = $1
-         FOR UPDATE`,
-        [parsed.gymmasterMemberId]
+      await acquireGymMasterMemberProvisioningLock(
+        client,
+        parsed.gymmasterMemberId
       );
-      if (member.rows.length !== 1) {
-        throw pendingEnrollmentError(
-          409,
-          "MEMBER_PENDING_ENROLLMENT_NOT_AVAILABLE",
-          "The member is not available for pending enrollment."
-        );
-      }
-      const memberId = String(member.rows[0].id);
+      const createdAt = await readTransactionDate(client, transactionTimestamp);
+      const expiresAt = new Date(
+        createdAt.getTime() + PENDING_ENROLLMENT_TTL_MILLISECONDS
+      );
+
+      await client.query(
+        `UPDATE goals_coach_member_pending_enrollments
+         SET status = 'expired', expired_at = $2
+         WHERE gymmaster_member_id = $1
+           AND status = 'pending'
+           AND expires_at <= $2`,
+        [parsed.gymmasterMemberId, createdAt]
+      );
 
       const requestReplay = await client.query(
         `SELECT member_id, gymmaster_member_id, requested_by_staff_user_id,
@@ -227,8 +231,7 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
       if (requestReplay.rows.length) {
         const row = requestReplay.rows[0];
         if (
-          String(row.member_id) === memberId
-          && row.gymmaster_member_id === parsed.gymmasterMemberId
+          row.gymmaster_member_id === parsed.gymmasterMemberId
           && String(row.requested_by_staff_user_id) === String(staffUser.id)
         ) {
           return replayResult(row);
@@ -240,15 +243,16 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
         );
       }
 
-      const mapping = await client.query(
+      const liveEnrollment = await client.query(
         `SELECT id
-         FROM goals_coach_member_auth_mappings
-         WHERE auth_provider = 'gymmaster'
-           AND (auth_subject = $1 OR member_id = $2)
+         FROM goals_coach_member_pending_enrollments
+         WHERE status = 'pending'
+           AND gymmaster_member_id = $1
+         ORDER BY id
          FOR UPDATE`,
-        [`gymmaster:${parsed.gymmasterMemberId}`, memberId]
+        [parsed.gymmasterMemberId]
       );
-      if (mapping.rows.length) {
+      if (liveEnrollment.rows.length) {
         throw pendingEnrollmentError(
           409,
           "MEMBER_PENDING_ENROLLMENT_CONFLICT",
@@ -256,23 +260,20 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
         );
       }
 
-      await client.query(
-        `UPDATE goals_coach_member_pending_enrollments
-         SET status = 'expired', expired_at = $2
-         WHERE member_id = $1
-           AND status = 'pending'
-           AND expires_at <= $2`,
-        [memberId, createdAt]
-      );
-      const liveEnrollment = await client.query(
-        `SELECT id
-         FROM goals_coach_member_pending_enrollments
-         WHERE status = 'pending'
-           AND (member_id = $1 OR gymmaster_member_id = $2)
+      const mapping = await client.query(
+        `SELECT mapping.id
+         FROM goals_coach_member_auth_mappings mapping
+         JOIN coach_members member ON member.id = mapping.member_id
+         WHERE mapping.auth_provider = 'gymmaster'
+           AND (
+             mapping.auth_subject = $1
+             OR member.gymmaster_member_id = $2
+           )
+         ORDER BY mapping.id
          FOR UPDATE`,
-        [memberId, parsed.gymmasterMemberId]
+        [`gymmaster:${parsed.gymmasterMemberId}`, parsed.gymmasterMemberId]
       );
-      if (liveEnrollment.rows.length) {
+      if (mapping.rows.length) {
         throw pendingEnrollmentError(
           409,
           "MEMBER_PENDING_ENROLLMENT_CONFLICT",
@@ -287,7 +288,7 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
          VALUES ($1, $2, $3, $4, 'pending', $5, $6)
          RETURNING id, expires_at`,
         [
-          memberId,
+          null,
           parsed.gymmasterMemberId,
           parsed.clientRequestId,
           String(staffUser.id),
@@ -304,7 +305,7 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
                  'pending_enrollment_created', 'created', $5)`,
         [
           String(pending.id),
-          memberId,
+          null,
           String(staffUser.id),
           parsed.clientRequestId,
           createdAt,
@@ -326,15 +327,14 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
     const verifiedEmailSnapshot = authenticatedEmailForIdentity(identity);
     if (!verifiedEmailSnapshot) return inactiveAuthorization();
 
-    const initialNow = currentDate(now);
     const candidateResult = await db.query(
-      `SELECT id, member_id
+      `SELECT id
        FROM goals_coach_member_pending_enrollments
        WHERE gymmaster_member_id = $1
-         AND status = 'pending'
-         AND expires_at > $2
-       LIMIT 1`,
-      [gymmasterMemberId, initialNow]
+         AND status IN ('pending', 'consumed')
+       ORDER BY id
+       LIMIT 2`,
+      [gymmasterMemberId]
     );
     if (candidateResult.rows.length !== 1) return inactiveAuthorization();
     const candidate = candidateResult.rows[0];
@@ -347,119 +347,182 @@ function createGymMasterMemberPendingEnrollmentService(options = {}) {
     }
     if (!membership || membership.active !== true) return inactiveAuthorization();
 
-    const completedAt = currentDate(now);
-    return withTransaction(db, async (client) => {
-      const member = await client.query(
-        `SELECT id
-         FROM coach_members
-         WHERE id = $1 AND gymmaster_member_id = $2
-         FOR UPDATE`,
-        [String(candidate.member_id), gymmasterMemberId]
-      );
-      if (member.rows.length !== 1) return inactiveAuthorization();
-      const memberId = String(member.rows[0].id);
-
-      const mappings = await client.query(
-        `SELECT id, member_id, auth_subject, active, provisioning_reference
-         FROM goals_coach_member_auth_mappings
-         WHERE auth_provider = 'gymmaster'
-           AND (auth_subject = $1 OR member_id = $2)
-         FOR UPDATE`,
-        [identity.authSubject, memberId]
-      );
-      if (mappings.rows.length) {
-        if (mappings.rows.length !== 1) return inactiveAuthorization();
-        const existing = mappings.rows[0];
-        const consumed = await client.query(
-          `SELECT auth_mapping_id, status
-           FROM goals_coach_member_pending_enrollments
-           WHERE id = $1 AND member_id = $2
-           FOR UPDATE`,
-          [String(candidate.id), memberId]
+    try {
+      return await withTransaction(db, async (client) => {
+        await acquireGymMasterMemberProvisioningLock(client, gymmasterMemberId);
+        const completedAt = await readTransactionDate(
+          client,
+          transactionTimestamp
         );
+        const pendingRows = await client.query(
+          `SELECT id, member_id, auth_mapping_id,
+                  requested_by_staff_user_id, client_request_id,
+                  status, expires_at
+           FROM goals_coach_member_pending_enrollments
+           WHERE gymmaster_member_id = $1
+           ORDER BY id
+           FOR UPDATE`,
+          [gymmasterMemberId]
+        );
+        await client.query(
+          `UPDATE goals_coach_member_pending_enrollments
+           SET status = 'expired', expired_at = $2
+           WHERE gymmaster_member_id = $1
+             AND status = 'pending'
+             AND expires_at <= $2`,
+          [gymmasterMemberId, completedAt]
+        );
+        const candidatePending = pendingRows.rows.find(
+          (row) => String(row.id) === String(candidate.id)
+        );
+        if (!candidatePending) throw new CompletionRejected();
+        const candidateExpired =
+          new Date(candidatePending.expires_at).getTime() <= completedAt.getTime();
+        const candidateIsLive =
+          candidatePending.status === "pending" && !candidateExpired;
         if (
-          String(existing.member_id) === memberId
-          && existing.auth_subject === identity.authSubject
-          && existing.active === true
-          && existing.provisioning_reference === `pending_enrollment:${candidate.id}`
-          && consumed.rows.length === 1
-          && consumed.rows[0].status === "consumed"
-          && String(consumed.rows[0].auth_mapping_id) === String(existing.id)
+          candidateIsLive
+          && pendingRows.rows.filter((row) => (
+            row.status === "pending"
+            && new Date(row.expires_at).getTime() > completedAt.getTime()
+          )).length !== 1
         ) {
-          return Object.freeze({
-            active: true,
-            mappingId: String(existing.id),
-            memberId,
-          });
+          throw new CompletionRejected();
         }
-        return inactiveAuthorization();
-      }
+        if (
+          candidatePending.status === "expired"
+          || (candidatePending.status === "pending" && candidateExpired)
+        ) return inactiveAuthorization();
+        if (
+          candidatePending.status !== "pending"
+          && candidatePending.status !== "consumed"
+        ) throw new CompletionRejected();
 
-      const pendingResult = await client.query(
-        `SELECT id, member_id, requested_by_staff_user_id,
-                client_request_id, status, expires_at
-         FROM goals_coach_member_pending_enrollments
-         WHERE id = $1
-           AND member_id = $2
-           AND gymmaster_member_id = $3
-         FOR UPDATE`,
-        [String(candidate.id), memberId, gymmasterMemberId]
-      );
-      if (pendingResult.rows.length !== 1) return inactiveAuthorization();
-      const pending = pendingResult.rows[0];
-      if (
-        pending.status !== "pending"
-        || new Date(pending.expires_at).getTime() <= completedAt.getTime()
-      ) {
-        return inactiveAuthorization();
-      }
+        let member = await client.query(
+          `SELECT id, first_name, last_name
+           FROM coach_members
+           WHERE gymmaster_member_id = $1
+           FOR UPDATE`,
+          [gymmasterMemberId]
+        );
+        if (!member.rows.length && candidateIsLive) {
+          await client.query(
+            `INSERT INTO coach_members
+              (gymmaster_member_id, first_name, last_name)
+             VALUES ($1, NULL, NULL)
+             ON CONFLICT (gymmaster_member_id) DO NOTHING`,
+            [gymmasterMemberId]
+          );
+          member = await client.query(
+            `SELECT id, first_name, last_name
+             FROM coach_members
+             WHERE gymmaster_member_id = $1
+             FOR UPDATE`,
+            [gymmasterMemberId]
+          );
+        }
+        if (member.rows.length !== 1) throw new CompletionRejected();
+        const memberRow = member.rows[0];
+        if ((memberRow.first_name === null) !== (memberRow.last_name === null)) {
+          throw new CompletionRejected();
+        }
+        const memberId = String(memberRow.id);
+        if (
+          candidatePending.member_id !== null
+          && String(candidatePending.member_id) !== memberId
+        ) throw new CompletionRejected();
 
-      const mapping = await client.query(
-        `INSERT INTO goals_coach_member_auth_mappings
-          (member_id, auth_provider, auth_subject, verified_email_snapshot,
-           active, provisioning_method, provisioning_reference,
-           provisioned_by_staff_user_id)
-         VALUES ($1, 'gymmaster', $2, $3, TRUE, 'administrative', $4, $5)
-         RETURNING id, member_id`,
-        [
-          memberId,
-          identity.authSubject,
-          verifiedEmailSnapshot,
-          `pending_enrollment:${pending.id}`,
-          String(pending.requested_by_staff_user_id),
-        ]
-      );
-      const createdMapping = mapping.rows[0];
-      const consumed = await client.query(
-        `UPDATE goals_coach_member_pending_enrollments
-         SET status = 'consumed', auth_mapping_id = $2, consumed_at = $3
-         WHERE id = $1 AND status = 'pending'
-         RETURNING id`,
-        [String(pending.id), String(createdMapping.id), completedAt]
-      );
-      if (consumed.rows.length !== 1) {
-        throw new Error("Member pending-enrollment consumption failed");
-      }
-      await client.query(
-        `INSERT INTO goals_coach_member_provisioning_events
-          (pending_enrollment_id, auth_mapping_id, member_id, staff_user_id,
-           client_request_id, action, result, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'mapping_completed', 'completed', $6)`,
-        [
-          String(pending.id),
-          String(createdMapping.id),
-          memberId,
-          String(pending.requested_by_staff_user_id),
-          pending.client_request_id,
-          completedAt,
-        ]
-      );
-      return Object.freeze({
-        active: true,
-        mappingId: String(createdMapping.id),
-        memberId: String(createdMapping.member_id),
+        const mappings = await client.query(
+          `SELECT id, member_id, auth_subject, verified_email_snapshot,
+                  active, provisioning_reference
+           FROM goals_coach_member_auth_mappings
+           WHERE auth_provider = 'gymmaster'
+             AND (auth_subject = $1 OR member_id = $2)
+           ORDER BY id
+           FOR UPDATE`,
+          [identity.authSubject, memberId]
+        );
+        if (mappings.rows.length) {
+          if (mappings.rows.length !== 1) throw new CompletionRejected();
+          const existing = mappings.rows[0];
+          if (
+            String(existing.member_id) === memberId
+            && existing.auth_subject === identity.authSubject
+            && existing.verified_email_snapshot === verifiedEmailSnapshot
+            && existing.active === true
+            && existing.provisioning_reference === `pending_enrollment:${candidate.id}`
+            && candidatePending.status === "consumed"
+            && String(candidatePending.member_id) === memberId
+            && String(candidatePending.auth_mapping_id) === String(existing.id)
+          ) {
+            return Object.freeze({
+              active: true,
+              mappingId: String(existing.id),
+              memberId,
+            });
+          }
+          throw new CompletionRejected();
+        }
+        if (!candidateIsLive) throw new CompletionRejected();
+        const mapping = await client.query(
+          `INSERT INTO goals_coach_member_auth_mappings
+            (member_id, auth_provider, auth_subject, verified_email_snapshot,
+             active, provisioning_method, provisioning_reference,
+             provisioned_by_staff_user_id)
+           VALUES ($1, 'gymmaster', $2, $3, TRUE, 'administrative', $4, $5)
+           RETURNING id, member_id`,
+          [
+            memberId,
+            identity.authSubject,
+            verifiedEmailSnapshot,
+            `pending_enrollment:${candidatePending.id}`,
+            String(candidatePending.requested_by_staff_user_id),
+          ]
+        );
+        const createdMapping = mapping.rows[0];
+        const consumed = await client.query(
+          `UPDATE goals_coach_member_pending_enrollments
+           SET status = 'consumed', member_id = $2, auth_mapping_id = $3,
+               consumed_at = $4
+           WHERE id = $1
+             AND status = 'pending'
+             AND expires_at > $4
+             AND (member_id IS NULL OR member_id = $2)
+           RETURNING id`,
+          [
+            String(candidatePending.id),
+            memberId,
+            String(createdMapping.id),
+            completedAt,
+          ]
+        );
+        if (consumed.rows.length !== 1) {
+          throw new Error("Member pending-enrollment consumption failed");
+        }
+        await client.query(
+          `INSERT INTO goals_coach_member_provisioning_events
+            (pending_enrollment_id, auth_mapping_id, member_id, staff_user_id,
+             client_request_id, action, result, created_at)
+           VALUES ($1, $2, $3, $4, $5, 'mapping_completed', 'completed', $6)`,
+          [
+            String(candidatePending.id),
+            String(createdMapping.id),
+            memberId,
+            String(candidatePending.requested_by_staff_user_id),
+            candidatePending.client_request_id,
+            completedAt,
+          ]
+        );
+        return Object.freeze({
+          active: true,
+          mappingId: String(createdMapping.id),
+          memberId: String(createdMapping.member_id),
+        });
       });
-    });
+    } catch (error) {
+      if (error instanceof CompletionRejected) return inactiveAuthorization();
+      return inactiveAuthorization();
+    }
   }
 
   return Object.freeze({

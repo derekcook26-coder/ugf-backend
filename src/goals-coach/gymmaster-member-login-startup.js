@@ -86,7 +86,10 @@ function createGymMasterMemberLoginStartup(options = {}) {
     memberApiKey: environment.GOALS_COACH_GYMMASTER_MEMBER_API_KEY,
     loginClient: portalClient.login,
   });
-  const mappingAuthorizer = createGymMasterMemberAuthorization({ db: options.db });
+  const mappingAuthorizer = createGymMasterMemberAuthorization({
+    db: options.db,
+    requirePendingEnrollmentEmail: true,
+  });
   const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({
     endpoint: environment.GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL,
     site: environment.GYMMASTER_SITE,

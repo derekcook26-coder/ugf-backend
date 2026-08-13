@@ -69,7 +69,9 @@ function createGymMasterMemberPendingEnrollmentStartup(options = {}) {
   const service = createGymMasterMemberPendingEnrollmentService({
     db: options.db,
     membershipVerifier,
-    ...(typeof options.now === "function" ? { now: options.now } : {}),
+    ...(typeof options.transactionTimestamp === "function"
+      ? { transactionTimestamp: options.transactionTimestamp }
+      : {}),
   });
   return Object.freeze({
     ...common,
