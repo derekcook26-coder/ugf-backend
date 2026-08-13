@@ -36,6 +36,7 @@ const {
 const { createGoalsCoachStaffRouter } = require("../src/goals-coach/staff-routes");
 const { goalsCoachErrorHandler } = require("../src/goals-coach/http-error-handler");
 const {
+  applyMigration011ForTests,
   createDisposableDatabase,
   seedStaff,
 } = require("./helpers/disposable-db");
@@ -111,6 +112,7 @@ async function fixture(t) {
   t.after(() => disposable.close());
   await runSafetyIntakeMigration({ pool: disposable.pool });
   await runPendingEnrollmentMigration({ pool: disposable.pool });
+  await applyMigration011ForTests(disposable.pool);
   const admin = await seedStaff(disposable.pool, "pending-admin", "admin", true);
   const coach = await seedStaff(disposable.pool, "pending-coach", "coach", true);
   const inactive = await seedStaff(disposable.pool, "pending-inactive", "admin", false);
@@ -249,7 +251,7 @@ test("staff enrollment reuses exact origin, Clerk session, active staff, and adm
   const service = createGymMasterMemberPendingEnrollmentService({
     db: disposable.pool,
     membershipVerifier: verifier(new Set(["42001"]), calls),
-    now: () => new Date("2026-08-07T12:00:00.000Z"),
+    transactionTimestamp: () => new Date("2026-08-07T12:00:00.000Z"),
   });
   const running = await createProtectedStaffApp(disposable.pool, service);
   t.after(() => running.close());
@@ -318,7 +320,7 @@ test("strict validation, active verification, coach-member matching, replay, con
   const service = createGymMasterMemberPendingEnrollmentService({
     db: disposable.pool,
     membershipVerifier: verifier(active, calls),
-    now: () => clock,
+    transactionTimestamp: () => clock,
   });
   const running = await createProtectedStaffApp(disposable.pool, service);
   t.after(() => running.close());
@@ -367,8 +369,13 @@ test("strict validation, active verification, coach-member matching, replay, con
       clientRequestId: requestId(207),
     })
   );
-  assert.equal(missingCoachMember.response.status, 409);
-  assert.equal(missingCoachMember.body.error, "MEMBER_PENDING_ENROLLMENT_NOT_AVAILABLE");
+  assert.equal(missingCoachMember.response.status, 201);
+  assert.equal(
+    (await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM coach_members WHERE gymmaster_member_id = '49999'"
+    )).rows[0].count,
+    0
+  );
 
   const firstBody = {
     gymmasterMemberId: "42101",
@@ -393,10 +400,14 @@ test("strict validation, active verification, coach-member matching, replay, con
   );
   assert.equal(replay.response.status, 200);
   assert.equal(replay.body.idempotentReplay, true);
-  assert.equal(calls.length, callCountBeforeReplay);
+  assert.equal(calls.length, callCountBeforeReplay + 1);
   assert.equal(
     (await disposable.pool.query(
-      "SELECT COUNT(*)::int AS count FROM goals_coach_member_provisioning_events"
+      `SELECT COUNT(*)::int AS count
+       FROM goals_coach_member_provisioning_events event
+       JOIN goals_coach_member_pending_enrollments pending
+         ON pending.id = event.pending_enrollment_id
+       WHERE pending.gymmaster_member_id = '42101'`
     )).rows[0].count,
     1
   );
@@ -413,6 +424,15 @@ test("strict validation, active verification, coach-member matching, replay, con
   assert.equal(conflict.body.error, "MEMBER_PENDING_ENROLLMENT_CONFLICT");
 
   clock = new Date("2026-08-08T13:00:00.001Z");
+  const elapsedReplay = await jsonRequest(
+    running.url,
+    "/staff/member-pending-enrollments",
+    asStaff(admin.auth_subject, firstBody)
+  );
+  assert.equal(elapsedReplay.response.status, 200);
+  assert.equal(elapsedReplay.body.idempotentReplay, true);
+  assert.equal(elapsedReplay.body.pendingEnrollment.status, "expired");
+
   const afterExpiry = await jsonRequest(
     running.url,
     "/staff/member-pending-enrollments",
@@ -433,13 +453,12 @@ test("strict validation, active verification, coach-member matching, replay, con
 
 test("successful login alone supplies the email snapshot, consumes enrollment, and changes no consent or safety data", async (t) => {
   const { disposable, admin } = await fixture(t);
-  const member = await seedGymMasterMember(disposable.pool, "42201");
   const calls = [];
   const membershipVerifier = verifier(new Set(["42201"]), calls);
   const enrollmentService = createGymMasterMemberPendingEnrollmentService({
     db: disposable.pool,
     membershipVerifier,
-    now: () => new Date("2026-08-07T14:00:00.000Z"),
+    transactionTimestamp: () => new Date("2026-08-07T14:00:00.000Z"),
   });
   await enrollmentService.createPendingEnrollment(
     { id: String(admin.id), role: "admin" },
@@ -463,13 +482,22 @@ test("successful login alone supplies the email snapshot, consumes enrollment, a
   const before = (await disposable.pool.query(
     `SELECT
        (SELECT COUNT(*)::int FROM goals_coach_alpha_consents) AS consents,
-       (SELECT COUNT(*)::int FROM goals_coach_member_safety_intake_submissions) AS safety`
+       (SELECT COUNT(*)::int FROM goals_coach_member_safety_intake_submissions) AS safety,
+       (SELECT COUNT(*)::int FROM coach_plans) AS plans,
+       (SELECT COUNT(*)::int FROM weekly_checkins) AS checkins,
+       (SELECT COUNT(*)::int FROM coaching_conversations) AS conversations,
+       (SELECT COUNT(*)::int FROM coaching_messages) AS messages,
+       (SELECT COUNT(*)::int FROM goals_coach_coaching_turns) AS turns,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_logs) AS workout_logs,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_sessions) AS workout_sessions,
+       (SELECT COUNT(*)::int FROM goals_coach_transcription_attempts) AS voice_attempts`
   )).rows[0];
+  const authenticatedEmails = [];
   const loginService = createGymMasterMemberLoginService({
     enabled: true,
     memberApiKey: "member-api-key",
     loginClient: async ({ email, password }) => {
-      assert.equal(email, "Member.Email@Example.Test");
+      authenticatedEmails.push(email);
       assert.equal(password, "member-password-secret");
       return {
         result: {
@@ -482,6 +510,7 @@ test("successful login alone supplies the email snapshot, consumes enrollment, a
   });
   const mappingAuthorization = createGymMasterMemberAuthorization({
     db: disposable.pool,
+    requirePendingEnrollmentEmail: true,
   });
   const accessAuthorization = createGymMasterMemberAccessAuthorizer({
     mappingAuthorizer: mappingAuthorization,
@@ -516,9 +545,13 @@ test("successful login alone supplies the email snapshot, consumes enrollment, a
   const mapping = (await disposable.pool.query(
     `SELECT *
      FROM goals_coach_member_auth_mappings
-     WHERE member_id = $1`,
-    [member.id]
+     WHERE auth_subject = 'gymmaster:42201'`
   )).rows[0];
+  const member = (await disposable.pool.query(
+    "SELECT * FROM coach_members WHERE gymmaster_member_id = '42201'"
+  )).rows[0];
+  assert.equal(member.first_name, null);
+  assert.equal(member.last_name, null);
   assert.equal(mapping.auth_provider, "gymmaster");
   assert.equal(mapping.auth_subject, "gymmaster:42201");
   assert.equal(mapping.verified_email_snapshot, "Member.Email@Example.Test");
@@ -544,10 +577,51 @@ test("successful login alone supplies the email snapshot, consumes enrollment, a
   ]);
   assert.equal(events.every((event) => event.reason_code === null), true);
 
+  const directReplayIdentity = await loginService.authenticate({
+    email: " Member.Email@Example.Test ",
+    password: "member-password-secret",
+  });
+  const directReplay = await enrollmentService.completeAuthenticatedEnrollment(
+    directReplayIdentity
+  );
+  assert.equal(directReplay.active, true);
+  assert.equal(String(directReplay.mappingId), String(mapping.id));
+
+  const exactReplay = response();
+  await handler(
+    loginRequest(" Member.Email@Example.Test ", "member-password-secret"),
+    exactReplay
+  );
+  assert.equal(exactReplay.statusCode, 204);
+  assert.match(exactReplay.headers["Set-Cookie"], /^gc_member_session=/);
+
+  const caseMismatch = response();
+  await handler(
+    loginRequest(" member.email@example.test ", "member-password-secret"),
+    caseMismatch
+  );
+  assert.equal(caseMismatch.statusCode, 401);
+  assert.deepEqual(caseMismatch.body, { error: "MEMBER_LOGIN_FAILED" });
+  assert.equal(caseMismatch.headers["Set-Cookie"], undefined);
+  assert.deepEqual(authenticatedEmails, [
+    "Member.Email@Example.Test",
+    "Member.Email@Example.Test",
+    "Member.Email@Example.Test",
+    "member.email@example.test",
+  ]);
+
   const after = (await disposable.pool.query(
     `SELECT
        (SELECT COUNT(*)::int FROM goals_coach_alpha_consents) AS consents,
-       (SELECT COUNT(*)::int FROM goals_coach_member_safety_intake_submissions) AS safety`
+       (SELECT COUNT(*)::int FROM goals_coach_member_safety_intake_submissions) AS safety,
+       (SELECT COUNT(*)::int FROM coach_plans) AS plans,
+       (SELECT COUNT(*)::int FROM weekly_checkins) AS checkins,
+       (SELECT COUNT(*)::int FROM coaching_conversations) AS conversations,
+       (SELECT COUNT(*)::int FROM coaching_messages) AS messages,
+       (SELECT COUNT(*)::int FROM goals_coach_coaching_turns) AS turns,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_logs) AS workout_logs,
+       (SELECT COUNT(*)::int FROM goals_coach_workout_sessions) AS workout_sessions,
+       (SELECT COUNT(*)::int FROM goals_coach_transcription_attempts) AS voice_attempts`
   )).rows[0];
   assert.deepEqual(after, before);
   const nonMappingOutput = JSON.stringify({
@@ -565,7 +639,274 @@ test("successful login alone supplies the email snapshot, consumes enrollment, a
   ]) {
     assert.equal(nonMappingOutput.includes(secret), false, secret);
   }
-  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(diagnostics, [
+    "[UGF] goals_coach_owner_login_stage=local_mapping",
+  ]);
+});
+
+test("completion preserves existing name pairs and rolls back member, mapping, consumption, and event stages atomically", async (t) => {
+  const { disposable, admin } = await fixture(t);
+  let sequence = 500;
+  async function identityFor(memberId, email = `member${memberId}@example.test`) {
+    return createGymMasterMemberLoginService({
+      enabled: true,
+      memberApiKey: "synthetic-api-key",
+      loginClient: async () => ({
+        result: {
+          token: "synthetic-token",
+          expires: 3600,
+          memberid: Number(memberId),
+        },
+      }),
+    }).authenticate({ email, password: "synthetic-password" });
+  }
+  function service(db, memberId) {
+    return createGymMasterMemberPendingEnrollmentService({
+      db,
+      membershipVerifier: {
+        async verifyActiveMember(value) { return { active: value === memberId }; },
+      },
+      transactionTimestamp: () => new Date("2099-08-07T14:00:00.000Z"),
+    });
+  }
+  async function approve(enrollment, memberId) {
+    sequence += 1;
+    await enrollment.createPendingEnrollment(
+      { id: String(admin.id), role: "admin" },
+      { gymmasterMemberId: memberId, clientRequestId: requestId(sequence) }
+    );
+  }
+
+  const namedId = "42601";
+  await seedGymMasterMember(disposable.pool, namedId);
+  const namedService = service(disposable.pool, namedId);
+  await approve(namedService, namedId);
+  assert.equal((await namedService.completeAuthenticatedEnrollment(
+    await identityFor(namedId)
+  )).active, true);
+  assert.deepEqual((await disposable.pool.query(
+    "SELECT first_name, last_name FROM coach_members WHERE gymmaster_member_id = $1",
+    [namedId]
+  )).rows[0], { first_name: "Pending", last_name: "Member" });
+
+  const failures = [
+    ["42602", /INSERT INTO coach_members/],
+    ["42603", /INSERT INTO goals_coach_member_auth_mappings/],
+    ["42604", /SET status = 'consumed'/],
+    ["42605", /'mapping_completed'/],
+  ];
+  for (const [memberId, failPattern] of failures) {
+    const normalService = service(disposable.pool, memberId);
+    await approve(normalService, memberId);
+    const failingDb = {
+      query: disposable.pool.query,
+      async connect() {
+        const client = await disposable.pool.connect();
+        return {
+          async query(sql, parameters) {
+            if (failPattern.test(sql)) throw new Error("synthetic write-stage failure");
+            return client.query(sql, parameters);
+          },
+          release(error) { client.release(error); },
+        };
+      },
+    };
+    const result = await service(failingDb, memberId)
+      .completeAuthenticatedEnrollment(await identityFor(memberId));
+    assert.deepEqual(result, { active: false });
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM coach_members WHERE gymmaster_member_id = $1",
+      [memberId]
+    )).rows[0].count, 0);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings WHERE auth_subject = $1",
+      [`gymmaster:${memberId}`]
+    )).rows[0].count, 0);
+    const pending = (await disposable.pool.query(
+      "SELECT status, member_id, auth_mapping_id FROM goals_coach_member_pending_enrollments WHERE gymmaster_member_id = $1",
+      [memberId]
+    )).rows[0];
+    assert.deepEqual(pending, { status: "pending", member_id: null, auth_mapping_id: null });
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM goals_coach_member_provisioning_events event
+       JOIN goals_coach_member_pending_enrollments pending
+         ON pending.id = event.pending_enrollment_id
+       WHERE pending.gymmaster_member_id = $1`,
+      [memberId]
+    )).rows[0].count, 1);
+  }
+});
+
+test("completion fails closed for every conflicting existing GymMaster mapping shape", async (t) => {
+  const { disposable, admin } = await fixture(t);
+  let sequence = 600;
+  async function identityFor(memberId) {
+    return createGymMasterMemberLoginService({
+      enabled: true,
+      memberApiKey: "synthetic-api-key",
+      loginClient: async () => ({
+        result: {
+          token: "synthetic-token",
+          expires: 3600,
+          memberid: Number(memberId),
+        },
+      }),
+    }).authenticate({
+      email: `conflict-${memberId}@example.test`,
+      password: "synthetic-password",
+    });
+  }
+  async function insertMember(memberId) {
+    return (await disposable.pool.query(
+      `INSERT INTO coach_members
+        (gymmaster_member_id, first_name, last_name)
+       VALUES ($1, NULL, NULL) RETURNING id`,
+      [memberId]
+    )).rows[0];
+  }
+  async function insertMapping(memberId, subject, active, reference, suffix) {
+    return disposable.pool.query(
+      `INSERT INTO goals_coach_member_auth_mappings
+        (member_id, auth_provider, auth_subject, verified_email_snapshot,
+         active, provisioning_method, provisioning_reference)
+       VALUES ($1, 'gymmaster', $2, $3, $4, 'administrative', $5)`,
+      [
+        memberId,
+        subject,
+        `seed-${suffix}@example.test`,
+        active,
+        reference,
+      ]
+    );
+  }
+
+  const cases = [
+    {
+      memberId: "42701",
+      async seed() {
+        const other = await insertMember("52701");
+        await insertMapping(
+          other.id,
+          "gymmaster:42701",
+          true,
+          "pending_enrollment:999901",
+          "subject-other-member"
+        );
+      },
+    },
+    {
+      memberId: "42702",
+      async seed() {
+        const member = await insertMember("42702");
+        await insertMapping(
+          member.id,
+          "gymmaster:52702",
+          true,
+          "pending_enrollment:999902",
+          "member-other-subject"
+        );
+      },
+    },
+    {
+      memberId: "42703",
+      async seed() {
+        const member = await insertMember("42703");
+        await insertMapping(
+          member.id,
+          "gymmaster:42703",
+          false,
+          "pending_enrollment:999903",
+          "inactive"
+        );
+      },
+    },
+    {
+      memberId: "42704",
+      async seed() {
+        const member = await insertMember("42704");
+        await insertMapping(
+          member.id,
+          "gymmaster:42704",
+          true,
+          "pending_enrollment:999904",
+          "wrong-reference"
+        );
+      },
+    },
+    {
+      memberId: "42705",
+      async seed() {
+        const member = await insertMember("42705");
+        const other = await insertMember("52705");
+        await insertMapping(
+          other.id,
+          "gymmaster:42705",
+          true,
+          "pending_enrollment:999905",
+          "ambiguous-subject"
+        );
+        await insertMapping(
+          member.id,
+          "gymmaster:52705",
+          true,
+          "pending_enrollment:999906",
+          "ambiguous-member"
+        );
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    sequence += 1;
+    const service = createGymMasterMemberPendingEnrollmentService({
+      db: disposable.pool,
+      membershipVerifier: {
+        async verifyActiveMember(value) {
+          return { active: value === scenario.memberId };
+        },
+      },
+      transactionTimestamp: () => new Date("2099-08-07T14:00:00.000Z"),
+    });
+    await service.createPendingEnrollment(
+      { id: String(admin.id), role: "admin" },
+      {
+        gymmasterMemberId: scenario.memberId,
+        clientRequestId: requestId(sequence),
+      }
+    );
+    await scenario.seed();
+    const mappingCountBefore = (await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings"
+    )).rows[0].count;
+    assert.deepEqual(
+      await service.completeAuthenticatedEnrollment(
+        await identityFor(scenario.memberId)
+      ),
+      { active: false }
+    );
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings"
+    )).rows[0].count, mappingCountBefore);
+    assert.deepEqual((await disposable.pool.query(
+      `SELECT status, member_id, auth_mapping_id
+       FROM goals_coach_member_pending_enrollments
+       WHERE gymmaster_member_id = $1`,
+      [scenario.memberId]
+    )).rows[0], {
+      status: "pending",
+      member_id: null,
+      auth_mapping_id: null,
+    });
+    assert.equal((await disposable.pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM goals_coach_member_provisioning_events event
+       JOIN goals_coach_member_pending_enrollments pending
+         ON pending.id = event.pending_enrollment_id
+       WHERE pending.gymmaster_member_id = $1`,
+      [scenario.memberId]
+    )).rows[0].count, 1);
+  }
 });
 
 test("existing mapped-member login remains response-compatible and never invokes completion", async () => {
@@ -617,10 +958,11 @@ test("missing, mismatched, expired, and inactive completion states share one gen
   const enrollmentService = createGymMasterMemberPendingEnrollmentService({
     db: disposable.pool,
     membershipVerifier,
-    now: () => clock,
+    transactionTimestamp: () => clock,
   });
   const mappingAuthorization = createGymMasterMemberAuthorization({
     db: disposable.pool,
+    requirePendingEnrollmentEmail: true,
   });
   const accessAuthorization = createGymMasterMemberAccessAuthorizer({
     mappingAuthorizer: mappingAuthorization,

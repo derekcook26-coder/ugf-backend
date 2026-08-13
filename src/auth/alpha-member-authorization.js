@@ -28,8 +28,8 @@ function createAlphaMemberAuthorization(options) {
         memberId: String(row.member_id),
         authProvider: row.auth_provider,
         authSubject: row.auth_subject,
-        firstName: row.first_name,
-        lastName: row.last_name,
+        firstName: typeof row.first_name === "string" ? row.first_name : null,
+        lastName: typeof row.last_name === "string" ? row.last_name : null,
       });
       return next();
     } catch (error) {

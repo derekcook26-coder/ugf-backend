@@ -212,7 +212,9 @@ async function buildCoachingContext(options) {
       "general_coaching_knowledge",
     ],
     member: {
-      preferredName: conversation.first_name,
+      preferredName: typeof conversation.first_name === "string"
+        ? conversation.first_name
+        : null,
       primaryGoal,
       timeZone,
     },

@@ -33,6 +33,12 @@ var { composeGymMasterOwnerOnlyRoutes } = require("./src/goals-coach/gymmaster-o
 var { createGymMasterMemberEditableWorkoutSessionsStartup } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-startup");
 var { composeGymMasterMemberEditableWorkoutSessionsRoutes } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-route-composition");
 var { createGymMasterMemberPendingEnrollmentStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-startup");
+var {
+  completeNamePair,
+  createPlanRouteTerminalContext,
+  createWeeklyCheckinSessionState,
+  executePersonalizedPlan,
+} = require("./src/goals-coach/legacy-member-provisioning");
 
 var app = express();
 // Railway routes public requests through one edge proxy. Trust that single hop
@@ -1075,88 +1081,77 @@ var PLAN_SYSTEM =
   "Close with a grounded UGF message.";
 
 app.post("/generate-personalized-workout", async function (req, res) {
-  var verifyPayload = verifyVerificationToken(req, res);
-  if (!verifyPayload) return;
-
-  // All identity values come from the token — not from the request body.
-  var gymmasterId      = verifyPayload.sub;
-  var verifiedFirstName  = verifyPayload.firstName;
-  var verifiedLastInitial = verifyPayload.lastInitial || "";
-  var displayLastName  = verifyPayload.displayLastName || "";
-
-  var profile  = req.body.profile;
-  var messages = req.body.messages;
-
-  if (!profile) {
-    return res.status(400).json({ error: "profile is required" });
-  }
-
-  var planSafetyState = getGoalsCoachSafetyState(messages, profile, req.body.safetyStop);
-  if (planSafetyState.active) {
-    return res.status(409).json({
-      error: GOALS_COACH_SAFETY_REPLY,
-      readyToGenerate: false,
-      safetyStop: true,
-    });
-  }
-
+  var route = createPlanRouteTerminalContext(req, res);
   try {
-    var client = getOpenAI();
-    var completion = await client.chat.completions.create({
-      model: getModel(),
-      temperature: 0.45,
-      max_tokens: 4096,
-      messages: [
-        { role: "system", content: PLAN_SYSTEM },
-        {
-          role: "user",
-          content: "Create the plan.\n\nMEMBER\n" +
-            JSON.stringify({ firstName: verifiedFirstName, lastName: displayLastName }, null, 2) +
-            "\n\nPROFILE\n" + JSON.stringify(profile, null, 2) +
-            "\n\nCONVERSATION\n" + JSON.stringify((messages || []).slice(-30), null, 2),
-        },
-      ],
-    });
+    var verifyPayload = verifyVerificationToken(req, res);
+    if (!verifyPayload) return;
 
-    var plan = completion.choices[0].message.content;
-    if (!plan) throw new Error("No plan returned from OpenAI");
+    // All identity values come from the signed legacy verification token.
+    var gymmasterId = verifyPayload.sub;
+    var verifiedFirstName = verifyPayload.firstName;
+    var displayLastName = verifyPayload.displayLastName || "";
+    var profile = req.body.profile;
+    var messages = req.body.messages;
 
-    // Save to DB before responding. Uses a transaction so that coach_members and
-    // coach_plans are always written together. If the save fails, return an error
-    // rather than returning a plan the member cannot later retrieve.
-    var dbClient = await db.connect();
-    try {
-      await dbClient.query("BEGIN");
-
-      var upsertResult = await dbClient.query(
-        "INSERT INTO coach_members (gymmaster_member_id, first_name, last_name) " +
-        "VALUES ($1, $2, $3) ON CONFLICT (gymmaster_member_id) DO UPDATE SET " +
-        "first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, updated_at = NOW() RETURNING id",
-        [gymmasterId, verifiedFirstName, displayLastName]
-      );
-      var dbMemberId = upsertResult.rows[0] && upsertResult.rows[0].id;
-      if (!dbMemberId) throw new Error("coach_members upsert did not return an id");
-
-      await dbClient.query(
-        "INSERT INTO coach_plans (member_id, profile_json, assessment_messages, plan_markdown) VALUES ($1, $2, $3, $4)",
-        [dbMemberId, JSON.stringify(profile), JSON.stringify((messages || []).slice(-60)), plan]
-      );
-
-      await dbClient.query("COMMIT");
-    } catch (dbErr) {
-      await dbClient.query("ROLLBACK").catch(function () {});
-      console.error("[UGF] Failed to save plan:", dbErr.message);
-      return res.status(500).json({
-        error: "Your plan was generated but could not be saved. Please try again.",
-      });
-    } finally {
-      dbClient.release();
+    if (!profile) {
+      return res.status(400).json({ error: "profile is required" });
     }
 
+    var planSafetyState = getGoalsCoachSafetyState(messages, profile, req.body.safetyStop);
+    if (planSafetyState.active) {
+      return res.status(409).json({
+        error: GOALS_COACH_SAFETY_REPLY,
+        readyToGenerate: false,
+        safetyStop: true,
+      });
+    }
+
+    var plan = await executePersonalizedPlan({
+      pool: db,
+      route: route,
+      gymmasterMemberId: gymmasterId,
+      firstName: verifiedFirstName,
+      lastName: displayLastName,
+      profile: profile,
+      messages: messages,
+      generatePlan: async function (providerOptions) {
+        var completion = await getOpenAI().chat.completions.create({
+          model: getModel(),
+          temperature: 0.45,
+          max_tokens: 4096,
+          messages: [
+            { role: "system", content: PLAN_SYSTEM },
+            {
+              role: "user",
+              content: "Create the plan.\n\nMEMBER\n" +
+                JSON.stringify({ firstName: verifiedFirstName, lastName: displayLastName }, null, 2) +
+                "\n\nPROFILE\n" + JSON.stringify(profile, null, 2) +
+                "\n\nCONVERSATION\n" + JSON.stringify((messages || []).slice(-30), null, 2),
+            },
+          ],
+        }, providerOptions);
+        return completion
+          && completion.choices
+          && completion.choices[0]
+          && completion.choices[0].message
+          && completion.choices[0].message.content;
+      },
+    });
+    if (
+      route.terminalState.isTerminal()
+      || res.writableEnded
+      || res.headersSent
+    ) return;
     return res.json({ plan: plan });
-  } catch (err) {
-    console.error("[UGF] generate-personalized-workout error:", err.message);
+  } catch (_) {
+    if (
+      !route.terminalState.responseAllowed()
+      || res.writableEnded
+      || res.headersSent
+    ) return;
     return res.status(500).json({ error: "Plan generation failed" });
+  } finally {
+    route.cleanup();
   }
 });
 
@@ -1180,7 +1175,6 @@ app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, 
   try {
     var gmRes = await fetch(GYMMASTER_BASE + "/members?memberid=" + encodeURIComponent(memberId), { headers: gymHeaders() });
     if (!gmRes.ok) {
-      console.error("[UGF] GymMaster responded with", gmRes.status);
       return res.status(502).json({ error: "Membership system unavailable. Please try again shortly." });
     }
     var gmData = await gmRes.json();
@@ -1209,21 +1203,16 @@ app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, 
       return res.json({ found: true, active: false });
     }
 
-    // Upsert coach_members keyed by verified GymMaster ID
-    var upsertResult = await db.query(
-      "INSERT INTO coach_members (gymmaster_member_id, first_name, last_name) " +
-      "VALUES ($1, $2, $3) ON CONFLICT (gymmaster_member_id) DO UPDATE SET " +
-      "first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, updated_at = NOW() RETURNING id",
-      [memberId, firstName, lastName]
-    );
-    var dbMemberId = upsertResult.rows[0].id;
-
-    // Load latest plan for plannedDaysPerWeek
-    var planResult = await db.query(
-      "SELECT profile_json, created_at FROM coach_plans WHERE member_id = $1 ORDER BY created_at DESC LIMIT 1",
-      [dbMemberId]
-    );
-    var latestPlan = planResult.rows[0] || null;
+    var weekStart = getWeekStart(new Date());
+    var sessionState = await createWeeklyCheckinSessionState({
+      pool: db,
+      gymmasterMemberId: memberId,
+      firstName: firstName,
+      lastName: lastName,
+      weekStart: weekStart,
+      buildToken: signCheckinSession,
+    });
+    var latestPlan = sessionState.latestPlan;
     var plannedDaysPerWeek = null;
     if (latestPlan && latestPlan.profile_json) {
       var profile = typeof latestPlan.profile_json === "string"
@@ -1232,27 +1221,17 @@ app.post("/weekly-checkin/session", checkinSessionLimiter, async function (req, 
       plannedDaysPerWeek = profile.daysPerWeek || null;
     }
 
-    // Check for existing submission this week (Mountain Time boundary)
-    var weekStart = getWeekStart(new Date());
-    var existingCheckin = await db.query(
-      "SELECT id FROM weekly_checkins WHERE member_id = $1 AND week_start = $2",
-      [dbMemberId, weekStart]
-    );
-
-    var sessionToken = signCheckinSession(dbMemberId, memberId, firstName);
-
     return res.json({
       found: true,
       active: true,
-      sessionToken: sessionToken,
+      sessionToken: sessionState.sessionToken,
       firstName: firstName,
       planDate: latestPlan ? latestPlan.created_at : null,
       plannedDaysPerWeek: plannedDaysPerWeek,
-      alreadySubmitted: existingCheckin.rows.length > 0,
+      alreadySubmitted: sessionState.alreadySubmitted,
       weekStart: weekStart,
     });
-  } catch (err) {
-    console.error("[UGF] weekly-checkin/session error:", err.message);
+  } catch (_) {
     return res.status(500).json({ error: "Verification service error. Please try again." });
   }
 });
@@ -1352,6 +1331,9 @@ app.post("/weekly-checkin/submit", checkinSubmitLimiter, async function (req, re
     );
     var memberRow = memberResult.rows[0];
     if (!memberRow) return res.status(404).json({ error: "Member not found" });
+    if (!completeNamePair(memberRow)) {
+      return res.status(500).json({ error: "Could not process your check-in. Please try again." });
+    }
 
     var planResult = await db.query(
       "SELECT profile_json, plan_markdown FROM coach_plans WHERE member_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -1499,7 +1481,7 @@ app.post("/admin/send-weekly-checkins", async function (req, res) {
     }
 
     var membersResult = await db.query(
-      "SELECT cm.id, cm.gymmaster_member_id, cm.first_name, cm.last_name " +
+      "SELECT cm.id, cm.gymmaster_member_id " +
       "FROM coach_members cm " +
       "WHERE EXISTS (SELECT 1 FROM coach_plans cp WHERE cp.member_id = cm.id)"
     );
@@ -1622,6 +1604,10 @@ app.post("/admin/retry-trainer-notifications", async function (req, res) {
 
     for (var i = 0; i < pending.rows.length; i++) {
       var row = pending.rows[i];
+      if (!completeNamePair(row)) {
+        skipped++;
+        continue;
+      }
       attempted++;
 
       var analysis = {};

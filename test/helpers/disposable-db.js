@@ -8,12 +8,23 @@ const { runMigration: runPhase1cTranscriptionMigration } = require("../../migrat
 const { runMigration: runPhase1dSafetyMigration } = require("../../migrate_006");
 const { runMigration: runOwnerWorkoutTrackingMigration } = require("../../migrate_007");
 const { runMigration: runOwnerEditableWorkoutSessionsMigration } = require("../../migrate_008");
+const {
+  MIGRATION_FILE: migration011File,
+  splitMigrationStatements: splitMigration011Statements,
+} = require("../../migrate_011");
 
 const projectRoot = path.resolve(__dirname, "../..");
 
 function createPoolAdapter(database) {
   const client = {
     async query(sql, parameters) {
+      if (
+        /pg_advisory_xact_lock/i.test(sql)
+        || /^\s*LOCK\s+TABLE\s+/i.test(sql)
+        || /set_config\('(?:lock_timeout|statement_timeout|idle_in_transaction_session_timeout)'/i.test(sql)
+      ) {
+        return { rows: [{}], rowCount: 1 };
+      }
       if (parameters === undefined && /;\s*\S/.test(sql.trim())) {
         await database.exec(sql);
         return { rows: [], rowCount: 0 };
@@ -29,6 +40,13 @@ function createPoolAdapter(database) {
     },
     async end() {},
   };
+}
+
+async function applyMigration011ForTests(pool) {
+  const sql = fs.readFileSync(migration011File, "utf8");
+  for (const statement of splitMigration011Statements(sql)) {
+    await pool.query(statement);
+  }
 }
 
 async function createDisposableDatabase(options = {}) {
@@ -114,6 +132,7 @@ async function seedAlphaMapping(pool, member, suffix = "1", active = true) {
 module.exports = {
   createDisposableDatabase,
   createPoolAdapter,
+  applyMigration011ForTests,
   seedAlphaMapping,
   seedMemberAndPlan,
   seedStaff,

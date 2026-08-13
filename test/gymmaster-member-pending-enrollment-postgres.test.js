@@ -5,12 +5,19 @@ const test = require("node:test");
 const {
   createGymMasterMemberPendingEnrollmentService,
 } = require("../src/goals-coach/gymmaster-member-pending-enrollment");
+const {
+  createGymMasterMemberLoginService,
+} = require("../src/goals-coach/gymmaster-member-login");
 const { runMigration: runPhase1cTranscriptionMigration } = require("../migrate_005");
 const { runMigration: runPhase1dSafetyMigration } = require("../migrate_006");
 const { runMigration: runOwnerWorkoutTrackingMigration } = require("../migrate_007");
 const { runMigration: runOwnerEditableWorkoutSessionsMigration } = require("../migrate_008");
 const { runMigration: runMemberSafetyIntakeMigration } = require("../migrate_009");
 const { runMigration: runPendingEnrollmentMigration } = require("../migrate_010");
+const { runMigration: runNullableNamesMigration } = require("../migrate_011");
+const {
+  acquireGymMasterMemberProvisioningLock,
+} = require("../src/goals-coach/gymmaster-member-provisioning-lock");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 
 const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0
@@ -25,20 +32,20 @@ function requestId(number) {
   return `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
 }
 
-async function waitForMemberLockWaiters(pool, expected, timeoutMs = 5000) {
+async function waitForProvisioningLockWaiters(pool, expected, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = await pool.query(
       `SELECT pid
        FROM pg_stat_activity
        WHERE wait_event_type = 'Lock'
-         AND query LIKE '%FROM coach_members%'
+         AND query LIKE '%pg_advisory_xact_lock%'
        ORDER BY pid`
     );
     if (result.rows.length >= expected) return result.rows;
     await delay(20);
   }
-  throw new Error(`Expected ${expected} pending-enrollment member-lock waiter(s)`);
+  throw new Error(`Expected ${expected} pending-enrollment advisory-lock waiter(s)`);
 }
 
 test(
@@ -62,6 +69,10 @@ test(
     await runOwnerEditableWorkoutSessionsMigration({ pool: disposable.pool });
     await runMemberSafetyIntakeMigration({ pool: disposable.pool });
     await runPendingEnrollmentMigration({ pool: disposable.pool });
+    await runNullableNamesMigration({
+      pool: disposable.pool,
+      environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" },
+    });
 
     const version = (await disposable.pool.query(
       "SHOW server_version"
@@ -74,11 +85,6 @@ test(
                'Admin', 'admin', TRUE)
        RETURNING *`
     )).rows[0];
-    const member = (await disposable.pool.query(
-      `INSERT INTO coach_members (gymmaster_member_id, first_name, last_name)
-       VALUES ('42501', 'Pending', 'Postgres')
-       RETURNING *`
-    )).rows[0];
     const service = createGymMasterMemberPendingEnrollmentService({
       db: disposable.pool,
       membershipVerifier: {
@@ -86,7 +92,6 @@ test(
           return { active: memberId === "42501" };
         },
       },
-      now: () => new Date("2026-08-07T16:00:00.000Z"),
     });
     const input = {
       gymmasterMemberId: "42501",
@@ -96,16 +101,13 @@ test(
 
     blocker = await disposable.pool.connect();
     await blocker.query("BEGIN");
-    await blocker.query(
-      "SELECT id FROM coach_members WHERE id = $1 FOR UPDATE",
-      [member.id]
-    );
+    await acquireGymMasterMemberProvisioningLock(blocker, "42501");
     const first = service.createPendingEnrollment(staff, input);
     pendingOperations.push(first);
-    await waitForMemberLockWaiters(disposable.pool, 1);
+    await waitForProvisioningLockWaiters(disposable.pool, 1);
     const second = service.createPendingEnrollment(staff, input);
     pendingOperations.push(second);
-    await waitForMemberLockWaiters(disposable.pool, 2);
+    await waitForProvisioningLockWaiters(disposable.pool, 2);
     await blocker.query("COMMIT");
     blocker.release();
     blocker = null;
@@ -120,6 +122,12 @@ test(
         "SELECT COUNT(*)::int AS count FROM goals_coach_member_pending_enrollments WHERE status = 'pending'"
       )).rows[0].count,
       1
+    );
+    assert.equal(
+      (await disposable.pool.query(
+        "SELECT COUNT(*)::int AS count FROM coach_members WHERE gymmaster_member_id = '42501'"
+      )).rows[0].count,
+      0
     );
     assert.equal(
       (await disposable.pool.query(
@@ -145,6 +153,41 @@ test(
       )),
       true
     );
+
+    const loginService = createGymMasterMemberLoginService({
+      enabled: true,
+      memberApiKey: "synthetic-member-api-key",
+      loginClient: async () => ({
+        result: {
+          token: "synthetic-provider-token",
+          expires: 3600,
+          memberid: 42501,
+        },
+      }),
+    });
+    const identities = await Promise.all([
+      loginService.authenticate({
+        email: "native@example.test",
+        password: "synthetic-password",
+      }),
+      loginService.authenticate({
+        email: "native@example.test",
+        password: "synthetic-password",
+      }),
+    ]);
+    const completions = await Promise.all(
+      identities.map((identity) => service.completeAuthenticatedEnrollment(identity))
+    );
+    assert.equal(completions.every((completion) => completion.active === true), true);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM coach_members WHERE gymmaster_member_id = '42501'"
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings WHERE auth_subject = 'gymmaster:42501'"
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_pending_enrollments WHERE status = 'consumed'"
+    )).rows[0].count, 1);
 
     const event = (await disposable.pool.query(
       "SELECT id FROM goals_coach_member_provisioning_events LIMIT 1"

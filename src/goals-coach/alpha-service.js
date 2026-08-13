@@ -273,7 +273,9 @@ function createAlphaGoalsCoachService(options) {
     );
     if (!result.rows.length) throw notFound("COACHING_PROFILE_NOT_FOUND", "Coaching profile not found");
     return {
-      preferredName: result.rows[0].first_name,
+      preferredName: typeof result.rows[0].first_name === "string"
+        ? result.rows[0].first_name
+        : null,
       currentGoal: result.rows[0].current_goal,
       access: "private_owner_alpha",
     };

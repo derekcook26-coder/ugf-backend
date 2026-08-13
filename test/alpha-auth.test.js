@@ -159,8 +159,8 @@ test("missing alpha Clerk configuration fails closed", async (t) => {
   assert.equal(result.body.error, "ALPHA_AUTH_NOT_CONFIGURED");
 });
 
-test("database authorization reloads the active immutable-subject mapping on every request", async () => {
-  let active = true;
+test("database authorization reloads the active immutable-subject mapping and represents unknown names as null", async () => {
+  let active = "named";
   let queryCount = 0;
   const authorization = createAlphaMemberAuthorization({
     applicationConfiguration: { valid: true, consentVersion: "GC-ALPHA-CONSENT-1.0", alphaEnvironment: "test" },
@@ -172,8 +172,8 @@ test("database authorization reloads the active immutable-subject mapping on eve
           member_id: "11",
           auth_provider: "clerk",
           auth_subject: "user_alpha_valid",
-          first_name: "Synthetic",
-          last_name: "Member",
+          first_name: active === "nameless" ? null : "Synthetic",
+          last_name: active === "nameless" ? null : "Member",
         }] } : { rows: [] };
       },
     },
@@ -183,6 +183,23 @@ test("database authorization reloads the active immutable-subject mapping on eve
     authorization.loadActiveAlphaMember(req, { status: () => ({ json: resolve }) }, () => resolve("next"));
   });
   assert.equal(first, "next");
+  active = "nameless";
+  const namelessRequest = {
+    alphaMemberIdentity: {
+      authProvider: "clerk",
+      authSubject: "user_alpha_valid",
+    },
+  };
+  const nameless = await new Promise((resolve) => {
+    authorization.loadActiveAlphaMember(
+      namelessRequest,
+      { status: () => ({ json: resolve }) },
+      () => resolve("next")
+    );
+  });
+  assert.equal(nameless, "next");
+  assert.equal(namelessRequest.alphaMember.firstName, null);
+  assert.equal(namelessRequest.alphaMember.lastName, null);
   active = false;
   const second = await new Promise((resolve) => {
     authorization.loadActiveAlphaMember(
@@ -193,5 +210,5 @@ test("database authorization reloads the active immutable-subject mapping on eve
   });
   assert.equal(second.status, 403);
   assert.equal(second.body.error, "ALPHA_ACCESS_FORBIDDEN");
-  assert.equal(queryCount, 2);
+  assert.equal(queryCount, 3);
 });
