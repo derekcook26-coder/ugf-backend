@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const express = require("express");
 const test = require("node:test");
 const {
   createGymMasterMemberPendingEnrollmentService,
@@ -19,6 +20,14 @@ const {
   acquireGymMasterMemberProvisioningLock,
 } = require("../src/goals-coach/gymmaster-member-provisioning-lock");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
+const {
+  createGymMasterMemberPendingEnrollmentLoginStartup,
+} = require("../src/goals-coach/gymmaster-member-pending-enrollment-login-startup");
+const {
+  MEMBER_PENDING_ENROLLMENT_LOGIN_PATH,
+  composeGymMasterMemberPendingEnrollmentLoginRoute,
+} = require("../src/goals-coach/gymmaster-member-pending-enrollment-login-route-composition");
+const { jsonRequest, startApp } = require("./helpers/http-app");
 
 const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0
   ? "embedded PostgreSQL refuses to run as root; run this test as an unprivileged user"
@@ -89,7 +98,7 @@ test(
       db: disposable.pool,
       membershipVerifier: {
         async verifyActiveMember(memberId) {
-          return { active: memberId === "42501" };
+          return { active: memberId === "42501" || memberId === "42502" };
         },
       },
     });
@@ -210,5 +219,63 @@ test(
     for (const forbidden of ["email", "password", "token", "provider_payload"]) {
       assert.equal(columns.some((column) => column.includes(forbidden)), false);
     }
+
+    await service.createPendingEnrollment(staff, {
+      gymmasterMemberId: "42502",
+      clientRequestId: requestId(504),
+    });
+    const app = express();
+    app.use(express.json());
+    const startup = createGymMasterMemberPendingEnrollmentLoginStartup({
+      environment: {
+        GOALS_COACH_MEMBER_PENDING_ENROLLMENT_LOGIN_ENABLED: "true",
+        GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "true",
+        GOALS_COACH_MEMBER_LOGIN_ENABLED: "true",
+        GOALS_COACH_MEMBER_LOGIN_ORIGIN: "https://ultimategoalsfitness.com",
+        GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL:
+          "https://ugf.gymmasteronline.com/portal/api/v1/login",
+        GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL:
+          "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
+        GOALS_COACH_GYMMASTER_MEMBER_API_KEY: "native-member-key",
+        GYMMASTER_API_KEY: "native-gatekeeper-key",
+        GYMMASTER_SITE: "ugf",
+        GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: "n".repeat(32),
+      },
+      db: disposable.pool,
+      fetchImpl: async (url) => {
+        assert.match(url, /\/portal\/api\/v1\/login$/);
+        return new Response(JSON.stringify({
+          result: { token: "native-provider-token", expires: 900, memberid: 42502 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+      pendingEnrollmentStartup: {
+        status: "ready_for_existing_boundaries",
+        service,
+      },
+    });
+    assert.equal(startup.status, "ready_for_separate_route_composition");
+    assert.deepEqual(
+      composeGymMasterMemberPendingEnrollmentLoginRoute(app, startup),
+      { mounted: true, path: MEMBER_PENDING_ENROLLMENT_LOGIN_PATH }
+    );
+    const running = await startApp(app);
+    t.after(() => running.close());
+    const login = await jsonRequest(running.url, MEMBER_PENDING_ENROLLMENT_LOGIN_PATH, {
+      method: "POST",
+      headers: { Origin: "https://ultimategoalsfitness.com" },
+      body: { email: "native-pending@example.test", password: "native-password" },
+    });
+    assert.equal(login.response.status, 204);
+    assert.match(login.response.headers.get("set-cookie"), /^gc_member_session=/);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_auth_mappings WHERE auth_subject = 'gymmaster:42502'"
+    )).rows[0].count, 1);
+    assert.equal((await disposable.pool.query(
+      "SELECT COUNT(*)::int AS count FROM goals_coach_member_pending_enrollments WHERE gymmaster_member_id = '42502' AND status = 'consumed'"
+    )).rows[0].count, 1);
+    const noCapability = await jsonRequest(running.url, "/goalscoach/member/tracked-workout-sessions", {
+      headers: { Origin: "https://ultimategoalsfitness.com" },
+    });
+    assert.equal(noCapability.response.status, 404);
   }
 );

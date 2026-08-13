@@ -33,6 +33,8 @@ var { composeGymMasterOwnerOnlyRoutes } = require("./src/goals-coach/gymmaster-o
 var { createGymMasterMemberEditableWorkoutSessionsStartup } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-startup");
 var { composeGymMasterMemberEditableWorkoutSessionsRoutes } = require("./src/goals-coach/gymmaster-member-editable-workout-sessions-route-composition");
 var { createGymMasterMemberPendingEnrollmentStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-startup");
+var { createGymMasterMemberPendingEnrollmentLoginStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-login-startup");
+var { composeGymMasterMemberPendingEnrollmentLoginRoute } = require("./src/goals-coach/gymmaster-member-pending-enrollment-login-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -116,6 +118,21 @@ var memberPendingEnrollmentStartup = createGymMasterMemberPendingEnrollmentStart
   db: db,
   fetchImpl: fetch,
 });
+
+// Approved pending enrollment uses a dedicated login-only route. It never
+// mounts owner, editable-workout, Safety Intake, plan, coaching, or voice
+// capabilities, and remains absent unless its own exact flag and all shared
+// member-login and pending-enrollment prerequisites are ready.
+var memberPendingEnrollmentLoginStartup =
+  createGymMasterMemberPendingEnrollmentLoginStartup({
+    db: db,
+    fetchImpl: fetch,
+    pendingEnrollmentStartup: memberPendingEnrollmentStartup,
+  });
+composeGymMasterMemberPendingEnrollmentLoginRoute(
+  app,
+  memberPendingEnrollmentLoginStartup
+);
 
 // Owner-only member login has no default route. It is mounted only after all
 // independent Member Portal, Gatekeeper, session, exact-origin, owner-ID, and
