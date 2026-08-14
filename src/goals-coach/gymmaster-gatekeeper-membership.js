@@ -2,15 +2,21 @@
 
 const GATEKEEPER_MEMBERS_PATH = "/gatekeeper_api/v2/members";
 const memberAccessFailureStages = new WeakMap();
+const memberAccessDependencyFailures = new WeakSet();
 
-function inactiveMemberAccess(stage) {
+function inactiveMemberAccess(stage, dependencyUnavailable = false) {
   const result = Object.freeze({ active: false });
-  memberAccessFailureStages.set(result, stage);
+  if (stage) memberAccessFailureStages.set(result, stage);
+  if (dependencyUnavailable) memberAccessDependencyFailures.add(result);
   return result;
 }
 
 function memberAccessFailureStage(result) {
   return result && memberAccessFailureStages.get(result) || null;
+}
+
+function memberAccessDependencyUnavailable(result) {
+  return Boolean(result && memberAccessDependencyFailures.has(result));
 }
 
 function validMemberId(value) {
@@ -98,7 +104,7 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
       try {
         mapping = await mappingAuthorizer.authorizeIdentity(identity);
       } catch (_) {
-        return inactiveMemberAccess("local_mapping");
+        return inactiveMemberAccess("local_mapping", true);
       }
       if (!mapping || mapping.active !== true) {
         return inactiveMemberAccess("local_mapping");
@@ -108,7 +114,7 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
       try {
         membership = await membershipVerifier.verifyActiveMember(subjectMemberId);
       } catch (_) {
-        return inactiveMemberAccess("gatekeeper");
+        return inactiveMemberAccess("gatekeeper", true);
       }
       if (!membership || membership.active !== true) {
         return inactiveMemberAccess("gatekeeper");
@@ -125,6 +131,7 @@ module.exports = {
   exactGatekeeperMembersEndpoint,
   matchingMember,
   memberAccessFailureStage,
+  memberAccessDependencyUnavailable,
   membershipIsActive,
   validMemberId,
 };

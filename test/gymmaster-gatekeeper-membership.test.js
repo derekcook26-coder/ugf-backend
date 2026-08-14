@@ -5,6 +5,8 @@ const test = require("node:test");
 const {
   createGymMasterGatekeeperMembershipVerifier,
   createGymMasterMemberAccessAuthorizer,
+  memberAccessFailureStage,
+  memberAccessDependencyUnavailable,
   membershipIsActive,
 } = require("../src/goals-coach/gymmaster-gatekeeper-membership");
 
@@ -66,4 +68,22 @@ test("access authorizer requires both the local mapping and active Gatekeeper re
     await access.authorizeIdentity({ authProvider: "gymmaster", authSubject: "gymmaster:10482" }),
     { active: true, mappingId: "9", memberId: "10482" }
   );
+});
+
+test("access authorizer keeps denial distinct from dependency unavailability", async () => {
+  const denied = createGymMasterMemberAccessAuthorizer({
+    mappingAuthorizer: { authorizeIdentity: async () => ({ active: false }) },
+    membershipVerifier: { verifyActiveMember: async () => ({ active: true }) },
+  });
+  const deniedResult = await denied.authorizeIdentity({});
+  assert.equal(memberAccessFailureStage(deniedResult), "local_mapping");
+  assert.equal(memberAccessDependencyUnavailable(deniedResult), false);
+
+  const unavailable = createGymMasterMemberAccessAuthorizer({
+    mappingAuthorizer: { authorizeIdentity: async () => { throw new Error("synthetic failure"); } },
+    membershipVerifier: { verifyActiveMember: async () => ({ active: true }) },
+  });
+  const unavailableResult = await unavailable.authorizeIdentity({});
+  assert.equal(memberAccessFailureStage(unavailableResult), "local_mapping");
+  assert.equal(memberAccessDependencyUnavailable(unavailableResult), true);
 });
