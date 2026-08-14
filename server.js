@@ -39,6 +39,8 @@ var { createGymMasterMemberPrivateScreenStartup } = require("./src/goals-coach/g
 var { composeGymMasterMemberPrivateScreenRoute } = require("./src/goals-coach/gymmaster-member-private-screen-route-composition");
 var { createGymMasterMemberPrivateScreenLoginStartup } = require("./src/goals-coach/gymmaster-member-private-screen-login-startup");
 var { composeGymMasterMemberPrivateScreenLoginRoute } = require("./src/goals-coach/gymmaster-member-private-screen-login-route-composition");
+var { createGymMasterMemberSafetyIntakeStartup } = require("./src/goals-coach/gymmaster-member-safety-intake-startup");
+var { composeGymMasterMemberSafetyIntakeRoutes } = require("./src/goals-coach/gymmaster-member-safety-intake-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -130,6 +132,14 @@ var memberPrivateScreenLoginStartup = createGymMasterMemberPrivateScreenLoginSta
   fetchImpl: fetch,
 });
 composeGymMasterMemberPrivateScreenLoginRoute(app, memberPrivateScreenLoginStartup);
+
+// Safety setup is independently exact-flagged. Construction only wires local
+// dependencies; database and Gatekeeper checks occur on authenticated requests.
+var memberSafetyIntakeStartup = createGymMasterMemberSafetyIntakeStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterMemberSafetyIntakeRoutes(app, memberSafetyIntakeStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider

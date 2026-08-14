@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  MEMBER_SAFETY_NOTICE_VERSION,
   parseSafetyIntake,
   submitSafetyIntake,
 } = require("../src/goals-coach/gymmaster-member-safety-intake");
@@ -17,7 +18,7 @@ const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0
   ? "embedded PostgreSQL refuses to run as root; run this test as an unprivileged user"
   : false;
-const noticeVersion = "approved-member-safety-intake-v1";
+const noticeVersion = MEMBER_SAFETY_NOTICE_VERSION;
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));

@@ -6,20 +6,18 @@ const test = require("node:test");
 const {
   MAXIMUM_SAFETY_INTAKE_JSON_BYTES,
   MEMBER_SAFETY_INTAKE_FLAG,
-  MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION,
+  MEMBER_SAFETY_NOTICE,
+  MEMBER_SAFETY_NOTICE_VERSION,
   memberSafetyIntakeEnabled,
   parseSafetyIntake,
   safetyIntakeRequestHash,
 } = require("../src/goals-coach/gymmaster-member-safety-intake");
 const {
-  MEMBER_EDITABLE_WORKOUT_SESSIONS_FLAG,
-} = require("../src/goals-coach/gymmaster-member-editable-workout-sessions");
+  createGymMasterMemberSafetyIntakeStartup,
+} = require("../src/goals-coach/gymmaster-member-safety-intake-startup");
 const {
-  createGymMasterMemberEditableWorkoutSessionsStartup,
-} = require("../src/goals-coach/gymmaster-member-editable-workout-sessions-startup");
-const {
-  composeGymMasterMemberEditableWorkoutSessionsRoutes,
-} = require("../src/goals-coach/gymmaster-member-editable-workout-sessions-route-composition");
+  composeGymMasterMemberSafetyIntakeRoutes,
+} = require("../src/goals-coach/gymmaster-member-safety-intake-route-composition");
 const {
   buildGymMasterSessionCookie,
   createGymMasterMemberSessionService,
@@ -36,12 +34,17 @@ const { runMigration: runSafetyIntakeMigration } = require("../migrate_009");
 const { jsonRequest, startApp } = require("./helpers/http-app");
 
 const origin = "https://ultimategoalsfitness.com";
-const noticeVersion = "approved-member-safety-intake-v1";
+const noticeVersion = MEMBER_SAFETY_NOTICE_VERSION;
 const sessionSecret = "s".repeat(32);
 const noRateLimits = {
   read: (_req, _res, next) => next(),
   mutation: (_req, _res, next) => next(),
 };
+const forbiddenPublicFields = /email|name|gymmaster.?id|member.?id|mapping.?id|auth.?(?:subject|provider)|enrollment|provider.?payload|configuration|client.?request.?id|request.?hash|currentpain|currentinjury|recentsurgery|medicalorexercise|othertrainingsafety|health.?narrative|stack|diagnostic/i;
+
+function assertPrivacyMinimized(body, label) {
+  assert.doesNotMatch(JSON.stringify(body), forbiddenPublicFields, label);
+}
 
 function environment(overrides = {}) {
   return {
@@ -55,9 +58,7 @@ function environment(overrides = {}) {
     GYMMASTER_API_KEY: "gatekeeper-key",
     GYMMASTER_SITE: "ugf",
     GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: sessionSecret,
-    [MEMBER_EDITABLE_WORKOUT_SESSIONS_FLAG]: "true",
     [MEMBER_SAFETY_INTAKE_FLAG]: "true",
-    [MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION]: noticeVersion,
     ...overrides,
   };
 }
@@ -119,19 +120,41 @@ async function fixture(t, overrides = {}) {
     )).rows[0]);
   }
   let providerCalls = 0;
+  let databaseCalls = 0;
+  const instrumentedDb = {
+    query(...args) {
+      databaseCalls += 1;
+      return disposable.pool.query(...args);
+    },
+    connect(...args) {
+      databaseCalls += 1;
+      return disposable.pool.connect(...args);
+    },
+  };
   const app = express();
   app.use(createApplicationJsonParser());
-  const startup = createGymMasterMemberEditableWorkoutSessionsStartup({
+  const startup = createGymMasterMemberSafetyIntakeStartup({
     environment: environment(overrides.environment),
-    db: disposable.pool,
-    fetchImpl: async () => {
+    db: instrumentedDb,
+    fetchImpl: overrides.fetchImpl || (async (url) => {
       providerCalls += 1;
-      throw new Error("provider access is forbidden in member safety-intake tests");
-    },
-    editableWorkoutSessionsRateLimits: noRateLimits,
-    safetyIntakeRateLimits: overrides.rateLimits || noRateLimits,
+      const memberId = new URL(url).searchParams.get("memberid");
+      return {
+        ok: true,
+        async json() {
+          return { members: [{
+            memberid: Number(memberId),
+            stopatgate: false,
+            membership: [{ expired: false }],
+          }] };
+        },
+      };
+    }),
+    ...(overrides.useProductionRateLimits
+      ? {}
+      : { rateLimits: overrides.rateLimits || noRateLimits }),
   });
-  composeGymMasterMemberEditableWorkoutSessionsRoutes(app, startup);
+  composeGymMasterMemberSafetyIntakeRoutes(app, startup);
   app.use(goalsCoachErrorHandler);
   const running = await startApp(app);
   t.after(() => running.close());
@@ -141,6 +164,7 @@ async function fixture(t, overrides = {}) {
     second,
     mappings,
     providerCalls: () => providerCalls,
+    databaseCalls: () => databaseCalls,
     running,
   };
 }
@@ -178,7 +202,7 @@ test("member safety intake is exact-flagged and absent with zero database or pro
     { [MEMBER_SAFETY_INTAKE_FLAG]: undefined },
     {
       [MEMBER_SAFETY_INTAKE_FLAG]: "true",
-      [MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION]: undefined,
+      GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: undefined,
     },
   ]) {
     let databaseCalls = 0;
@@ -195,16 +219,15 @@ test("member safety intake is exact-flagged and absent with zero database or pro
     };
     const app = express();
     app.use(createApplicationJsonParser());
-    const startup = createGymMasterMemberEditableWorkoutSessionsStartup({
+    const startup = createGymMasterMemberSafetyIntakeStartup({
       environment: environment(safetyEnvironment),
       db,
       fetchImpl: async () => {
         providerCalls += 1;
         throw new Error("provider access is forbidden when safety intake is absent");
       },
-      editableWorkoutSessionsRateLimits: noRateLimits,
     });
-    composeGymMasterMemberEditableWorkoutSessionsRoutes(app, startup);
+    composeGymMasterMemberSafetyIntakeRoutes(app, startup);
     const running = await startApp(app);
     t.after(() => running.close());
     const get = await jsonRequest(
@@ -249,12 +272,13 @@ test("safety-intake hashing is canonical and covers the notice plus all five ans
     );
     assert.notEqual(safetyIntakeRequestHash(changed), baseHash, field);
   }
-  const nextNotice = "approved-member-safety-intake-v2";
-  const changedNotice = parseSafetyIntake(
-    { ...submission(8), noticeVersion: nextNotice },
-    nextNotice
+  assert.throws(
+    () => parseSafetyIntake(
+      { ...submission(8), noticeVersion: "unapproved-version" },
+      noticeVersion
+    ),
+    /notice version is invalid/
   );
-  assert.notEqual(safetyIntakeRequestHash(changedNotice), baseHash);
 });
 
 test("safety intake reuses exact origin, signed session, and active mapping ownership", async (t) => {
@@ -276,6 +300,7 @@ test("safety intake reuses exact origin, signed session, and active mapping owne
   );
   assert.equal(wrongOrigin.response.status, 403);
   assert.equal(wrongOrigin.body.error, "MEMBER_ORIGIN_NOT_ALLOWED");
+  assertPrivacyMinimized(wrongOrigin.body, "403 response");
   assert.equal(wrongOrigin.response.headers.get("cache-control"), "no-store");
 
   const missingSession = await jsonRequest(
@@ -285,6 +310,7 @@ test("safety intake reuses exact origin, signed session, and active mapping owne
   );
   assert.equal(missingSession.response.status, 401);
   assert.equal(missingSession.body.error, "MEMBER_AUTHENTICATION_REQUIRED");
+  assertPrivacyMinimized(missingSession.body, "401 response");
 
   const tampered = await jsonRequest(
     running.url,
@@ -297,6 +323,7 @@ test("safety intake reuses exact origin, signed session, and active mapping owne
     }
   );
   assert.equal(tampered.response.status, 401);
+  assertPrivacyMinimized(tampered.body, "tampered-session 401 response");
 
   const empty = await memberRequest(
     running,
@@ -306,9 +333,13 @@ test("safety intake reuses exact origin, signed session, and active mapping owne
   assert.equal(empty.response.status, 200);
   assert.deepEqual(empty.body, {
     safetyIntake: {
+      notice: MEMBER_SAFETY_NOTICE,
       noticeVersion,
       status: "not_submitted",
       safetyStop: null,
+      readiness: { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" },
+      activationPermitted: false,
+      externalCallsPermitted: false,
     },
   });
   assert.equal(empty.response.headers.get("cache-control"), "no-store");
@@ -324,7 +355,8 @@ test("safety intake reuses exact origin, signed session, and active mapping owne
   );
   assert.equal(inactive.response.status, 401);
   assert.equal(inactive.body.error, "MEMBER_AUTHENTICATION_REQUIRED");
-  assert.equal(providerCalls(), 0);
+  assertPrivacyMinimized(inactive.body, "revoked-mapping 401 response");
+  assert.equal(providerCalls() > 0, true);
 });
 
 test("safety intake accepts only the five required strict booleans and approved envelope", async (t) => {
@@ -366,6 +398,7 @@ test("safety intake accepts only the five required strict booleans and approved 
     );
     assert.equal(response.response.status, 400);
     assert.match(response.body.error, /^SAFETY_INTAKE_/);
+    assertPrivacyMinimized(response.body, "400 response");
   }
 
   const query = await memberRequest(
@@ -375,6 +408,7 @@ test("safety intake accepts only the five required strict booleans and approved 
   );
   assert.equal(query.response.status, 400);
   assert.equal(query.body.error, "SAFETY_INTAKE_INVALID");
+  assertPrivacyMinimized(query.body, "query 400 response");
 
   const wrongMedia = await fetch(
     `${running.url}/goalscoach/member/safety-intake`,
@@ -389,7 +423,9 @@ test("safety intake accepts only the five required strict booleans and approved 
     }
   );
   assert.equal(wrongMedia.status, 415);
-  assert.equal((await wrongMedia.json()).error, "SAFETY_INTAKE_MEDIA_TYPE_UNSUPPORTED");
+  const wrongMediaBody = await wrongMedia.json();
+  assert.equal(wrongMediaBody.error, "SAFETY_INTAKE_MEDIA_TYPE_UNSUPPORTED");
+  assertPrivacyMinimized(wrongMediaBody, "415 response");
 });
 
 test("safety intake is idempotent and its effective stop is monotonic across all rows", async (t) => {
@@ -410,12 +446,17 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   assert.equal(negative.response.status, 201);
   assert.deepEqual(negative.body, {
     safetyIntake: {
+      notice: MEMBER_SAFETY_NOTICE,
       noticeVersion,
       status: "screen_complete",
       safetyStop: false,
+      readiness: { status: "COACHING_UNAVAILABLE", nextAction: "CHECK_BACK_LATER" },
+      activationPermitted: false,
+      externalCallsPermitted: false,
     },
     idempotentReplay: false,
   });
+  assertPrivacyMinimized(negative.body, "screen-complete POST response");
 
   const reorderedReplay = {
     answers: {
@@ -437,6 +478,7 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   assert.equal(replay.response.status, 200);
   assert.equal(replay.body.idempotentReplay, true);
   assert.equal(replay.body.safetyIntake.status, "screen_complete");
+  assertPrivacyMinimized(replay.body, "idempotent POST response");
 
   const conflict = await memberRequest(
     running,
@@ -466,6 +508,7 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   assert.equal(positive.response.status, 201);
   assert.equal(positive.body.safetyIntake.status, "handoff_required");
   assert.equal(positive.body.safetyIntake.safetyStop, true);
+  assertPrivacyMinimized(positive.body, "handoff POST response");
 
   const laterNegative = await memberRequest(
     running,
@@ -476,6 +519,7 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   assert.equal(laterNegative.response.status, 201);
   assert.equal(laterNegative.body.safetyIntake.status, "handoff_required");
   assert.equal(laterNegative.body.safetyIntake.safetyStop, true);
+  assertPrivacyMinimized(laterNegative.body, "monotonic-handoff POST response");
 
   const replayAfterStop = await memberRequest(
     running,
@@ -486,6 +530,7 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   assert.equal(replayAfterStop.response.status, 200);
   assert.equal(replayAfterStop.body.idempotentReplay, true);
   assert.equal(replayAfterStop.body.safetyIntake.status, "handoff_required");
+  assertPrivacyMinimized(replayAfterStop.body, "handoff replay POST response");
 
   const effective = await memberRequest(
     running,
@@ -494,9 +539,17 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   );
   assert.deepEqual(effective.body, {
     safetyIntake: {
+      notice: MEMBER_SAFETY_NOTICE,
       noticeVersion,
       status: "handoff_required",
       safetyStop: true,
+      readiness: {
+        status: "SAFETY_HANDOFF_REQUIRED",
+        nextAction: "SAFETY_HANDOFF_REQUIRED",
+        message: "Goals Coach cannot continue. No person has been notified; seek appropriate medical guidance before exercise.",
+      },
+      activationPermitted: false,
+      externalCallsPermitted: false,
     },
   });
   assert.doesNotMatch(
@@ -530,7 +583,7 @@ test("safety intake is idempotent and its effective stop is monotonic across all
     ]
   );
   assert.deepEqual(await protectedTableCounts(disposable.pool), protectedBefore);
-  assert.equal(providerCalls(), 0);
+  assert.equal(providerCalls() > 0, true);
 });
 
 test("every individual positive answer records a fixed handoff-required safety stop", async (t) => {
@@ -591,6 +644,7 @@ test("safety intake uses bounded JSON, fixed parser errors, and mutation rate li
   );
   assert.equal(limited.response.status, 429);
   assert.equal(limited.body.error, "RATE_LIMITED");
+  assertPrivacyMinimized(limited.body, "429 response");
   assert.equal(mutationLimitCalls, 1);
 
   const malformed = await fetch(
@@ -606,10 +660,12 @@ test("safety intake uses bounded JSON, fixed parser errors, and mutation rate li
     }
   );
   assert.equal(malformed.status, 400);
-  assert.deepEqual(await malformed.json(), {
+  const malformedBody = await malformed.json();
+  assert.deepEqual(malformedBody, {
     error: "SAFETY_INTAKE_INVALID",
     message: "Invalid safety intake request.",
   });
+  assertPrivacyMinimized(malformedBody, "malformed 400 response");
   assert.equal(malformed.headers.get("cache-control"), "no-store");
 
   const oversized = await fetch(
@@ -628,9 +684,148 @@ test("safety intake uses bounded JSON, fixed parser errors, and mutation rate li
     }
   );
   assert.equal(oversized.status, 413);
-  assert.deepEqual(await oversized.json(), {
+  const oversizedBody = await oversized.json();
+  assert.deepEqual(oversizedBody, {
     error: "SAFETY_INTAKE_BODY_TOO_LARGE",
     message: "The safety intake request is too large.",
   });
+  assertPrivacyMinimized(oversizedBody, "413 response");
   assert.equal(oversized.headers.get("cache-control"), "no-store");
+});
+
+test("safety intake OPTIONS is exact-origin credentialed and isolated to its exact route", async (t) => {
+  const { running } = await fixture(t);
+  const preflight = await fetch(`${running.url}/goalscoach/member/safety-intake`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: origin,
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "Content-Type",
+    },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+  assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
+  const unrelated = await fetch(`${running.url}/goalscoach/member/unrelated`, {
+    method: "OPTIONS",
+    headers: { Origin: origin, "Access-Control-Request-Method": "POST" },
+  });
+  assert.equal(unrelated.status, 404);
+  assert.equal(unrelated.headers.get("access-control-allow-origin"), null);
+});
+
+test("authenticated Gatekeeper dependency failure returns only the minimized 503", async (t) => {
+  const { running } = await fixture(t, {
+    fetchImpl: async () => { throw new Error("synthetic dependency failure"); },
+  });
+  const result = await memberRequest(running, "/safety-intake", "gymmaster:30001");
+  assert.equal(result.response.status, 503);
+  assert.deepEqual(result.body, {
+    error: "MEMBER_ACCESS_TEMPORARILY_UNAVAILABLE",
+    message: "We can’t verify your access right now. Please try again later.",
+    nextAction: "TRY_AGAIN_LATER",
+  });
+  assertPrivacyMinimized(result.body, "503 response");
+});
+
+test("current inactive Gatekeeper membership conceals both safety-intake read and submission", async (t) => {
+  let gatekeeperCalls = 0;
+  const { disposable, first, running } = await fixture(t, {
+    fetchImpl: async (url) => {
+      gatekeeperCalls += 1;
+      const memberId = Number(new URL(url).searchParams.get("memberid"));
+      return {
+        ok: true,
+        json: async () => ({ members: [{
+          memberid: memberId,
+          stopatgate: true,
+          membership: [{ expired: false }],
+        }] }),
+      };
+    },
+  });
+  const read = await memberRequest(running, "/safety-intake", "gymmaster:30001");
+  const write = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
+    method: "POST",
+    body: submission(70, { currentInjuryConcern: true }),
+  });
+  for (const [label, response] of [["inactive GET", read], ["inactive POST", write]]) {
+    assert.equal(response.response.status, 401, label);
+    assert.deepEqual(response.body, { error: "MEMBER_AUTHENTICATION_REQUIRED" }, label);
+    assertPrivacyMinimized(response.body, label);
+  }
+  assert.equal(gatekeeperCalls, 2);
+  const stored = await disposable.pool.query(
+    "SELECT COUNT(*)::int AS count FROM goals_coach_member_safety_intake_submissions WHERE member_id = $1",
+    [first.member.id]
+  );
+  assert.equal(stored.rows[0].count, 0);
+});
+
+test("production mutation limiter is session scoped and precedes mapping and Gatekeeper work", async (t) => {
+  const {
+    databaseCalls,
+    providerCalls,
+    running,
+  } = await fixture(t, { useProductionRateLimits: true });
+
+  for (let index = 0; index < 12; index += 1) {
+    const invalidSession = await jsonRequest(
+      running.url,
+      "/goalscoach/member/safety-intake",
+      { method: "POST", headers: { Origin: origin }, body: submission(100 + index) }
+    );
+    assert.equal(invalidSession.response.status, 401);
+  }
+
+  for (let index = 0; index < 10; index += 1) {
+    const allowed = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
+      method: "POST",
+      body: submission(200 + index),
+    });
+    assert.equal(allowed.response.status, 201, `member one request ${index + 1}`);
+  }
+  const callsAtLimit = {
+    database: databaseCalls(),
+    provider: providerCalls(),
+  };
+  const limited = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
+    method: "POST",
+    body: submission(210),
+  });
+  assert.equal(limited.response.status, 429);
+  assert.deepEqual(limited.body, { error: "RATE_LIMITED" });
+  assertPrivacyMinimized(limited.body, "production 429 response");
+  assert.deepEqual(
+    { database: databaseCalls(), provider: providerCalls() },
+    callsAtLimit,
+    "limited request must stop before local mapping, transaction, and Gatekeeper work"
+  );
+
+  const otherMember = await memberRequest(running, "/safety-intake", "gymmaster:30002", {
+    method: "POST",
+    body: submission(211),
+  });
+  assert.equal(otherMember.response.status, 201);
+  assert.equal(otherMember.body.safetyIntake.status, "screen_complete");
+  assertPrivacyMinimized(otherMember.body, "other-member POST response");
+  assert.equal(providerCalls(), callsAtLimit.provider + 1);
+  assert.equal(databaseCalls() > callsAtLimit.database, true);
+
+  const callsAfterOtherMember = {
+    database: databaseCalls(),
+    provider: providerCalls(),
+  };
+  const stillLimited = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
+    method: "POST",
+    body: submission(212),
+  });
+  assert.equal(stillLimited.response.status, 429);
+  assert.deepEqual(stillLimited.body, { error: "RATE_LIMITED" });
+  assertPrivacyMinimized(stillLimited.body, "still-limited production 429 response");
+  assert.deepEqual(
+    { database: databaseCalls(), provider: providerCalls() },
+    callsAfterOtherMember,
+    "another member's request must not reset the exhausted member quota"
+  );
 });
