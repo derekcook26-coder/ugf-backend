@@ -55,56 +55,53 @@ function createGymMasterMemberPortalClient(options = {}) {
         email: request.email,
         password: request.password,
       });
-      let response;
-      if (timeoutMs === undefined) {
+      async function requestAndConsume(signal) {
+        let response;
         try {
           response = await fetchImpl(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body,
             redirect: "error",
+            ...(signal ? { signal } : {}),
           });
         } catch (_) {
           throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
         }
-      } else {
-      const controller = new AbortController();
-      let timeout;
-      try {
-        const timedOut = new Promise((_, reject) => {
-          timeout = setTimeout(() => {
-            controller.abort();
-            reject(memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request));
-          }, timeoutMs);
-        });
-        response = await Promise.race([
-          fetchImpl(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body,
-            redirect: "error",
-            signal: controller.signal,
-          }),
-          timedOut,
-        ]);
-      } catch (_) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
-      } finally {
-        clearTimeout(timeout);
-      }
-      }
-      if (!response || response.status !== 200) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
-      }
-      if (typeof response.json !== "function") {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+        if (!response || response.status !== 200) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
+        }
+        if (typeof response.json !== "function") {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+        }
+
+        try {
+          return await response.json();
+        } catch (_) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+        }
       }
 
       let parsed;
-      try {
-        parsed = await response.json();
-      } catch (_) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+      if (timeoutMs === undefined) {
+        parsed = await requestAndConsume();
+      } else {
+        const controller = new AbortController();
+        let timeout;
+        try {
+          const timedOut = new Promise((_, reject) => {
+            timeout = setTimeout(() => {
+              controller.abort();
+              reject(memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request));
+            }, timeoutMs);
+          });
+          parsed = await Promise.race([
+            requestAndConsume(controller.signal),
+            timedOut,
+          ]);
+        } finally {
+          clearTimeout(timeout);
+        }
       }
       if (providerDeclaredFailure(parsed)) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.provider);

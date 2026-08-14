@@ -76,3 +76,27 @@ test("GymMaster client classifies only fixed request, status, provider, and enve
     );
   }
 });
+
+test("GymMaster client timeout remains active while consuming the response body", async () => {
+  let aborted = false;
+  const client = createGymMasterMemberPortalClient({
+    endpoint: ENDPOINT,
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => ({
+      status: 200,
+      json: async () => new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("synthetic stalled body abort"));
+        });
+      }),
+    }),
+  });
+
+  await assert.rejects(
+    () => client.login({ memberApiKey: "key", email: "member@example.com", password: "member-password" }),
+    (error) => error.message === "GymMaster member login failed"
+      && error.memberPortalFailureStage === "member_portal_request_failure"
+  );
+  assert.equal(aborted, true);
+});

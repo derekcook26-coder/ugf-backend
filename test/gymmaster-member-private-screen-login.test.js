@@ -3,6 +3,8 @@
 const assert = require("node:assert/strict");
 const express = require("express");
 const test = require("node:test");
+const { goalsCoachErrorHandler } = require("../src/goals-coach/http-error-handler");
+const { createApplicationJsonParser } = require("../src/goals-coach/transcription-route");
 const { createGymMasterMemberLoginRateLimiter } = require("../src/goals-coach/gymmaster-member-login-rate-limit");
 const {
   MEMBER_PRIVATE_SCREEN_LOGIN_ENABLE_FLAG,
@@ -67,12 +69,34 @@ function dependencies(overrides = {}) {
 
 async function runningLogin(startup, t) {
   const app = express();
-  app.use(express.json());
+  app.use(createApplicationJsonParser());
   composeGymMasterMemberPrivateScreenLoginRoute(app, startup);
+  app.use(goalsCoachErrorHandler);
   const running = await startApp(app);
   t.after(() => running.close());
   return running;
 }
+
+test("invalid and oversized JSON use the concealed login failure contract", async (t) => {
+  const deps = dependencies();
+  const startup = createGymMasterMemberPrivateScreenLoginStartup({
+    environment: environment(), db: deps.db, fetchImpl: deps.fetchImpl,
+  });
+  const running = await runningLogin(startup, t);
+
+  for (const body of ["{", `{"padding":"${"x".repeat(1024 * 101)}"}`]) {
+    const response = await fetch(`${running.url}${MEMBER_PRIVATE_SCREEN_LOGIN_PATH}`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body,
+    });
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: "MEMBER_LOGIN_FAILED" });
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  }
+  assert.deepEqual(deps.calls, { db: 0, portal: 0, gatekeeper: 0 });
+});
 
 test("private-screen login is absent by default, parses only exact true, and performs no startup work", async (t) => {
   assert.equal(memberPrivateScreenLoginEnabled("true"), true);
