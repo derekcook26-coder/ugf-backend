@@ -35,6 +35,8 @@ var { composeGymMasterMemberEditableWorkoutSessionsRoutes } = require("./src/goa
 var { createGymMasterMemberPendingEnrollmentStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-startup");
 var { createGymMasterMemberPendingEnrollmentLoginStartup } = require("./src/goals-coach/gymmaster-member-pending-enrollment-login-startup");
 var { composeGymMasterMemberPendingEnrollmentLoginRoute } = require("./src/goals-coach/gymmaster-member-pending-enrollment-login-route-composition");
+var { createGymMasterMemberPrivateScreenStartup } = require("./src/goals-coach/gymmaster-member-private-screen-startup");
+var { composeGymMasterMemberPrivateScreenRoute } = require("./src/goals-coach/gymmaster-member-private-screen-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -109,6 +111,15 @@ var db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// The member private shell is separately gated and performs no work at startup.
+// It revalidates the signed session, local mapping, and Gatekeeper membership
+// on every request and does not mount any other Goals Coach capability.
+var memberPrivateScreenStartup = createGymMasterMemberPrivateScreenStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterMemberPrivateScreenRoute(app, memberPrivateScreenStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider

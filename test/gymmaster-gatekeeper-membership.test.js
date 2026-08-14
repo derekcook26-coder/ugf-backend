@@ -5,6 +5,8 @@ const test = require("node:test");
 const {
   createGymMasterGatekeeperMembershipVerifier,
   createGymMasterMemberAccessAuthorizer,
+  memberAccessFailureStage,
+  memberAccessDependencyUnavailable,
   membershipIsActive,
 } = require("../src/goals-coach/gymmaster-gatekeeper-membership");
 
@@ -32,8 +34,41 @@ test("Gatekeeper verifier requests only the exact member ID using server-side ba
   assert.equal(called.url, `${ENDPOINT}?memberid=10482`);
   assert.equal(called.options.method, "GET");
   assert.equal(called.options.redirect, "error");
+  assert.equal(called.options.signal instanceof AbortSignal, true);
   assert.equal(called.options.headers.Accept, "application/json");
   assert.equal(called.options.headers.Authorization, `Basic ${Buffer.from("ugf:gatekeeper-key").toString("base64")}`);
+});
+
+test("Gatekeeper verifier aborts and rejects a request that exceeds its timeout", async () => {
+  let signal;
+  const verifier = createGymMasterGatekeeperMembershipVerifier({
+    endpoint: ENDPOINT,
+    site: "ugf",
+    apiKey: "gatekeeper-key",
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(verifier.verifyActiveMember("10482"), /timed out/);
+  assert.equal(signal.aborted, true);
+});
+
+test("Gatekeeper verifier also bounds an incomplete response body", async () => {
+  let signal;
+  const verifier = createGymMasterGatekeeperMembershipVerifier({
+    endpoint: ENDPOINT,
+    site: "ugf",
+    apiKey: "gatekeeper-key",
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return { ok: true, json: async () => new Promise(() => {}) };
+    },
+  });
+  await assert.rejects(verifier.verifyActiveMember("10482"), /timed out/);
+  assert.equal(signal.aborted, true);
 });
 
 test("unmatched and inactive Gatekeeper members are denied", async () => {
@@ -66,4 +101,22 @@ test("access authorizer requires both the local mapping and active Gatekeeper re
     await access.authorizeIdentity({ authProvider: "gymmaster", authSubject: "gymmaster:10482" }),
     { active: true, mappingId: "9", memberId: "10482" }
   );
+});
+
+test("access authorizer keeps denial distinct from dependency unavailability", async () => {
+  const denied = createGymMasterMemberAccessAuthorizer({
+    mappingAuthorizer: { authorizeIdentity: async () => ({ active: false }) },
+    membershipVerifier: { verifyActiveMember: async () => ({ active: true }) },
+  });
+  const deniedResult = await denied.authorizeIdentity({});
+  assert.equal(memberAccessFailureStage(deniedResult), "local_mapping");
+  assert.equal(memberAccessDependencyUnavailable(deniedResult), false);
+
+  const unavailable = createGymMasterMemberAccessAuthorizer({
+    mappingAuthorizer: { authorizeIdentity: async () => { throw new Error("synthetic failure"); } },
+    membershipVerifier: { verifyActiveMember: async () => ({ active: true }) },
+  });
+  const unavailableResult = await unavailable.authorizeIdentity({});
+  assert.equal(memberAccessFailureStage(unavailableResult), "local_mapping");
+  assert.equal(memberAccessDependencyUnavailable(unavailableResult), true);
 });

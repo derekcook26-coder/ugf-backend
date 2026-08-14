@@ -60,6 +60,12 @@ test("owner-only GymMaster login is conditionally composed and cannot replace ex
   assert.equal(serverSource.includes('app.use("/goalscoach"'), false);
 });
 
+test("member private screen is separately composed without replacing the existing session route", () => {
+  assert.match(serverSource, /createGymMasterMemberPrivateScreenStartup\(\{\s*db: db,\s*fetchImpl: fetch,\s*\}\)/);
+  assert.match(serverSource, /composeGymMasterMemberPrivateScreenRoute\(app, memberPrivateScreenStartup\)/);
+  assert.equal(serverSource.includes('app.get("/goalscoach/member/session"'), false);
+});
+
 test("Phase 2 uses no required Clerk audience variable", () => {
   const authSource = fs.readFileSync(
     path.join(projectRoot, "src", "auth", "clerk-staff-auth.js"),

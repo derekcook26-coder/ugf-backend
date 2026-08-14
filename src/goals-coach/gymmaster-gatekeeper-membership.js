@@ -1,16 +1,23 @@
 "use strict";
 
 const GATEKEEPER_MEMBERS_PATH = "/gatekeeper_api/v2/members";
+const DEFAULT_GATEKEEPER_TIMEOUT_MS = 5000;
 const memberAccessFailureStages = new WeakMap();
+const memberAccessDependencyFailures = new WeakSet();
 
-function inactiveMemberAccess(stage) {
+function inactiveMemberAccess(stage, dependencyUnavailable = false) {
   const result = Object.freeze({ active: false });
-  memberAccessFailureStages.set(result, stage);
+  if (stage) memberAccessFailureStages.set(result, stage);
+  if (dependencyUnavailable) memberAccessDependencyFailures.add(result);
   return result;
 }
 
 function memberAccessFailureStage(result) {
   return result && memberAccessFailureStages.get(result) || null;
+}
+
+function memberAccessDependencyUnavailable(result) {
+  return Boolean(result && memberAccessDependencyFailures.has(result));
 }
 
 function validMemberId(value) {
@@ -55,6 +62,10 @@ function createGymMasterGatekeeperMembershipVerifier(options = {}) {
     : null;
   const apiKey = typeof options.apiKey === "string" && options.apiKey.length > 0 ? options.apiKey : null;
   const fetchImpl = typeof options.fetchImpl === "function" ? options.fetchImpl : null;
+  const timeoutMs = options.timeoutMs === undefined ? DEFAULT_GATEKEEPER_TIMEOUT_MS : options.timeoutMs;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("GymMaster Gatekeeper timeout must be a positive integer");
+  }
   if (!site || !apiKey || !fetchImpl) {
     throw new Error("GymMaster Gatekeeper verifier requires site, server-side key, and injected fetch");
   }
@@ -65,18 +76,39 @@ function createGymMasterGatekeeperMembershipVerifier(options = {}) {
       const requestUrl = new URL(endpoint);
       requestUrl.searchParams.set("memberid", String(memberId));
       const basicCredential = Buffer.from(`${site}:${apiKey}`).toString("base64");
-      const response = await fetchImpl(requestUrl.toString(), {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Basic ${basicCredential}`,
-        },
-        redirect: "error",
+      const controller = new AbortController();
+      let timeout;
+      const timedOut = new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error("GymMaster Gatekeeper membership lookup timed out"));
+        }, timeoutMs);
       });
-      if (!response || !response.ok || typeof response.json !== "function") {
-        throw new Error("GymMaster Gatekeeper membership lookup failed");
+      let data;
+      try {
+        const request = (async () => {
+          const response = await fetchImpl(requestUrl.toString(), {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              Authorization: `Basic ${basicCredential}`,
+            },
+            redirect: "error",
+            signal: controller.signal,
+          });
+          if (!response || !response.ok || typeof response.json !== "function") {
+            throw new Error("GymMaster Gatekeeper membership lookup failed");
+          }
+          return response.json();
+        })();
+        data = await Promise.race([
+          request,
+          timedOut,
+        ]);
+      } finally {
+        clearTimeout(timeout);
       }
-      const member = matchingMember(await response.json(), String(memberId));
+      const member = matchingMember(data, String(memberId));
       return Object.freeze({ active: membershipIsActive(member) });
     },
   });
@@ -98,7 +130,7 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
       try {
         mapping = await mappingAuthorizer.authorizeIdentity(identity);
       } catch (_) {
-        return inactiveMemberAccess("local_mapping");
+        return inactiveMemberAccess("local_mapping", true);
       }
       if (!mapping || mapping.active !== true) {
         return inactiveMemberAccess("local_mapping");
@@ -108,7 +140,7 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
       try {
         membership = await membershipVerifier.verifyActiveMember(subjectMemberId);
       } catch (_) {
-        return inactiveMemberAccess("gatekeeper");
+        return inactiveMemberAccess("gatekeeper", true);
       }
       if (!membership || membership.active !== true) {
         return inactiveMemberAccess("gatekeeper");
@@ -119,12 +151,14 @@ function createGymMasterMemberAccessAuthorizer(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_GATEKEEPER_TIMEOUT_MS,
   GATEKEEPER_MEMBERS_PATH,
   createGymMasterGatekeeperMembershipVerifier,
   createGymMasterMemberAccessAuthorizer,
   exactGatekeeperMembersEndpoint,
   matchingMember,
   memberAccessFailureStage,
+  memberAccessDependencyUnavailable,
   membershipIsActive,
   validMemberId,
 };
