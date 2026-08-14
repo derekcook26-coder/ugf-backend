@@ -70,6 +70,9 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
     site,
     apiKey,
     fetchImpl: options.fetchImpl,
+    ...(options.gatekeeperTimeoutMs === undefined
+      ? {}
+      : { timeoutMs: options.gatekeeperTimeoutMs }),
   });
   const accessAuthorizer = createGymMasterMemberAccessAuthorizer({
     mappingAuthorizer,
@@ -82,6 +85,7 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
     handlers: Object.freeze(createGymMasterMemberPrivateScreenHandler({
       authenticateSession,
       authorizeIdentity: accessAuthorizer.authorizeIdentity,
+      ...(options.rateLimiter ? { rateLimiter: options.rateLimiter } : {}),
     })),
     origin,
   });

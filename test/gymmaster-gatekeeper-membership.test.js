@@ -34,8 +34,41 @@ test("Gatekeeper verifier requests only the exact member ID using server-side ba
   assert.equal(called.url, `${ENDPOINT}?memberid=10482`);
   assert.equal(called.options.method, "GET");
   assert.equal(called.options.redirect, "error");
+  assert.equal(called.options.signal instanceof AbortSignal, true);
   assert.equal(called.options.headers.Accept, "application/json");
   assert.equal(called.options.headers.Authorization, `Basic ${Buffer.from("ugf:gatekeeper-key").toString("base64")}`);
+});
+
+test("Gatekeeper verifier aborts and rejects a request that exceeds its timeout", async () => {
+  let signal;
+  const verifier = createGymMasterGatekeeperMembershipVerifier({
+    endpoint: ENDPOINT,
+    site: "ugf",
+    apiKey: "gatekeeper-key",
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(verifier.verifyActiveMember("10482"), /timed out/);
+  assert.equal(signal.aborted, true);
+});
+
+test("Gatekeeper verifier also bounds an incomplete response body", async () => {
+  let signal;
+  const verifier = createGymMasterGatekeeperMembershipVerifier({
+    endpoint: ENDPOINT,
+    site: "ugf",
+    apiKey: "gatekeeper-key",
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return { ok: true, json: async () => new Promise(() => {}) };
+    },
+  });
+  await assert.rejects(verifier.verifyActiveMember("10482"), /timed out/);
+  assert.equal(signal.aborted, true);
 });
 
 test("unmatched and inactive Gatekeeper members are denied", async () => {

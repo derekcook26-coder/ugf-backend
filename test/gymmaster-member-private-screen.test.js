@@ -8,6 +8,7 @@ const {
   PRIVATE_SCREEN_BODY,
   UNAUTHORIZED_BODY,
   UNAVAILABLE_BODY,
+  createPrivateScreenRateLimit,
 } = require("../src/goals-coach/gymmaster-member-private-screen");
 const {
   composeGymMasterMemberPrivateScreenRoute,
@@ -75,6 +76,8 @@ function readyOptions(overrides = {}) {
   };
 }
 
+const passRateLimit = (_req, _res, next) => next();
+
 async function appFor(options) {
   const app = express();
   const startup = createGymMasterMemberPrivateScreenStartup(options);
@@ -139,6 +142,72 @@ test("active mapped member receives the exact private shell with protected crede
   assert.deepEqual(Object.keys(result.body), [
     "status", "message", "nextAction", "activationPermitted", "externalCallsPermitted",
   ]);
+});
+
+test("credentialed OPTIONS preflight receives the same exact-origin CORS policy", async (t) => {
+  const { app } = await appFor(readyOptions());
+  const running = await startApp(app);
+  t.after(() => running.close());
+  const response = await fetch(`${running.url}/goalscoach/member/private-screen`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: origin,
+      "Access-Control-Request-Method": "GET",
+      "Access-Control-Request-Headers": "Content-Type",
+    },
+  });
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("access-control-allow-origin"), origin);
+  assert.equal(response.headers.get("access-control-allow-credentials"), "true");
+  assert.equal(response.headers.get("access-control-allow-methods"), "GET");
+  assert.equal(response.headers.get("access-control-allow-headers"), "Content-Type");
+});
+
+test("rate limiting is concealed and occurs before database and Gatekeeper revalidation", async (t) => {
+  let databaseCalls = 0;
+  let providerCalls = 0;
+  const options = readyOptions({
+    db: { query: async () => { databaseCalls += 1; return { rows: [{ mapping_id: 9, member_id: 10482 }] }; } },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      return { ok: true, json: async () => ({ members: [{ memberid: 10482, membership: [{ expired: false }] }] }) };
+    },
+    rateLimiter: createPrivateScreenRateLimit({ max: 1 }),
+  });
+  const { app } = await appFor(options);
+  const running = await startApp(app);
+  t.after(() => running.close());
+  const request = () => jsonRequest(running.url, "/goalscoach/member/private-screen", {
+    headers: { Origin: origin, Cookie: cookie() },
+  });
+  assert.equal((await request()).response.status, 200);
+  const limited = await request();
+  assert.equal(limited.response.status, 401);
+  assert.deepEqual(limited.body, UNAUTHORIZED_BODY);
+  assertPrivateHeaders(limited.response);
+  assert.equal(databaseCalls, 1);
+  assert.equal(providerCalls, 1);
+});
+
+test("Gatekeeper timeout is cancelled and returned as a minimized 503", async (t) => {
+  let signal;
+  const { app } = await appFor(readyOptions({
+    gatekeeperTimeoutMs: 10,
+    rateLimiter: passRateLimit,
+    fetchImpl: async (_url, request) => {
+      signal = request.signal;
+      return new Promise(() => {});
+    },
+  }));
+  const running = await startApp(app);
+  t.after(() => running.close());
+  const result = await jsonRequest(running.url, "/goalscoach/member/private-screen", {
+    headers: { Origin: origin, Cookie: cookie() },
+  });
+  assert.equal(result.response.status, 503);
+  assert.deepEqual(result.body, UNAVAILABLE_BODY);
+  assert.equal(signal.aborted, true);
+  assertPrivateHeaders(result.response);
 });
 
 test("invalid sessions are concealed uniformly and dependencies are not called before authentication", async (t) => {

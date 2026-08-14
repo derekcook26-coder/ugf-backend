@@ -28,7 +28,7 @@ function createPrivateScreenOriginGuard(origin) {
 }
 
 function composeGymMasterMemberPrivateScreenRoute(app, startup) {
-  if (!app || typeof app.get !== "function") {
+  if (!app || typeof app.get !== "function" || typeof app.options !== "function") {
     throw new Error("Member private screen composition requires an Express application");
   }
   if (
@@ -39,6 +39,7 @@ function composeGymMasterMemberPrivateScreenRoute(app, startup) {
     || !exactHttpsOrigin(startup.origin)
   ) return Object.freeze({ mounted: false, path: null });
   const path = "/goalscoach/member/private-screen";
+  app.options(path, createPrivateScreenCors(startup.origin));
   app.get(
     path,
     createPrivateScreenCors(startup.origin),

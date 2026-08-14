@@ -1,5 +1,6 @@
 "use strict";
 
+const rateLimit = require("express-rate-limit");
 const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-membership");
 
 const PRIVATE_SCREEN_BODY = Object.freeze({
@@ -16,6 +17,17 @@ const UNAVAILABLE_BODY = Object.freeze({
   nextAction: "TRY_AGAIN_LATER",
 });
 
+function createPrivateScreenRateLimit(options = {}) {
+  return rateLimit({
+    windowMs: options.windowMs || 15 * 60 * 1000,
+    max: options.max || 120,
+    standardHeaders: false,
+    legacyHeaders: false,
+    keyGenerator: (req) => `member:${String(req.alphaMemberIdentity.authSubject)}`,
+    handler: (_req, res) => res.status(401).json(UNAUTHORIZED_BODY),
+  });
+}
+
 function privateResponseHeaders(_req, res, next) {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -25,6 +37,7 @@ function privateResponseHeaders(_req, res, next) {
 function createGymMasterMemberPrivateScreenHandler(options = {}) {
   const authenticateSession = options.authenticateSession;
   const authorizeIdentity = options.authorizeIdentity;
+  const rateLimiter = options.rateLimiter || createPrivateScreenRateLimit();
   if (typeof authenticateSession !== "function" || typeof authorizeIdentity !== "function") {
     throw new Error("Member private screen requires session and access authorization");
   }
@@ -42,13 +55,18 @@ function createGymMasterMemberPrivateScreenHandler(options = {}) {
     );
   }
 
-  return [privateResponseHeaders, authenticateSession, authorize];
+  if (typeof rateLimiter !== "function") {
+    throw new Error("Member private screen requires a rate limiter");
+  }
+
+  return [privateResponseHeaders, authenticateSession, rateLimiter, authorize];
 }
 
 module.exports = {
   PRIVATE_SCREEN_BODY,
   UNAUTHORIZED_BODY,
   UNAVAILABLE_BODY,
+  createPrivateScreenRateLimit,
   createGymMasterMemberPrivateScreenHandler,
   privateResponseHeaders,
 };
