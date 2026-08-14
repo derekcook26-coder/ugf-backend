@@ -42,7 +42,11 @@ function validatedLoginEndpoint(value) {
 function createGymMasterMemberPortalClient(options = {}) {
   const endpoint = validatedLoginEndpoint(options.endpoint);
   const fetchImpl = typeof options.fetchImpl === "function" ? options.fetchImpl : null;
+  const timeoutMs = options.timeoutMs;
   if (!fetchImpl) throw new Error("GymMaster login client requires an injected fetch implementation");
+  if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error("GymMaster login timeout must be a positive integer");
+  }
 
   return Object.freeze({
     async login(request) {
@@ -52,15 +56,42 @@ function createGymMasterMemberPortalClient(options = {}) {
         password: request.password,
       });
       let response;
+      if (timeoutMs === undefined) {
+        try {
+          response = await fetchImpl(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body,
+            redirect: "error",
+          });
+        } catch (_) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
+        }
+      } else {
+      const controller = new AbortController();
+      let timeout;
       try {
-        response = await fetchImpl(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body,
-          redirect: "error",
+        const timedOut = new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort();
+            reject(memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request));
+          }, timeoutMs);
         });
+        response = await Promise.race([
+          fetchImpl(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body,
+            redirect: "error",
+            signal: controller.signal,
+          }),
+          timedOut,
+        ]);
       } catch (_) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
+      } finally {
+        clearTimeout(timeout);
+      }
       }
       if (!response || response.status !== 200) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);

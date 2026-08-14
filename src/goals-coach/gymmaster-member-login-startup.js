@@ -80,6 +80,9 @@ function createGymMasterMemberLoginStartup(options = {}) {
   const portalClient = createGymMasterMemberPortalClient({
     endpoint: environment.GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL,
     fetchImpl: options.fetchImpl,
+    ...(options.memberPortalTimeoutMs === undefined
+      ? {}
+      : { timeoutMs: options.memberPortalTimeoutMs }),
   });
   const loginService = createGymMasterMemberLoginService({
     enabled: true,
@@ -95,6 +98,9 @@ function createGymMasterMemberLoginStartup(options = {}) {
     site: environment.GYMMASTER_SITE,
     apiKey: environment.GYMMASTER_API_KEY,
     fetchImpl: options.fetchImpl,
+    ...(options.gatekeeperTimeoutMs === undefined
+      ? {}
+      : { timeoutMs: options.gatekeeperTimeoutMs }),
   });
   const accessAuthorizer = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer, membershipVerifier });
   const sessionService = createGymMasterMemberSessionService({
