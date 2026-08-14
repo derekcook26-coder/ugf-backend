@@ -38,6 +38,22 @@ function goalsCoachErrorHandler(error, req, res, next) {
     }
   }
 
+  if (req.path === "/goalscoach/member/private-screen/login") {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (
+      error
+      && [
+        "entity.too.large",
+        "entity.parse.failed",
+        "request.aborted",
+        "request.size.invalid",
+      ].includes(error.type)
+    ) {
+      return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
+    }
+  }
+
   if (req.path === "/staff/member-pending-enrollments") {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");

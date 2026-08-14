@@ -42,7 +42,11 @@ function validatedLoginEndpoint(value) {
 function createGymMasterMemberPortalClient(options = {}) {
   const endpoint = validatedLoginEndpoint(options.endpoint);
   const fetchImpl = typeof options.fetchImpl === "function" ? options.fetchImpl : null;
+  const timeoutMs = options.timeoutMs;
   if (!fetchImpl) throw new Error("GymMaster login client requires an injected fetch implementation");
+  if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error("GymMaster login timeout must be a positive integer");
+  }
 
   return Object.freeze({
     async login(request) {
@@ -51,29 +55,53 @@ function createGymMasterMemberPortalClient(options = {}) {
         email: request.email,
         password: request.password,
       });
-      let response;
-      try {
-        response = await fetchImpl(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body,
-          redirect: "error",
-        });
-      } catch (_) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
-      }
-      if (!response || response.status !== 200) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
-      }
-      if (typeof response.json !== "function") {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+      async function requestAndConsume(signal) {
+        let response;
+        try {
+          response = await fetchImpl(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body,
+            redirect: "error",
+            ...(signal ? { signal } : {}),
+          });
+        } catch (_) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request);
+        }
+        if (!response || response.status !== 200) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.nonSuccessResponse);
+        }
+        if (typeof response.json !== "function") {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+        }
+
+        try {
+          return await response.json();
+        } catch (_) {
+          throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+        }
       }
 
       let parsed;
-      try {
-        parsed = await response.json();
-      } catch (_) {
-        throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.invalidEnvelopeResult);
+      if (timeoutMs === undefined) {
+        parsed = await requestAndConsume();
+      } else {
+        const controller = new AbortController();
+        let timeout;
+        try {
+          const timedOut = new Promise((_, reject) => {
+            timeout = setTimeout(() => {
+              controller.abort();
+              reject(memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.request));
+            }, timeoutMs);
+          });
+          parsed = await Promise.race([
+            requestAndConsume(controller.signal),
+            timedOut,
+          ]);
+        } finally {
+          clearTimeout(timeout);
+        }
       }
       if (providerDeclaredFailure(parsed)) {
         throw memberPortalFailure(MEMBER_PORTAL_FAILURE_STAGES.provider);

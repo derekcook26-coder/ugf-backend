@@ -37,6 +37,8 @@ var { createGymMasterMemberPendingEnrollmentLoginStartup } = require("./src/goal
 var { composeGymMasterMemberPendingEnrollmentLoginRoute } = require("./src/goals-coach/gymmaster-member-pending-enrollment-login-route-composition");
 var { createGymMasterMemberPrivateScreenStartup } = require("./src/goals-coach/gymmaster-member-private-screen-startup");
 var { composeGymMasterMemberPrivateScreenRoute } = require("./src/goals-coach/gymmaster-member-private-screen-route-composition");
+var { createGymMasterMemberPrivateScreenLoginStartup } = require("./src/goals-coach/gymmaster-member-private-screen-login-startup");
+var { composeGymMasterMemberPrivateScreenLoginRoute } = require("./src/goals-coach/gymmaster-member-private-screen-login-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -120,6 +122,14 @@ var memberPrivateScreenStartup = createGymMasterMemberPrivateScreenStartup({
   fetchImpl: fetch,
 });
 composeGymMasterMemberPrivateScreenRoute(app, memberPrivateScreenStartup);
+
+// Active mapped members receive a session only through this independently
+// gated boundary. Composition performs no database or provider work.
+var memberPrivateScreenLoginStartup = createGymMasterMemberPrivateScreenLoginStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterMemberPrivateScreenLoginRoute(app, memberPrivateScreenLoginStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider
