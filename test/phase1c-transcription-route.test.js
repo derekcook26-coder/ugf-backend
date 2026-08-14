@@ -830,7 +830,10 @@ test("real PostgreSQL authenticated route preserves scope, concurrency, retry bi
     { type: "failure", failureCategory: "provider_unavailable" },
     { type: "success", text: "Real retry transcript", durationMs: 1600 },
   ] });
-  const retryService = integratedService(disposable.pool, retryAdapter, { now: () => now });
+  const retryService = integratedService(disposable.pool, retryAdapter, {
+    now: () => now,
+    operationTimeoutMs: 2000,
+  });
   const retryRunning = await createIntegratedApp(disposable.pool, fixture, retryService);
   t.after(() => retryRunning.close());
   const retryId = crypto.randomUUID();
