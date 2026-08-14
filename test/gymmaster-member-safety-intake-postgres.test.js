@@ -3,8 +3,10 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
+  MEMBER_SAFETY_NOTICE,
   MEMBER_SAFETY_NOTICE_VERSION,
   parseSafetyIntake,
+  readEffectiveSafetyIntake,
   submitSafetyIntake,
 } = require("../src/goals-coach/gymmaster-member-safety-intake");
 const { runMigration: runPhase1cTranscriptionMigration } = require("../migrate_005");
@@ -169,5 +171,105 @@ test(
       [seeded.member.id]
     );
     assert.equal(effective.rows[0].safety_stop, true);
+  }
+);
+
+test(
+  "PostgreSQL 16 requires the current notice without clearing historical safety stops",
+  { skip: skipForRoot },
+  async (t) => {
+    const disposable = await createRealDisposablePostgres({ phase1b: true });
+    t.after(() => disposable.close());
+    await runPhase1cTranscriptionMigration({ pool: disposable.pool });
+    await runPhase1dSafetyMigration({ pool: disposable.pool });
+    await runOwnerWorkoutTrackingMigration({ pool: disposable.pool });
+    await runOwnerEditableWorkoutSessionsMigration({ pool: disposable.pool });
+    await runMemberSafetyIntakeMigration({ pool: disposable.pool });
+    assert.match((await disposable.pool.query("SHOW server_version")).rows[0].server_version, /^16\./);
+
+    const authorizations = [];
+    for (const [suffix, subject] of [["clear", "39002"], ["stop", "39003"]]) {
+      const seeded = await seedMemberAndPlan(
+        disposable.pool,
+        `member-safety-notice-version-${suffix}`
+      );
+      const mapping = (await disposable.pool.query(
+        `INSERT INTO goals_coach_member_auth_mappings
+          (member_id, auth_provider, auth_subject, verified_email_snapshot, active,
+           provisioning_method, provisioning_reference)
+         VALUES ($1, 'gymmaster', $2, 'notice-version@example.test', TRUE,
+                 'owner_approved_script', 'postgres-16-notice-version-test')
+         RETURNING *`,
+        [seeded.member.id, `gymmaster:${subject}`]
+      )).rows[0];
+      authorizations.push({
+        active: true,
+        mappingId: String(mapping.id),
+        memberId: String(mapping.member_id),
+      });
+    }
+
+    async function insertOld(authorization, number, safetyStop) {
+      await disposable.pool.query(
+        `INSERT INTO goals_coach_member_safety_intake_submissions
+          (auth_mapping_id, member_id, client_request_id, client_request_hash,
+           notice_version, current_pain_or_concerning_symptoms,
+           current_injury_concern, recent_surgery,
+           medical_or_exercise_restriction, other_training_safety_concern,
+           outcome, safety_stop, rule_version)
+         VALUES ($1, $2, $3, $4, 'GC-MEMBER-SAFETY-NOTICE-0',
+                 $5, FALSE, FALSE, FALSE, FALSE, $6, $5,
+                 'GC-MEMBER-SAFETY-INTAKE-1')`,
+        [
+          authorization.mappingId,
+          authorization.memberId,
+          `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
+          (safetyStop ? "d" : "c").repeat(64),
+          safetyStop,
+          safetyStop ? "handoff_required" : "screen_complete",
+        ]
+      );
+    }
+
+    await insertOld(authorizations[0], 9101, false);
+    assert.deepEqual(
+      await readEffectiveSafetyIntake(
+        disposable.pool,
+        authorizations[0].memberId,
+        noticeVersion
+      ),
+      {
+        notice: MEMBER_SAFETY_NOTICE,
+        noticeVersion,
+        status: "not_submitted",
+        safetyStop: null,
+        readiness: { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" },
+        activationPermitted: false,
+        externalCallsPermitted: false,
+      }
+    );
+    const currentClear = await submitSafetyIntake(
+      disposable.pool,
+      authorizations[0],
+      input(9102)
+    );
+    assert.equal(currentClear.safetyIntake.status, "screen_complete");
+    assert.equal(currentClear.safetyIntake.safetyStop, false);
+
+    await insertOld(authorizations[1], 9103, true);
+    const oldStop = await readEffectiveSafetyIntake(
+      disposable.pool,
+      authorizations[1].memberId,
+      noticeVersion
+    );
+    assert.equal(oldStop.status, "handoff_required");
+    assert.equal(oldStop.safetyStop, true);
+    const currentAfterStop = await submitSafetyIntake(
+      disposable.pool,
+      authorizations[1],
+      input(9104)
+    );
+    assert.equal(currentAfterStop.safetyIntake.status, "handoff_required");
+    assert.equal(currentAfterStop.safetyIntake.safetyStop, true);
   }
 );

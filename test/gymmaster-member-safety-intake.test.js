@@ -192,6 +192,29 @@ async function protectedTableCounts(pool) {
   return result.rows[0];
 }
 
+async function insertHistoricalSubmission(pool, mapping, options = {}) {
+  const safetyStop = options.safetyStop === true;
+  await pool.query(
+    `INSERT INTO goals_coach_member_safety_intake_submissions
+      (auth_mapping_id, member_id, client_request_id, client_request_hash,
+       notice_version, current_pain_or_concerning_symptoms,
+       current_injury_concern, recent_surgery,
+       medical_or_exercise_restriction, other_training_safety_concern,
+       outcome, safety_stop, rule_version)
+     VALUES ($1, $2, $3, $4, 'GC-MEMBER-SAFETY-NOTICE-0',
+             $5, FALSE, FALSE, FALSE, FALSE, $6, $5,
+             'GC-MEMBER-SAFETY-INTAKE-1')`,
+    [
+      mapping.id,
+      mapping.member_id,
+      options.clientRequestId,
+      options.requestHash,
+      safetyStop,
+      safetyStop ? "handoff_required" : "screen_complete",
+    ]
+  );
+}
+
 test("member safety intake is exact-flagged and absent with zero database or provider work", async (t) => {
   assert.equal(memberSafetyIntakeEnabled("true"), true);
   for (const value of [undefined, true, "True", " true", "true ", "1"]) {
@@ -584,6 +607,48 @@ test("safety intake is idempotent and its effective stop is monotonic across all
   );
   assert.deepEqual(await protectedTableCounts(disposable.pool), protectedBefore);
   assert.equal(providerCalls() > 0, true);
+});
+
+test("current notice completion is required while historical safety stops remain monotonic", async (t) => {
+  const { disposable, mappings, running } = await fixture(t);
+  await insertHistoricalSubmission(disposable.pool, mappings[0], {
+    clientRequestId: requestId(340),
+    requestHash: "a".repeat(64),
+  });
+  const oldAllClear = await memberRequest(running, "/safety-intake", "gymmaster:30001");
+  assert.equal(oldAllClear.response.status, 200);
+  assert.equal(oldAllClear.body.safetyIntake.status, "not_submitted");
+  assert.equal(oldAllClear.body.safetyIntake.safetyStop, null);
+  assert.deepEqual(oldAllClear.body.safetyIntake.readiness, {
+    status: "SETUP_REQUIRED",
+    nextAction: "COMPLETE_SAFETY_SETUP",
+  });
+
+  const currentAllClear = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
+    method: "POST",
+    body: submission(341),
+  });
+  assert.equal(currentAllClear.response.status, 201);
+  assert.equal(currentAllClear.body.safetyIntake.status, "screen_complete");
+  assert.equal(currentAllClear.body.safetyIntake.safetyStop, false);
+
+  await insertHistoricalSubmission(disposable.pool, mappings[1], {
+    clientRequestId: requestId(342),
+    requestHash: "b".repeat(64),
+    safetyStop: true,
+  });
+  const oldStop = await memberRequest(running, "/safety-intake", "gymmaster:30002");
+  assert.equal(oldStop.response.status, 200);
+  assert.equal(oldStop.body.safetyIntake.status, "handoff_required");
+  assert.equal(oldStop.body.safetyIntake.safetyStop, true);
+
+  const currentAfterStop = await memberRequest(running, "/safety-intake", "gymmaster:30002", {
+    method: "POST",
+    body: submission(343),
+  });
+  assert.equal(currentAfterStop.response.status, 201);
+  assert.equal(currentAfterStop.body.safetyIntake.status, "handoff_required");
+  assert.equal(currentAfterStop.body.safetyIntake.safetyStop, true);
 });
 
 test("every individual positive answer records a fixed handoff-required safety stop", async (t) => {

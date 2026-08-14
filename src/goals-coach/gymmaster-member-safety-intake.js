@@ -179,28 +179,31 @@ async function withTransaction(db, action) {
   }
 }
 
-async function aggregateEffectiveState(client, memberId) {
+async function aggregateEffectiveState(client, memberId, noticeVersion) {
   const result = await client.query(
-    `SELECT COUNT(*)::int AS submission_count,
+    `SELECT COUNT(*) FILTER (WHERE notice_version = $2)::int AS current_submission_count,
             COALESCE(BOOL_OR(safety_stop), FALSE) AS safety_stop
      FROM goals_coach_member_safety_intake_submissions
      WHERE member_id = $1`,
-    [memberId]
+    [memberId, noticeVersion]
   );
   const row = result.rows[0];
-  if (Number(row.submission_count) === 0) {
+  const safetyStop = row.safety_stop === true;
+  if (safetyStop) {
+    return { status: "handoff_required", safetyStop: true };
+  }
+  if (Number(row.current_submission_count) === 0) {
     return { status: "not_submitted", safetyStop: null };
   }
-  const safetyStop = row.safety_stop === true;
   return {
-    status: safetyStop ? "handoff_required" : "screen_complete",
-    safetyStop,
+    status: "screen_complete",
+    safetyStop: false,
   };
 }
 
 async function readEffectiveSafetyIntake(db, memberId, noticeVersion) {
   if (!DATABASE_ID.test(String(memberId))) throw memberAuthenticationError();
-  const effective = await aggregateEffectiveState(db, String(memberId));
+  const effective = await aggregateEffectiveState(db, String(memberId), noticeVersion);
   return {
     notice: MEMBER_SAFETY_NOTICE,
     noticeVersion,
@@ -281,7 +284,7 @@ async function submitSafetyIntake(db, authorization, input) {
       );
       created = true;
     }
-    const effective = await aggregateEffectiveState(client, memberId);
+    const effective = await aggregateEffectiveState(client, memberId, input.noticeVersion);
     return {
       created,
       safetyIntake: {
