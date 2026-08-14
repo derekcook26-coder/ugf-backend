@@ -4,14 +4,14 @@ const crypto = require("node:crypto");
 const express = require("express");
 const rateLimit = require("express-rate-limit");
 const {
-  createGymMasterMemberAuthorization,
   validGymMasterIdentity,
 } = require("./gymmaster-member-authorization");
+const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-membership");
 
 const MEMBER_SAFETY_INTAKE_FLAG =
   "GOALS_COACH_MEMBER_SAFETY_INTAKE_ALPHA_ENABLED";
-const MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION =
-  "GOALS_COACH_MEMBER_SAFETY_INTAKE_NOTICE_VERSION";
+const MEMBER_SAFETY_NOTICE_VERSION = "GC-MEMBER-SAFETY-NOTICE-1";
+const MEMBER_SAFETY_NOTICE = "Goals Coach uses the information you choose to provide, including fitness goals, workout feedback, and safety-related responses, to personalize your coaching experience. It does not replace medical advice. Your information is kept private and used only to provide and safely operate Goals Coach. You may stop using Goals Coach at any time.";
 const MEMBER_SAFETY_INTAKE_RULE_VERSION = "GC-MEMBER-SAFETY-INTAKE-1";
 const MAXIMUM_SAFETY_INTAKE_JSON_BYTES = 4096;
 const UUID =
@@ -30,16 +30,21 @@ function memberSafetyIntakeEnabled(value) {
 }
 
 function approvedNoticeVersion(value) {
-  if (
-    typeof value !== "string"
-    || value !== value.trim()
-    || value.length < 1
-    || value.length > 100
-    || /[^\x20-\x7e]/.test(value)
-  ) {
-    return null;
+  return value === MEMBER_SAFETY_NOTICE_VERSION ? value : null;
+}
+
+function readinessFor(effective) {
+  if (effective.status === "not_submitted") {
+    return { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" };
   }
-  return value;
+  if (effective.safetyStop === true) {
+    return {
+      status: "SAFETY_HANDOFF_REQUIRED",
+      nextAction: "SAFETY_HANDOFF_REQUIRED",
+      message: "Goals Coach cannot continue. No person has been notified; seek appropriate medical guidance before exercise.",
+    };
+  }
+  return { status: "COACHING_UNAVAILABLE", nextAction: "CHECK_BACK_LATER" };
 }
 
 function intakeError(statusCode, code, message) {
@@ -174,32 +179,39 @@ async function withTransaction(db, action) {
   }
 }
 
-async function aggregateEffectiveState(client, memberId) {
+async function aggregateEffectiveState(client, memberId, noticeVersion) {
   const result = await client.query(
-    `SELECT COUNT(*)::int AS submission_count,
+    `SELECT COUNT(*) FILTER (WHERE notice_version = $2)::int AS current_submission_count,
             COALESCE(BOOL_OR(safety_stop), FALSE) AS safety_stop
      FROM goals_coach_member_safety_intake_submissions
      WHERE member_id = $1`,
-    [memberId]
+    [memberId, noticeVersion]
   );
   const row = result.rows[0];
-  if (Number(row.submission_count) === 0) {
+  const safetyStop = row.safety_stop === true;
+  if (safetyStop) {
+    return { status: "handoff_required", safetyStop: true };
+  }
+  if (Number(row.current_submission_count) === 0) {
     return { status: "not_submitted", safetyStop: null };
   }
-  const safetyStop = row.safety_stop === true;
   return {
-    status: safetyStop ? "handoff_required" : "screen_complete",
-    safetyStop,
+    status: "screen_complete",
+    safetyStop: false,
   };
 }
 
 async function readEffectiveSafetyIntake(db, memberId, noticeVersion) {
   if (!DATABASE_ID.test(String(memberId))) throw memberAuthenticationError();
-  const effective = await aggregateEffectiveState(db, String(memberId));
+  const effective = await aggregateEffectiveState(db, String(memberId), noticeVersion);
   return {
+    notice: MEMBER_SAFETY_NOTICE,
     noticeVersion,
     status: effective.status,
     safetyStop: effective.safetyStop,
+    readiness: readinessFor(effective),
+    activationPermitted: false,
+    externalCallsPermitted: false,
   };
 }
 
@@ -272,13 +284,17 @@ async function submitSafetyIntake(db, authorization, input) {
       );
       created = true;
     }
-    const effective = await aggregateEffectiveState(client, memberId);
+    const effective = await aggregateEffectiveState(client, memberId, input.noticeVersion);
     return {
       created,
       safetyIntake: {
+        notice: MEMBER_SAFETY_NOTICE,
         noticeVersion: input.noticeVersion,
         status: effective.status,
         safetyStop: effective.safetyStop,
+        readiness: readinessFor(effective),
+        activationPermitted: false,
+        externalCallsPermitted: false,
       },
     };
   });
@@ -289,6 +305,7 @@ function createRateLimits() {
     windowMs: 15 * 60 * 1000,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: (req) => `member:${String(req.alphaMemberIdentity.authSubject)}`,
     handler: (_req, res) => res.status(429).json({ error: "RATE_LIMITED" }),
   };
   return {
@@ -314,8 +331,10 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
   if (!noticeVersion) {
     throw new Error("Member safety intake requires an approved notice version");
   }
-  const mappingAuthorization = options.mappingAuthorization
-    || createGymMasterMemberAuthorization({ db });
+  const authorizeIdentity = options.authorizeIdentity;
+  if (typeof authorizeIdentity !== "function") {
+    throw new Error("Member safety intake requires current member access authorization");
+  }
   const rateLimits = options.rateLimits || createRateLimits();
   const router = express.Router();
 
@@ -333,9 +352,14 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
       if (!validGymMasterIdentity(req.alphaMemberIdentity)) {
         return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" });
       }
-      const authorization = await mappingAuthorization.authorizeIdentity(
-        req.alphaMemberIdentity
-      );
+      const authorization = await authorizeIdentity(req.alphaMemberIdentity);
+      if (memberAccessDependencyUnavailable(authorization)) {
+        return res.status(503).json({
+          error: "MEMBER_ACCESS_TEMPORARILY_UNAVAILABLE",
+          message: "We can’t verify your access right now. Please try again later.",
+          nextAction: "TRY_AGAIN_LATER",
+        });
+      }
       if (!authorization.active) {
         return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" });
       }
@@ -346,12 +370,11 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
     }
   }
 
-  const protectedMember = [protectMember, authorizeActiveMapping];
-
   router.get(
-    "/safety-intake",
-    ...protectedMember,
+    "/",
+    protectMember,
     rateLimits.read,
+    authorizeActiveMapping,
     async (req, res, next) => {
       try {
         rejectUnknownKeys(req.query, [], "safety intake query");
@@ -368,9 +391,10 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
   );
 
   router.post(
-    "/safety-intake",
-    ...protectedMember,
+    "/",
+    protectMember,
     rateLimits.mutation,
+    authorizeActiveMapping,
     async (req, res, next) => {
       try {
         rejectUnknownKeys(req.query, [], "safety intake query");
@@ -404,7 +428,8 @@ module.exports = {
   ANSWER_FIELDS,
   MAXIMUM_SAFETY_INTAKE_JSON_BYTES,
   MEMBER_SAFETY_INTAKE_FLAG,
-  MEMBER_SAFETY_INTAKE_NOTICE_VERSION_CONFIGURATION,
+  MEMBER_SAFETY_NOTICE,
+  MEMBER_SAFETY_NOTICE_VERSION,
   MEMBER_SAFETY_INTAKE_RULE_VERSION,
   approvedNoticeVersion,
   canonicalSafetyIntakeRequest,
