@@ -17,6 +17,7 @@ const functionalTranscriptionPath = /^\/alpha\/goals-coach\/conversations\/([^/]
 const missingRequestIdPath = /^\/alpha\/goals-coach\/conversations\/([^/]+)\/transcriptions$/;
 const encodedPathSeparator = /%(?:2f|5c)/i;
 const memberSafetyIntakePath = "/goalscoach/member/safety-intake";
+const memberCoachingConsentPath = "/goalscoach/member/coaching-consent";
 const serviceResultFields = Object.freeze([
   "transcriptionId",
   "requestId",
@@ -115,6 +116,9 @@ function createApplicationJsonParser() {
     const originalUrl = typeof req.originalUrl === "string" ? req.originalUrl : "";
     const queryOffset = originalUrl.indexOf("?");
     const rawPath = queryOffset === -1 ? originalUrl : originalUrl.slice(0, queryOffset);
+    // Coaching consent owns a post-authentication, post-rate-limit raw parser.
+    // Do not consume or inspect that body at the application-wide boundary.
+    if (req.method === "POST" && rawPath === memberCoachingConsentPath) return next();
     if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
       return memberSafetyIntakeJsonParser(req, res, next);
     }
