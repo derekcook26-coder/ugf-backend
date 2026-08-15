@@ -4,6 +4,7 @@ const fs=require("node:fs");
 const test=require("node:test");
 const {GUIDANCE,MEMBER_TODAY_FLAG,enabled,execute,hash,parse}=require("../src/goals-coach/gymmaster-member-today");
 const {createGymMasterMemberTodayStartup}=require("../src/goals-coach/gymmaster-member-today-startup");
+const {createApplicationJsonParser}=require("../src/goals-coach/transcription-route");
 function database(query){return {async connect(){return {query,release(){}};}};}
 const identity={authProvider:"gymmaster",authSubject:"gymmaster:10482"},authorization={active:true,memberId:"1",mappingId:"2"};
 
@@ -24,6 +25,11 @@ test("member today uses fixed safety wording and imports no provider",()=>{
   const source=fs.readFileSync("src/goals-coach/gymmaster-member-today.js","utf8")+fs.readFileSync("src/goals-coach/gymmaster-member-today-startup.js","utf8");
   assert.doesNotMatch(source,/require\(["'](?:openai|\.\/transcription-adapter|\.\/coaching-engine)["']\)/i);
 });
+test("application JSON parser leaves the today body for its authenticated route parser",()=>{
+  const parser=createApplicationJsonParser(); let continued=false;
+  parser({method:"POST",originalUrl:"/goalscoach/member/today",headers:{}},{},()=>{continued=true;});
+  assert.equal(continued,true);
+});
 test("READY replay applies expired and newer safety outcomes before returning an action",async(t)=>{
   const cases=[
     {name:"expired assessment",safety:null,body:{state:"SAFETY_REQUIRED"}},
@@ -38,11 +44,36 @@ test("READY replay applies expired and newer safety outcomes before returning an
       if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
       if(sql.includes("safety_intake_v2"))return {rows:entry.safety?[{outcome:entry.safety}]:[]};
       if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:"READY",request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:"20",safety_outcome:"SCREEN_COMPLETE"}]};
+      if(sql.includes("coaching_consents"))return {rows:[{}]};
       if(sql.includes("FROM coach_plan_exercises")){itemQueries++;return {rows:[{exercise_name:"Original choice",prescription_json:{reps:8}}]};}
       assert.fail(`unexpected query: ${sql}`);
     });
     const result=await execute(db,identity,authorization,input);
     assert.deepEqual(result,{body:entry.body,replay:true}); assert.equal(itemQueries,entry.safety==="MODIFICATION_REQUIRED"?1:0);
+  });
+});
+test("plan-guidance replays apply current safety and consent before disclosure",async(t)=>{
+  const input={clientRequestId:"00000000-0000-4000-8000-000000000006"};
+  const cases=[
+    {name:"question replay with expired safety",state:"QUESTION_REQUIRED",safety:null,consent:true,body:{state:"SAFETY_REQUIRED"}},
+    {name:"question replay with urgent stop",state:"QUESTION_REQUIRED",safety:"URGENT_STOP",consent:true,body:{state:"URGENT_STOP",guidance:GUIDANCE.URGENT_STOP}},
+    {name:"question replay after consent withdrawal",state:"QUESTION_REQUIRED",safety:"SCREEN_COMPLETE",consent:false,body:{state:"CONSENT_REQUIRED"}},
+    {name:"ready replay after consent withdrawal",state:"READY",safety:"SCREEN_COMPLETE",consent:false,body:{state:"CONSENT_REQUIRED"}},
+    {name:"question replay with modification",state:"QUESTION_REQUIRED",safety:"MODIFICATION_REQUIRED",consent:true,body:{state:"QUESTION_REQUIRED",attemptId:input.clientRequestId,question:{id:"TODAY_PLAN_ITEM",prompt:"Which planned item are you ready to start?",options:[{id:"option-1",label:"Original choice"}]},safetyConstraint:GUIDANCE.MODIFICATION_REQUIRED}},
+  ];
+  for(const entry of cases)await t.test(entry.name,async()=>{
+    let planQueries=0;
+    const db=database(async(sql)=>{
+      if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
+      if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
+      if(sql.includes("safety_intake_v2"))return {rows:entry.safety?[{outcome:entry.safety}]:[]};
+      if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:entry.state,client_request_id:input.clientRequestId,request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:entry.state==="READY"?"20":null,option_ids:["option-1"],option_item_ids:{"option-1":"20"}}]};
+      if(sql.includes("coaching_consents"))return {rows:entry.consent?[{}]:[]};
+      if(sql.includes("FROM coach_plan_exercises")){planQueries++;return {rows:[entry.state==="READY"?{exercise_name:"Original choice",prescription_json:{reps:8}}:{id:"20",exercise_name:"Original choice"}]};}
+      assert.fail(`unexpected query: ${sql}`);
+    });
+    assert.deepEqual(await execute(db,identity,authorization,input),{body:entry.body,replay:true});
+    assert.equal(planQueries,entry.safety==="MODIFICATION_REQUIRED"?1:0);
   });
 });
 test("continuation keeps the originally offered item after retirement, insertion, and reordering",async()=>{

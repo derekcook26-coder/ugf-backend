@@ -18,6 +18,7 @@ const missingRequestIdPath = /^\/alpha\/goals-coach\/conversations\/([^/]+)\/tra
 const encodedPathSeparator = /%(?:2f|5c)/i;
 const memberSafetyIntakePath = "/goalscoach/member/safety-intake";
 const memberCoachingConsentPath = "/goalscoach/member/coaching-consent";
+const memberTodayPath = "/goalscoach/member/today";
 const serviceResultFields = Object.freeze([
   "transcriptionId",
   "requestId",
@@ -116,9 +117,12 @@ function createApplicationJsonParser() {
     const originalUrl = typeof req.originalUrl === "string" ? req.originalUrl : "";
     const queryOffset = originalUrl.indexOf("?");
     const rawPath = queryOffset === -1 ? originalUrl : originalUrl.slice(0, queryOffset);
-    // Coaching consent owns a post-authentication, post-rate-limit raw parser.
-    // Do not consume or inspect that body at the application-wide boundary.
-    if (req.method === "POST" && rawPath === memberCoachingConsentPath) return next();
+    // These routes own post-authentication, post-rate-limit raw parsers.
+    // Do not consume or inspect their bodies at the application-wide boundary.
+    if (
+      req.method === "POST"
+      && (rawPath === memberCoachingConsentPath || rawPath === memberTodayPath)
+    ) return next();
     if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
       return memberSafetyIntakeJsonParser(req, res, next);
     }

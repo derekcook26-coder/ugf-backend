@@ -32,7 +32,7 @@ function authError() { return error(401, "MEMBER_AUTHENTICATION_REQUIRED"); }
 function responseFrom(row, item) {
   const out = { state: row.state_code };
   if (row.state_code === "URGENT_STOP" || row.state_code === "MEDICAL_REVIEW_REQUIRED") out.guidance = GUIDANCE[row.state_code];
-  if (row.state_code === "QUESTION_REQUIRED") { out.attemptId = row.client_request_id; out.question = { id: "TODAY_PLAN_ITEM", prompt: "Which planned item are you ready to start?", options: row.options }; }
+  if (row.state_code === "QUESTION_REQUIRED") { out.attemptId = row.client_request_id; out.question = { id: "TODAY_PLAN_ITEM", prompt: "Which planned item are you ready to start?", options: row.options }; if (row.safety_outcome === "MODIFICATION_REQUIRED") out.safetyConstraint = GUIDANCE.MODIFICATION_REQUIRED; }
   if (row.state_code === "READY") { out.action = { planId: String(row.plan_id), planVersion: new Date(row.plan_version).toISOString(), itemId: String(row.plan_item_id), name: item.exercise_name, prescription: item.prescription_json }; if (row.safety_outcome === "MODIFICATION_REQUIRED") out.safetyConstraint = GUIDANCE.MODIFICATION_REQUIRED; }
   return out;
 }
@@ -45,8 +45,10 @@ async function decide(client, memberId, mappingId, identity, input) {
   if (replay.rows.length) {
     if (replay.rows[0].request_hash !== requestHash) throw error(409,"MEMBER_TODAY_IDEMPOTENCY_CONFLICT");
     let row=replay.rows[0];
-    if (row.state_code==="READY") {
+    if (["READY","QUESTION_REQUIRED"].includes(row.state_code)) {
       if (!safety || ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) return { body:responseFrom({state_code:safety?safety.outcome:"SAFETY_REQUIRED"}),replay:true };
+      const consent=(await client.query("SELECT 1 FROM goals_coach_member_coaching_consents WHERE member_id=$1 AND notice_version=$2 AND status='accepted'",[memberId,CONSENT_VERSION])).rows[0];
+      if (!consent) return { body:responseFrom({state_code:"CONSENT_REQUIRED"}),replay:true };
       row={...row,safety_outcome:safety.outcome};
     }
     let item = null; if (row.plan_item_id) item=(await client.query("SELECT exercise_name,prescription_json FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2",[row.plan_item_id,row.plan_id])).rows[0];
