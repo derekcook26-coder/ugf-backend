@@ -47,6 +47,13 @@ function goalsCoachErrorHandler(error, req, res, next) {
     }
   }
 
+  if (req.path === "/goalscoach/member/today") {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (error && error.type === "entity.too.large") return res.status(413).json({ error: "MEMBER_TODAY_INVALID" });
+    if (error && ["encoding.unsupported", "entity.parse.failed", "request.aborted", "request.size.invalid"].includes(error.type)) return res.status(400).json({ error: "MEMBER_TODAY_INVALID" });
+  }
+
   if (req.path === "/goalscoach/member/private-screen/login") {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
