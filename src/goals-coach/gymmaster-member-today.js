@@ -56,6 +56,8 @@ async function decide(client, memberId, mappingId, identity, input) {
       if (!safety) return { body:responseFrom({state_code:"SAFETY_REQUIRED"}),replay:true };
       const consent=(await client.query("SELECT 1 FROM goals_coach_member_coaching_consents WHERE member_id=$1 AND notice_version=$2 AND status='accepted'",[memberId,CONSENT_VERSION])).rows[0];
       if (!consent) return { body:responseFrom({state_code:"CONSENT_REQUIRED"}),replay:true };
+      const latestPlan=(await client.query("SELECT id,created_at FROM coach_plans WHERE member_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1",[memberId])).rows[0];
+      if (!latestPlan || String(row.plan_id)!==String(latestPlan.id) || new Date(row.plan_version).getTime()!==new Date(latestPlan.created_at).getTime()) return { body:responseFrom({state_code:"UNAVAILABLE"}),replay:true };
       row={...row,safety_outcome:safety.outcome};
     }
     let item = null; if (row.plan_item_id) item=(await client.query("SELECT exercise_name,prescription_json FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2",[row.plan_item_id,row.plan_id])).rows[0];

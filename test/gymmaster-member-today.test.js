@@ -75,6 +75,7 @@ test("READY replay applies expired and newer safety outcomes before returning an
       if(sql.includes("safety_intake_v2"))return {rows:entry.safety?[{outcome:entry.safety}]:[]};
       if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:"READY",request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:"20",safety_outcome:"SCREEN_COMPLETE"}]};
       if(sql.includes("coaching_consents"))return {rows:[{}]};
+      if(sql.includes("FROM coach_plans"))return {rows:[{id:"10",created_at:new Date("2026-01-01T00:00:00.000Z")}]};
       if(sql.includes("FROM coach_plan_exercises")){itemQueries++;return {rows:[{exercise_name:"Original choice",prescription_json:{reps:8}}]};}
       assert.fail(`unexpected query: ${sql}`);
     });
@@ -99,11 +100,35 @@ test("plan-guidance replays apply current safety and consent before disclosure",
       if(sql.includes("safety_intake_v2"))return {rows:entry.safety?[{outcome:entry.safety}]:[]};
       if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:entry.state,client_request_id:input.clientRequestId,request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:entry.state==="READY"?"20":null,option_ids:["option-1"],option_item_ids:{"option-1":"20"}}]};
       if(sql.includes("coaching_consents"))return {rows:entry.consent?[{}]:[]};
+      if(sql.includes("FROM coach_plans"))return {rows:[{id:"10",created_at:new Date("2026-01-01T00:00:00.000Z")}]};
       if(sql.includes("FROM coach_plan_exercises")){planQueries++;return {rows:[entry.state==="READY"?{exercise_name:"Original choice",prescription_json:{reps:8}}:{id:"20",exercise_name:"Original choice"}]};}
       assert.fail(`unexpected query: ${sql}`);
     });
     assert.deepEqual(await execute(db,identity,authorization,input),{body:entry.body,replay:true});
     assert.equal(planQueries,entry.safety==="MODIFICATION_REQUIRED"?1:0);
+  });
+});
+test("plan-guidance replays fail closed when the stored plan is no longer latest",async(t)=>{
+  const input={clientRequestId:"00000000-0000-4000-8000-000000000016"};
+  const cases=[
+    {name:"ready replay after a newer plan",state:"READY",latest:{id:"11",created_at:new Date("2026-02-01T00:00:00.000Z")}},
+    {name:"question replay after the plan version changes",state:"QUESTION_REQUIRED",latest:{id:"10",created_at:new Date("2026-02-01T00:00:00.000Z")}},
+    {name:"ready replay after plans become unavailable",state:"READY",latest:null},
+  ];
+  for(const entry of cases)await t.test(entry.name,async()=>{
+    let itemQueries=0;
+    const db=database(async(sql)=>{
+      if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
+      if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
+      if(sql.includes("safety_intake_v2"))return {rows:[{outcome:"SCREEN_COMPLETE"}]};
+      if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:entry.state,client_request_id:input.clientRequestId,request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:entry.state==="READY"?"20":null,option_ids:["option-1"],option_item_ids:{"option-1":"20"}}]};
+      if(sql.includes("coaching_consents"))return {rows:[{}]};
+      if(sql.includes("FROM coach_plans"))return {rows:entry.latest?[entry.latest]:[]};
+      if(sql.includes("FROM coach_plan_exercises")){itemQueries++;return {rows:[]};}
+      assert.fail(`unexpected query: ${sql}`);
+    });
+    assert.deepEqual(await execute(db,identity,authorization,input),{body:{state:"UNAVAILABLE"},replay:true});
+    assert.equal(itemQueries,0);
   });
 });
 test("continuation keeps the originally offered item after retirement, insertion, and reordering",async()=>{
