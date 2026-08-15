@@ -25,15 +25,22 @@ session, exact active local mapping, and current Gatekeeper membership.
 
 The API owns this approved, immutable version/text pair:
 
-- Version: `GC-MEMBER-SAFETY-NOTICE-1`
+- Version: `GC-MEMBER-SAFETY-NOTICE-2`; rule `GC-MEMBER-SAFETY-INTAKE-2`.
+- V2 results are session checks that expire within 12 hours. Historical V1 rows
+  remain immutable but never determine a V2 session. Outcomes are
+  `SCREEN_COMPLETE`, `MODIFICATION_REQUIRED`, `MEDICAL_REVIEW_REQUIRED`, and
+  `URGENT_STOP`; the public result contains no answers or member identifiers.
+- Frontend follow-up: update the WordPress result heading to meet WCAG contrast
+  requirements. WordPress is intentionally outside this backend change.
 - Notice: “Goals Coach uses the information you choose to provide, including
   fitness goals, workout feedback, and safety-related responses, to personalize
   your coaching experience. It does not replace medical advice. Your information
   is kept private and used only to provide and safely operate Goals Coach. You may
   stop using Goals Coach at any time.”
 
-The five-answer submission acknowledges that version and persists only the
-existing minimized safety/provenance record. Any positive answer makes the
-effective result a safety stop and truthfully says no person was notified.
-All-negative completion still returns coaching unavailable; it does not enable
-AI, coaching, plans, voice, workouts, external calls, or activation.
+The structured submission contains strict booleans and no free-text health
+narrative. The backend deterministically derives and persists only the outcome,
+request hash, approved versions, ownership provenance, and timestamps. Public
+responses do not claim that a person was notified, diagnosed, or medically
+cleared. No result enables AI, coaching, plans, voice, workouts, external calls,
+or activation.

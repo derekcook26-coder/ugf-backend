@@ -2,274 +2,90 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const {
-  MEMBER_SAFETY_NOTICE,
-  MEMBER_SAFETY_NOTICE_VERSION,
-  parseSafetyIntake,
-  readEffectiveSafetyIntake,
-  submitSafetyIntake,
-} = require("../src/goals-coach/gymmaster-member-safety-intake");
-const { runMigration: runPhase1cTranscriptionMigration } = require("../migrate_005");
-const { runMigration: runPhase1dSafetyMigration } = require("../migrate_006");
-const { runMigration: runOwnerWorkoutTrackingMigration } = require("../migrate_007");
-const { runMigration: runOwnerEditableWorkoutSessionsMigration } = require("../migrate_008");
-const { runMigration: runMemberSafetyIntakeMigration } = require("../migrate_009");
+const { MEMBER_SAFETY_NOTICE_VERSION, parseSafetyIntake, readEffectiveSafetyIntake, submitSafetyIntake } = require("../src/goals-coach/gymmaster-member-safety-intake");
+const { runMigration: migrate005 } = require("../migrate_005");
+const { runMigration: migrate006 } = require("../migrate_006");
+const { runMigration: migrate007 } = require("../migrate_007");
+const { runMigration: migrate008 } = require("../migrate_008");
+const { runMigration: migrate009 } = require("../migrate_009");
+const { runMigration: migrate010 } = require("../migrate_010");
+const { runMigration: migrate011 } = require("../migrate_011");
+const { runMigration: migrate012 } = require("../migrate_012");
+const { runRollback: rollback012 } = require("../rollback_012");
+const { ANSWER_FIELDS } = require("../src/goals-coach/gymmaster-member-safety-intake");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 
-const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0
-  ? "embedded PostgreSQL refuses to run as root; run this test as an unprivileged user"
-  : false;
-const noticeVersion = MEMBER_SAFETY_NOTICE_VERSION;
+const skipForRoot = typeof process.getuid === "function" && process.getuid() === 0 ? "requires unprivileged PostgreSQL 16" : false;
+function input(number, overrides = {}) { return parseSafetyIntake({ clientRequestId: `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`, noticeVersion: MEMBER_SAFETY_NOTICE_VERSION, answers: { ...Object.fromEntries(ANSWER_FIELDS.map((field) => [field, false])), ...overrides } }, MEMBER_SAFETY_NOTICE_VERSION); }
 
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function database(t) {
+  const db = await createRealDisposablePostgres({ phase1b: true }); t.after(() => db.close());
+  await migrate005({ pool: db.pool }); await migrate006({ pool: db.pool }); await migrate007({ pool: db.pool }); await migrate008({ pool: db.pool });
+  await migrate009({ pool: db.pool }); await migrate010({ pool: db.pool });
+  await migrate011({ pool: db.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } }); await migrate012({ pool: db.pool });
+  assert.match((await db.pool.query("SHOW server_version")).rows[0].server_version, /^16\./); return db;
 }
 
-function input(number, overrides = {}) {
-  return parseSafetyIntake({
-    clientRequestId:
-      `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
-    noticeVersion,
-    answers: {
-      currentPainOrConcerningSymptoms: false,
-      currentInjuryConcern: false,
-      recentSurgery: false,
-      medicalOrExerciseRestriction: false,
-      otherTrainingSafetyConcern: false,
-      ...overrides,
-    },
-  }, noticeVersion);
-}
-
-async function waitForBlockedMemberLocks(pool, expected, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
+async function waitForMemberLocks(pool, expected) {
+  const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
-    const result = await pool.query(
-      `SELECT pid
-       FROM pg_stat_activity
-       WHERE wait_event_type = 'Lock'
-         AND query LIKE '%FROM coach_members%'
-       ORDER BY pid`,
-      []
-    );
-    if (result.rows.length >= expected) return result.rows.map((row) => Number(row.pid));
-    await delay(20);
+    const rows = (await pool.query("SELECT pid FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%FROM coach_members%'")).rows;
+    if (rows.length >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(
-    `Expected ${expected} safety-intake transaction(s) to wait on the member lock`
-  );
+  throw new Error("expected blocked member locks");
 }
 
-test(
-  "PostgreSQL 16 serializes member submissions so a committed stop remains monotonic",
-  { skip: skipForRoot },
-  async (t) => {
-    const disposable = await createRealDisposablePostgres({ phase1b: true });
-    let blocker = null;
-    const pendingSubmissions = [];
-    t.after(async () => {
-      if (blocker) {
-        try { await blocker.query("ROLLBACK"); } catch (_) {}
-        blocker.release();
-      }
-      await Promise.allSettled(pendingSubmissions);
-      await disposable.close();
-    });
-    await runPhase1cTranscriptionMigration({ pool: disposable.pool });
-    await runPhase1dSafetyMigration({ pool: disposable.pool });
-    await runOwnerWorkoutTrackingMigration({ pool: disposable.pool });
-    await runOwnerEditableWorkoutSessionsMigration({ pool: disposable.pool });
-    await runMemberSafetyIntakeMigration({ pool: disposable.pool });
+test("PostgreSQL 16 preserves v1 history and uses latest unexpired immutable v2 assessment", { skip: skipForRoot }, async (t) => {
+  const db = await database(t); const seeded = await seedMemberAndPlan(db.pool, "safety-v2-real");
+  const mapping = (await db.pool.query("INSERT INTO goals_coach_member_auth_mappings (member_id,auth_provider,auth_subject,verified_email_snapshot,active,provisioning_method,provisioning_reference) VALUES ($1,'gymmaster','gymmaster:92001','synthetic@example.test',TRUE,'owner_approved_script','safety-v2-real') RETURNING *", [seeded.member.id])).rows[0];
+  const auth = { active: true, mappingId: String(mapping.id), memberId: String(mapping.member_id) };
+  await db.pool.query("INSERT INTO goals_coach_member_safety_intake_submissions (auth_mapping_id,member_id,client_request_id,client_request_hash,notice_version,current_pain_or_concerning_symptoms,current_injury_concern,recent_surgery,medical_or_exercise_restriction,other_training_safety_concern,outcome,safety_stop,rule_version) VALUES ($1,$2,'00000000-0000-4000-8000-000000092001',$3,'GC-MEMBER-SAFETY-NOTICE-1',TRUE,FALSE,FALSE,FALSE,FALSE,'handoff_required',TRUE,'GC-MEMBER-SAFETY-INTAKE-1')", [mapping.id, mapping.member_id, "b".repeat(64)]);
+  assert.equal((await readEffectiveSafetyIntake(db.pool, auth.memberId, MEMBER_SAFETY_NOTICE_VERSION)).status, "not_submitted");
+  for (const [number, answers, outcome] of [
+    [9202, { painOrStiffness: true, familiar: true, mild: true }, "MODIFICATION_REQUIRED"],
+    [9203, { painOrStiffness: true, severe: true }, "MEDICAL_REVIEW_REQUIRED"],
+    [9204, { urgentWarningSigns: true }, "URGENT_STOP"],
+    [9205, {}, "SCREEN_COMPLETE"],
+  ]) assert.equal((await submitSafetyIntake(db.pool, auth, input(number, answers))).safetyIntake.status, outcome);
+  assert.equal((await db.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_submissions WHERE member_id=$1", [mapping.member_id])).rows[0].count, 1);
+  const first = (await db.pool.query("SELECT id FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1 ORDER BY id LIMIT 1", [mapping.member_id])).rows[0];
+  await assert.rejects(db.pool.query("DELETE FROM goals_coach_member_safety_intake_v2_assessments WHERE id=$1", [first.id]), /append-only/);
 
-    const version = (await disposable.pool.query(
-      "SHOW server_version"
-    )).rows[0].server_version;
-    assert.match(version, /^16\./);
+  const expiredSeed = await seedMemberAndPlan(db.pool, "safety-v2-expired-real");
+  const expiredMapping = (await db.pool.query("INSERT INTO goals_coach_member_auth_mappings (member_id,auth_provider,auth_subject,verified_email_snapshot,active,provisioning_method,provisioning_reference) VALUES ($1,'gymmaster','gymmaster:92002','synthetic@example.test',TRUE,'owner_approved_script','safety-v2-expired-real') RETURNING *", [expiredSeed.member.id])).rows[0];
+  await db.pool.query("INSERT INTO goals_coach_member_safety_intake_v2_assessments (auth_mapping_id,member_id,client_request_id,client_request_hash,notice_version,outcome,rule_version,submitted_at,valid_until) VALUES ($1,$2,'00000000-0000-4000-8000-000000092006',$3,'GC-MEMBER-SAFETY-NOTICE-2','SCREEN_COMPLETE','GC-MEMBER-SAFETY-INTAKE-2',NOW()-INTERVAL '2 hours',NOW()-INTERVAL '1 hour')", [expiredMapping.id, expiredMapping.member_id, "c".repeat(64)]);
+  assert.equal((await readEffectiveSafetyIntake(db.pool, String(expiredMapping.member_id), MEMBER_SAFETY_NOTICE_VERSION)).status, "not_submitted");
+});
 
-    const seeded = await seedMemberAndPlan(
-      disposable.pool,
-      "member-safety-intake-concurrency"
-    );
-    const mapping = (await disposable.pool.query(
-      `INSERT INTO goals_coach_member_auth_mappings
-        (member_id, auth_provider, auth_subject, verified_email_snapshot, active,
-         provisioning_method, provisioning_reference)
-       VALUES ($1, 'gymmaster', 'gymmaster:39001', 'concurrency@example.test',
-               TRUE, 'owner_approved_script', 'postgres-16-concurrency-test')
-       RETURNING *`,
-      [seeded.member.id]
-    )).rows[0];
-    const authorization = {
-      active: true,
-      mappingId: String(mapping.id),
-      memberId: String(mapping.member_id),
-    };
+test("PostgreSQL 16 serializes concurrent V2 submissions on the member lock", { skip: skipForRoot }, async (t) => {
+  const db = await database(t); const seeded = await seedMemberAndPlan(db.pool, "safety-v2-lock-real");
+  const mapping = (await db.pool.query("INSERT INTO goals_coach_member_auth_mappings (member_id,auth_provider,auth_subject,verified_email_snapshot,active,provisioning_method,provisioning_reference) VALUES ($1,'gymmaster','gymmaster:92003','synthetic@example.test',TRUE,'owner_approved_script','safety-v2-lock-real') RETURNING *", [seeded.member.id])).rows[0];
+  const auth = { active: true, mappingId: String(mapping.id), memberId: String(mapping.member_id) };
+  const blocker = await db.pool.connect(); await blocker.query("BEGIN"); await blocker.query("SELECT id FROM coach_members WHERE id=$1 FOR UPDATE", [mapping.member_id]);
+  const urgent = submitSafetyIntake(db.pool, auth, input(9210, { urgentWarningSigns: true }));
+  await waitForMemberLocks(db.pool, 1);
+  const safe = submitSafetyIntake(db.pool, auth, input(9211));
+  await waitForMemberLocks(db.pool, 2);
+  await blocker.query("COMMIT"); blocker.release();
+  assert.equal((await urgent).safetyIntake.status, "URGENT_STOP");
+  assert.equal((await safe).safetyIntake.status, "SCREEN_COMPLETE");
+  assert.equal((await db.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1", [mapping.member_id])).rows[0].count, 2);
+});
 
-    blocker = await disposable.pool.connect();
-    await blocker.query("BEGIN");
-    await blocker.query(
-      "SELECT id FROM coach_members WHERE id = $1 FOR UPDATE",
-      [seeded.member.id]
-    );
+test("PostgreSQL 16 bounds Migration 012 advisory-lock blocking and reuses the pool", { skip: skipForRoot }, async (t) => {
+  const db = await database(t); const blocker = await db.pool.connect();
+  await blocker.query("BEGIN"); await blocker.query("SELECT pg_advisory_xact_lock(82720512)");
+  await assert.rejects(migrate012({ pool: db.pool, overallMilliseconds: 100 }), (error) => error.code === "migration_failed");
+  await blocker.query("ROLLBACK"); blocker.release();
+  assert.equal((await db.pool.query("SELECT 1 AS ready")).rows[0].ready, 1);
+});
 
-    const positivePromise = submitSafetyIntake(
-      disposable.pool,
-      authorization,
-      input(9001, { currentInjuryConcern: true })
-    );
-    pendingSubmissions.push(positivePromise);
-    const firstWaiters = await waitForBlockedMemberLocks(
-      disposable.pool,
-      1
-    );
-    assert.equal(firstWaiters.length, 1);
-
-    const negativePromise = submitSafetyIntake(
-      disposable.pool,
-      authorization,
-      input(9002)
-    );
-    pendingSubmissions.push(negativePromise);
-    const bothWaiters = await waitForBlockedMemberLocks(
-      disposable.pool,
-      2
-    );
-    assert.equal(bothWaiters.length, 2);
-
-    await blocker.query("COMMIT");
-    blocker.release();
-    blocker = null;
-
-    const [positive, negative] = await Promise.all([
-      positivePromise,
-      negativePromise,
-    ]);
-    assert.equal(positive.safetyIntake.status, "handoff_required");
-    assert.equal(positive.safetyIntake.safetyStop, true);
-    assert.equal(negative.safetyIntake.status, "handoff_required");
-    assert.equal(negative.safetyIntake.safetyStop, true);
-
-    const rows = await disposable.pool.query(
-      `SELECT outcome, safety_stop
-       FROM goals_coach_member_safety_intake_submissions
-       WHERE member_id = $1
-       ORDER BY id`,
-      [seeded.member.id]
-    );
-    assert.deepEqual(
-      rows.rows.map((row) => [row.outcome, row.safety_stop]),
-      [
-        ["handoff_required", true],
-        ["screen_complete", false],
-      ]
-    );
-    const effective = await disposable.pool.query(
-      `SELECT BOOL_OR(safety_stop) AS safety_stop
-       FROM goals_coach_member_safety_intake_submissions
-       WHERE member_id = $1`,
-      [seeded.member.id]
-    );
-    assert.equal(effective.rows[0].safety_stop, true);
-  }
-);
-
-test(
-  "PostgreSQL 16 requires the current notice without clearing historical safety stops",
-  { skip: skipForRoot },
-  async (t) => {
-    const disposable = await createRealDisposablePostgres({ phase1b: true });
-    t.after(() => disposable.close());
-    await runPhase1cTranscriptionMigration({ pool: disposable.pool });
-    await runPhase1dSafetyMigration({ pool: disposable.pool });
-    await runOwnerWorkoutTrackingMigration({ pool: disposable.pool });
-    await runOwnerEditableWorkoutSessionsMigration({ pool: disposable.pool });
-    await runMemberSafetyIntakeMigration({ pool: disposable.pool });
-    assert.match((await disposable.pool.query("SHOW server_version")).rows[0].server_version, /^16\./);
-
-    const authorizations = [];
-    for (const [suffix, subject] of [["clear", "39002"], ["stop", "39003"]]) {
-      const seeded = await seedMemberAndPlan(
-        disposable.pool,
-        `member-safety-notice-version-${suffix}`
-      );
-      const mapping = (await disposable.pool.query(
-        `INSERT INTO goals_coach_member_auth_mappings
-          (member_id, auth_provider, auth_subject, verified_email_snapshot, active,
-           provisioning_method, provisioning_reference)
-         VALUES ($1, 'gymmaster', $2, 'notice-version@example.test', TRUE,
-                 'owner_approved_script', 'postgres-16-notice-version-test')
-         RETURNING *`,
-        [seeded.member.id, `gymmaster:${subject}`]
-      )).rows[0];
-      authorizations.push({
-        active: true,
-        mappingId: String(mapping.id),
-        memberId: String(mapping.member_id),
-      });
-    }
-
-    async function insertOld(authorization, number, safetyStop) {
-      await disposable.pool.query(
-        `INSERT INTO goals_coach_member_safety_intake_submissions
-          (auth_mapping_id, member_id, client_request_id, client_request_hash,
-           notice_version, current_pain_or_concerning_symptoms,
-           current_injury_concern, recent_surgery,
-           medical_or_exercise_restriction, other_training_safety_concern,
-           outcome, safety_stop, rule_version)
-         VALUES ($1, $2, $3, $4, 'GC-MEMBER-SAFETY-NOTICE-0',
-                 $5, FALSE, FALSE, FALSE, FALSE, $6, $5,
-                 'GC-MEMBER-SAFETY-INTAKE-1')`,
-        [
-          authorization.mappingId,
-          authorization.memberId,
-          `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`,
-          (safetyStop ? "d" : "c").repeat(64),
-          safetyStop,
-          safetyStop ? "handoff_required" : "screen_complete",
-        ]
-      );
-    }
-
-    await insertOld(authorizations[0], 9101, false);
-    assert.deepEqual(
-      await readEffectiveSafetyIntake(
-        disposable.pool,
-        authorizations[0].memberId,
-        noticeVersion
-      ),
-      {
-        notice: MEMBER_SAFETY_NOTICE,
-        noticeVersion,
-        status: "not_submitted",
-        safetyStop: null,
-        readiness: { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" },
-        activationPermitted: false,
-        externalCallsPermitted: false,
-      }
-    );
-    const currentClear = await submitSafetyIntake(
-      disposable.pool,
-      authorizations[0],
-      input(9102)
-    );
-    assert.equal(currentClear.safetyIntake.status, "screen_complete");
-    assert.equal(currentClear.safetyIntake.safetyStop, false);
-
-    await insertOld(authorizations[1], 9103, true);
-    const oldStop = await readEffectiveSafetyIntake(
-      disposable.pool,
-      authorizations[1].memberId,
-      noticeVersion
-    );
-    assert.equal(oldStop.status, "handoff_required");
-    assert.equal(oldStop.safetyStop, true);
-    const currentAfterStop = await submitSafetyIntake(
-      disposable.pool,
-      authorizations[1],
-      input(9104)
-    );
-    assert.equal(currentAfterStop.safetyIntake.status, "handoff_required");
-    assert.equal(currentAfterStop.safetyIntake.safetyStop, true);
-  }
-);
+test("PostgreSQL 16 bounds Rollback 012 advisory-lock blocking and reuses the pool", { skip: skipForRoot }, async (t) => {
+  const db = await database(t); const blocker = await db.pool.connect();
+  await blocker.query("BEGIN"); await blocker.query("SELECT pg_advisory_xact_lock(82720512)");
+  await assert.rejects(rollback012({ pool: db.pool, skipConfirmation: true, overallMilliseconds: 100 }), (error) => error.code === "rollback_failed");
+  await blocker.query("ROLLBACK"); blocker.release();
+  assert.equal((await db.pool.query("SELECT 1 AS ready")).rows[0].ready, 1);
+});

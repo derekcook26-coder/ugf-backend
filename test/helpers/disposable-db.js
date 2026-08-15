@@ -25,7 +25,7 @@ function createPoolAdapter(database) {
       ) {
         return { rows: [{}], rowCount: 1 };
       }
-      if (parameters === undefined && /;\s*\S/.test(sql.trim())) {
+      if ((parameters === undefined || parameters.length === 0) && /;\s*\S/.test(sql.trim())) {
         await database.exec(sql);
         return { rows: [], rowCount: 0 };
       }
