@@ -28,14 +28,14 @@ test("member today uses fixed safety wording and imports no provider",()=>{
 });
 test("application JSON parser leaves the today body for its authenticated route parser",()=>{
   const parser=createApplicationJsonParser();
-  for(const originalUrl of ["/goalscoach/member/today","/goalscoach/member/today/"]){
+  for(const originalUrl of ["/goalscoach/member/today","/goalscoach/member/today/","/GOALSCOACH/MEMBER/TODAY","/GoalsCoach/Member/Today/"]){
     let continued=false;
     parser({method:"POST",originalUrl,headers:{}},{},()=>{continued=true;});
     assert.equal(continued,true,originalUrl);
   }
 });
 test("member today parser errors are concealed for both accepted path forms",()=>{
-  for(const path of ["/goalscoach/member/today","/goalscoach/member/today/"]){
+  for(const path of ["/goalscoach/member/today","/goalscoach/member/today/","/GOALSCOACH/MEMBER/TODAY","/GoalsCoach/Member/Today/"]){
     let result;
     const res={headers:{},setHeader(name,value){this.headers[name]=value;},status(status){result={status};return this;},json(body){result.body=body;return this;}};
     goalsCoachErrorHandler(Object.assign(new Error("body parser detail"),{type:"entity.parse.failed"}),{path},res,()=>assert.fail("error should be handled"));

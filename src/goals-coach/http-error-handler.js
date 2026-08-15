@@ -1,10 +1,11 @@
 function goalsCoachErrorHandler(error, req, res, next) {
   if (res.headersSent) return next(error);
+  const normalizedPath = req.path.toLowerCase();
   if (
-    !(req.path === "/staff" || req.path.startsWith("/staff/"))
-    && !(req.path === "/goals-coach" || req.path.startsWith("/goals-coach/"))
-    && !(req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/"))
-    && !(req.path === "/goalscoach" || req.path.startsWith("/goalscoach/"))
+    !(normalizedPath === "/staff" || normalizedPath.startsWith("/staff/"))
+    && !(normalizedPath === "/goals-coach" || normalizedPath.startsWith("/goals-coach/"))
+    && !(normalizedPath === "/alpha/goals-coach" || normalizedPath.startsWith("/alpha/goals-coach/"))
+    && !(normalizedPath === "/goalscoach" || normalizedPath.startsWith("/goalscoach/"))
   ) {
     return next(error);
   }
@@ -47,7 +48,7 @@ function goalsCoachErrorHandler(error, req, res, next) {
     }
   }
 
-  if (req.path === "/goalscoach/member/today" || req.path === "/goalscoach/member/today/") {
+  if (normalizedPath === "/goalscoach/member/today" || normalizedPath === "/goalscoach/member/today/") {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
     if (error && error.type === "entity.too.large") return res.status(413).json({ error: "MEMBER_TODAY_INVALID" });

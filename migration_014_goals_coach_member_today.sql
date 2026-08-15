@@ -5,7 +5,7 @@ CREATE TABLE goals_coach_member_today_attempts (
   auth_mapping_id BIGINT NOT NULL,
   client_request_id UUID NOT NULL,
   request_hash TEXT NOT NULL CHECK (request_hash ~ '^[a-f0-9]{64}$'),
-  original_attempt_id BIGINT REFERENCES goals_coach_member_today_attempts(id) ON DELETE RESTRICT,
+  original_attempt_id BIGINT,
   state_code TEXT NOT NULL CHECK (state_code IN ('SAFETY_REQUIRED','URGENT_STOP','MEDICAL_REVIEW_REQUIRED','CONSENT_REQUIRED','UNAVAILABLE','QUESTION_REQUIRED','READY')),
   safety_outcome TEXT CHECK (safety_outcome IN ('SCREEN_COMPLETE','MODIFICATION_REQUIRED','MEDICAL_REVIEW_REQUIRED','URGENT_STOP')),
   plan_id BIGINT,
@@ -17,9 +17,11 @@ CREATE TABLE goals_coach_member_today_attempts (
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   FOREIGN KEY (auth_mapping_id, member_id) REFERENCES goals_coach_member_auth_mappings(id, member_id) ON DELETE RESTRICT,
+  FOREIGN KEY (original_attempt_id, member_id) REFERENCES goals_coach_member_today_attempts(id, member_id) ON DELETE RESTRICT,
   FOREIGN KEY (plan_id, member_id) REFERENCES coach_plans(id, member_id) ON DELETE RESTRICT,
   FOREIGN KEY (plan_item_id, plan_id) REFERENCES coach_plan_exercises(id, plan_id) ON DELETE RESTRICT,
   UNIQUE (member_id, client_request_id),
+  UNIQUE (id, member_id),
   CHECK ((state_code IN ('QUESTION_REQUIRED','READY') AND plan_id IS NOT NULL AND plan_version IS NOT NULL) OR (state_code NOT IN ('QUESTION_REQUIRED','READY') AND plan_id IS NULL AND plan_version IS NULL)),
   CHECK ((state_code='READY' AND plan_item_id IS NOT NULL) OR (state_code<>'READY' AND plan_item_id IS NULL))
 );
