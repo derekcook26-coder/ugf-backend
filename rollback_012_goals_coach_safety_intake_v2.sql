@@ -1,0 +1,4 @@
+DROP TRIGGER trg_preserve_goals_coach_member_safety_intake_v2_assessment
+  ON goals_coach_member_safety_intake_v2_assessments;
+DROP FUNCTION preserve_goals_coach_member_safety_intake_v2_assessment();
+DROP TABLE goals_coach_member_safety_intake_v2_assessments;

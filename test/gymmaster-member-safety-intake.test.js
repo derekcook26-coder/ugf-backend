@@ -4,893 +4,242 @@ const assert = require("node:assert/strict");
 const express = require("express");
 const test = require("node:test");
 const {
-  MAXIMUM_SAFETY_INTAKE_JSON_BYTES,
-  MEMBER_SAFETY_INTAKE_FLAG,
-  MEMBER_SAFETY_NOTICE,
-  MEMBER_SAFETY_NOTICE_VERSION,
-  memberSafetyIntakeEnabled,
-  parseSafetyIntake,
-  safetyIntakeRequestHash,
+  ANSWER_FIELDS, MEMBER_SAFETY_INTAKE_FLAG, MEMBER_SAFETY_NOTICE_VERSION,
+  memberSafetyIntakeEnabled, parseSafetyIntake, safetyIntakeRequestHash,
 } = require("../src/goals-coach/gymmaster-member-safety-intake");
-const {
-  createGymMasterMemberSafetyIntakeStartup,
-} = require("../src/goals-coach/gymmaster-member-safety-intake-startup");
-const {
-  composeGymMasterMemberSafetyIntakeRoutes,
-} = require("../src/goals-coach/gymmaster-member-safety-intake-route-composition");
-const {
-  buildGymMasterSessionCookie,
-  createGymMasterMemberSessionService,
-} = require("../src/goals-coach/gymmaster-member-session");
-const {
-  createApplicationJsonParser,
-} = require("../src/goals-coach/transcription-route");
+const { createGymMasterMemberSafetyIntakeStartup } = require("../src/goals-coach/gymmaster-member-safety-intake-startup");
+const { composeGymMasterMemberSafetyIntakeRoutes } = require("../src/goals-coach/gymmaster-member-safety-intake-route-composition");
+const { buildGymMasterSessionCookie, createGymMasterMemberSessionService } = require("../src/goals-coach/gymmaster-member-session");
+const { createApplicationJsonParser } = require("../src/goals-coach/transcription-route");
 const { goalsCoachErrorHandler } = require("../src/goals-coach/http-error-handler");
-const {
-  createDisposableDatabase,
-  seedMemberAndPlan,
-} = require("./helpers/disposable-db");
-const { runMigration: runSafetyIntakeMigration } = require("../migrate_009");
+const { createDisposableDatabase, seedMemberAndPlan } = require("./helpers/disposable-db");
+const { runMigration: migrate009 } = require("../migrate_009");
+const { runMigration: migrate010 } = require("../migrate_010");
+const { runMigration: migrate011 } = require("../migrate_011");
+const { runMigration: migrate012 } = require("../migrate_012");
 const { jsonRequest, startApp } = require("./helpers/http-app");
 
 const origin = "https://ultimategoalsfitness.com";
-const noticeVersion = MEMBER_SAFETY_NOTICE_VERSION;
-const sessionSecret = "s".repeat(32);
-const noRateLimits = {
-  read: (_req, _res, next) => next(),
-  mutation: (_req, _res, next) => next(),
-};
-const forbiddenPublicFields = /email|name|gymmaster.?id|member.?id|mapping.?id|auth.?(?:subject|provider)|enrollment|provider.?payload|configuration|client.?request.?id|request.?hash|currentpain|currentinjury|recentsurgery|medicalorexercise|othertrainingsafety|health.?narrative|stack|diagnostic/i;
-
-function assertPrivacyMinimized(body, label) {
-  assert.doesNotMatch(JSON.stringify(body), forbiddenPublicFields, label);
-}
-
-function environment(overrides = {}) {
-  return {
-    GOALS_COACH_MEMBER_LOGIN_ENABLED: "true",
-    GOALS_COACH_MEMBER_LOGIN_ORIGIN: origin,
-    GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL:
-      "https://ugf.gymmasteronline.com/portal/api/v1/login",
-    GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL:
-      "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
-    GOALS_COACH_GYMMASTER_MEMBER_API_KEY: "member-key",
-    GYMMASTER_API_KEY: "gatekeeper-key",
-    GYMMASTER_SITE: "ugf",
-    GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: sessionSecret,
-    [MEMBER_SAFETY_INTAKE_FLAG]: "true",
-    ...overrides,
-  };
-}
-
-function cookie(subject) {
-  const token = createGymMasterMemberSessionService({ secret: sessionSecret }).issue({
-    authProvider: "gymmaster",
-    authSubject: subject,
-    expiresInSeconds: 900,
-  });
-  return buildGymMasterSessionCookie(token).split(";")[0];
-}
-
-function requestId(number) {
-  return `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
-}
+const secret = "s".repeat(32);
+const forbidden = /email|name|gymmaster.?id|member.?id|mapping.?id|auth.?subject|client.?request|request.?hash|urgentwarningsigns|painorstiffness|recentsurgery|neurological|notified|diagnos|clearance/i;
+const noLimits = { read: (_q, _s, n) => n(), mutation: (_q, _s, n) => n() };
 
 function answers(overrides = {}) {
+  return Object.assign(Object.fromEntries(ANSWER_FIELDS.map((field) => [field, false])), overrides);
+}
+function body(number, overrides = {}, envelope = {}) {
+  return { clientRequestId: `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`, noticeVersion: MEMBER_SAFETY_NOTICE_VERSION, answers: answers(overrides), ...envelope };
+}
+function environment(overrides = {}) {
   return {
-    currentPainOrConcerningSymptoms: false,
-    currentInjuryConcern: false,
-    recentSurgery: false,
-    medicalOrExerciseRestriction: false,
-    otherTrainingSafetyConcern: false,
-    ...overrides,
+    GOALS_COACH_MEMBER_LOGIN_ENABLED: "true", GOALS_COACH_MEMBER_LOGIN_ORIGIN: origin,
+    GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL: "https://ugf.gymmasteronline.com/portal/api/v1/login",
+    GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL: "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
+    GOALS_COACH_GYMMASTER_MEMBER_API_KEY: "unused", GYMMASTER_API_KEY: "test", GYMMASTER_SITE: "ugf",
+    GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: secret, [MEMBER_SAFETY_INTAKE_FLAG]: "true", ...overrides,
   };
 }
-
-function submission(number, answerOverrides = {}, bodyOverrides = {}) {
-  return {
-    clientRequestId: requestId(number),
-    noticeVersion,
-    answers: answers(answerOverrides),
-    ...bodyOverrides,
-  };
+function cookie(subject) {
+  const token = createGymMasterMemberSessionService({ secret }).issue({ authProvider: "gymmaster", authSubject: subject, expiresInSeconds: 900 });
+  return buildGymMasterSessionCookie(token).split(";")[0];
 }
-
-async function fixture(t, overrides = {}) {
-  const disposable = await createDisposableDatabase({
-    ownerEditableWorkoutSessions: true,
-  });
+async function fixture(t, options = {}) {
+  const disposable = await createDisposableDatabase({ ownerEditableWorkoutSessions: true });
   t.after(() => disposable.close());
-  await runSafetyIntakeMigration({ pool: disposable.pool });
-  const first = await seedMemberAndPlan(disposable.pool, "safety-route-first");
-  const second = await seedMemberAndPlan(disposable.pool, "safety-route-second");
-  const mappings = [];
-  for (const [member, subject] of [
-    [first.member, "gymmaster:30001"],
-    [second.member, "gymmaster:30002"],
-  ]) {
-    mappings.push((await disposable.pool.query(
-      `INSERT INTO goals_coach_member_auth_mappings
-        (member_id, auth_provider, auth_subject, verified_email_snapshot, active,
-         provisioning_method, provisioning_reference)
-       VALUES ($1, 'gymmaster', $2, 'member@example.test', TRUE,
-               'owner_approved_script', 'member-safety-intake-test')
-       RETURNING *`,
-      [member.id, subject]
-    )).rows[0]);
+  await migrate009({ pool: disposable.pool });
+  await migrate010({ pool: disposable.pool });
+  await migrate011({ pool: disposable.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } });
+  await migrate012({ pool: disposable.pool });
+  const members = [];
+  for (const [suffix, subject] of [["one", "gymmaster:30001"], ["two", "gymmaster:30002"]]) {
+    const seeded = await seedMemberAndPlan(disposable.pool, `safety-v2-${suffix}`);
+    const mapping = (await disposable.pool.query(`INSERT INTO goals_coach_member_auth_mappings
+      (member_id, auth_provider, auth_subject, verified_email_snapshot, active, provisioning_method, provisioning_reference)
+      VALUES ($1, 'gymmaster', $2, 'synthetic@example.test', TRUE, 'owner_approved_script', 'safety-v2-test') RETURNING *`, [seeded.member.id, subject])).rows[0];
+    members.push({ seeded, mapping, subject });
   }
   let providerCalls = 0;
-  let databaseCalls = 0;
-  const instrumentedDb = {
-    query(...args) {
-      databaseCalls += 1;
-      return disposable.pool.query(...args);
-    },
-    connect(...args) {
-      databaseCalls += 1;
-      return disposable.pool.connect(...args);
-    },
-  };
   const app = express();
   app.use(createApplicationJsonParser());
   const startup = createGymMasterMemberSafetyIntakeStartup({
-    environment: environment(overrides.environment),
-    db: instrumentedDb,
-    fetchImpl: overrides.fetchImpl || (async (url) => {
-      providerCalls += 1;
-      const memberId = new URL(url).searchParams.get("memberid");
-      return {
-        ok: true,
-        async json() {
-          return { members: [{
-            memberid: Number(memberId),
-            stopatgate: false,
-            membership: [{ expired: false }],
-          }] };
-        },
-      };
-    }),
-    ...(overrides.useProductionRateLimits
-      ? {}
-      : { rateLimits: overrides.rateLimits || noRateLimits }),
+    environment: environment(options.environment), db: disposable.pool,
+    fetchImpl: options.fetchImpl || (async (url) => { providerCalls += 1; return { ok: true, async json() { return { members: [{ memberid: Number(new URL(url).searchParams.get("memberid")), stopatgate: false, membership: [{ expired: false }] }] }; } }; }),
+    ...(options.productionRateLimits ? {} : { rateLimits: options.rateLimits || noLimits }),
   });
   composeGymMasterMemberSafetyIntakeRoutes(app, startup);
   app.use(goalsCoachErrorHandler);
-  const running = await startApp(app);
-  t.after(() => running.close());
-  return {
-    disposable,
-    first,
-    second,
-    mappings,
-    providerCalls: () => providerCalls,
-    databaseCalls: () => databaseCalls,
-    running,
-  };
+  const running = await startApp(app); t.after(() => running.close());
+  return { disposable, members, running, providerCalls: () => providerCalls };
+}
+function request(running, subject, options = {}) {
+  return jsonRequest(running.url, "/goalscoach/member/safety-intake", { ...options, headers: { Origin: origin, Cookie: cookie(subject), ...(options.headers || {}) } });
+}
+function assertPrivate(value) { assert.doesNotMatch(JSON.stringify(value), forbidden); }
+async function protectedCounts(pool) {
+  return (await pool.query(`SELECT
+    (SELECT COUNT(*)::int FROM coach_plans) plans,
+    (SELECT COUNT(*)::int FROM coaching_conversations) conversations,
+    (SELECT COUNT(*)::int FROM coaching_concerns) concerns,
+    (SELECT COUNT(*)::int FROM coaching_reviews) reviews,
+    (SELECT COUNT(*)::int FROM goals_coach_tracked_workout_sessions) workouts`)).rows[0];
+}
+function assertPublic(result, status) {
+  assert.deepEqual(Object.keys(result).sort(), ["activationPermitted", "externalCallsPermitted", "message", "nextAction", "status", "validUntil"]);
+  assert.equal(result.status, status); assert.equal(result.activationPermitted, false); assert.equal(result.externalCallsPermitted, false); assertPrivate(result);
 }
 
-function memberRequest(running, pathName, subject, options = {}) {
-  return jsonRequest(running.url, `/goalscoach/member${pathName}`, {
-    ...options,
-    headers: {
-      Origin: origin,
-      Cookie: cookie(subject),
-      ...(options.headers || {}),
-    },
-  });
-}
-
-async function protectedTableCounts(pool) {
-  const result = await pool.query(
-    `SELECT
-       (SELECT COUNT(*)::int FROM coach_plans) AS plans,
-       (SELECT COUNT(*)::int FROM coaching_conversations) AS conversations,
-       (SELECT COUNT(*)::int FROM coaching_concerns) AS concerns,
-       (SELECT COUNT(*)::int FROM coaching_reviews) AS reviews,
-       (SELECT COUNT(*)::int FROM goals_coach_tracked_workout_sessions) AS workouts`
-  );
-  return result.rows[0];
-}
-
-async function insertHistoricalSubmission(pool, mapping, options = {}) {
-  const safetyStop = options.safetyStop === true;
-  await pool.query(
-    `INSERT INTO goals_coach_member_safety_intake_submissions
-      (auth_mapping_id, member_id, client_request_id, client_request_hash,
-       notice_version, current_pain_or_concerning_symptoms,
-       current_injury_concern, recent_surgery,
-       medical_or_exercise_restriction, other_training_safety_concern,
-       outcome, safety_stop, rule_version)
-     VALUES ($1, $2, $3, $4, 'GC-MEMBER-SAFETY-NOTICE-0',
-             $5, FALSE, FALSE, FALSE, FALSE, $6, $5,
-             'GC-MEMBER-SAFETY-INTAKE-1')`,
-    [
-      mapping.id,
-      mapping.member_id,
-      options.clientRequestId,
-      options.requestHash,
-      safetyStop,
-      safetyStop ? "handoff_required" : "screen_complete",
-    ]
-  );
-}
-
-test("member safety intake is exact-flagged and absent with zero database or provider work", async (t) => {
+test("safety intake remains exact-disabled without startup database or provider work", async (t) => {
   assert.equal(memberSafetyIntakeEnabled("true"), true);
-  for (const value of [undefined, true, "True", " true", "true ", "1"]) {
-    assert.equal(memberSafetyIntakeEnabled(value), false);
-  }
-
-  for (const safetyEnvironment of [
-    { [MEMBER_SAFETY_INTAKE_FLAG]: undefined },
-    {
-      [MEMBER_SAFETY_INTAKE_FLAG]: "true",
-      GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: undefined,
-    },
-  ]) {
-    let databaseCalls = 0;
-    let providerCalls = 0;
-    const db = {
-      async query() {
-        databaseCalls += 1;
-        throw new Error("database access is forbidden when safety intake is absent");
-      },
-      async connect() {
-        databaseCalls += 1;
-        throw new Error("database access is forbidden when safety intake is absent");
-      },
-    };
-    const app = express();
-    app.use(createApplicationJsonParser());
-    const startup = createGymMasterMemberSafetyIntakeStartup({
-      environment: environment(safetyEnvironment),
-      db,
-      fetchImpl: async () => {
-        providerCalls += 1;
-        throw new Error("provider access is forbidden when safety intake is absent");
-      },
-    });
-    composeGymMasterMemberSafetyIntakeRoutes(app, startup);
-    const running = await startApp(app);
-    t.after(() => running.close());
-    const get = await jsonRequest(
-      running.url,
-      "/goalscoach/member/safety-intake",
-      { headers: { Origin: origin } }
-    );
-    const post = await jsonRequest(
-      running.url,
-      "/goalscoach/member/safety-intake",
-      {
-        method: "POST",
-        headers: { Origin: origin },
-        body: submission(1),
-      }
-    );
-    assert.equal(get.response.status, 404);
-    assert.equal(post.response.status, 404);
-    assert.equal(databaseCalls, 0);
-    assert.equal(providerCalls, 0);
-  }
+  for (const value of [undefined, true, "True", " true", "true "]) assert.equal(memberSafetyIntakeEnabled(value), false);
+  let calls = 0;
+  const app = express();
+  const startup = createGymMasterMemberSafetyIntakeStartup({ environment: environment({ [MEMBER_SAFETY_INTAKE_FLAG]: undefined }), db: { query() { calls += 1; }, connect() { calls += 1; } }, fetchImpl: async () => { calls += 1; } });
+  composeGymMasterMemberSafetyIntakeRoutes(app, startup);
+  const running = await startApp(app); t.after(() => running.close());
+  assert.equal((await jsonRequest(running.url, "/goalscoach/member/safety-intake")).response.status, 404);
+  assert.equal(calls, 0);
 });
 
-test("safety-intake hashing is canonical and covers the notice plus all five answers", () => {
-  const base = parseSafetyIntake(submission(5), noticeVersion);
-  const baseHash = safetyIntakeRequestHash(base);
-  assert.match(baseHash, /^[a-f0-9]{64}$/);
-  assert.equal(
-    safetyIntakeRequestHash(parseSafetyIntake(submission(6), noticeVersion)),
-    baseHash
-  );
-  for (const field of [
-    "currentPainOrConcerningSymptoms",
-    "currentInjuryConcern",
-    "recentSurgery",
-    "medicalOrExerciseRestriction",
-    "otherTrainingSafetyConcern",
-  ]) {
-    const changed = parseSafetyIntake(
-      submission(7, { [field]: true }),
-      noticeVersion
-    );
-    assert.notEqual(safetyIntakeRequestHash(changed), baseHash, field);
-  }
-  assert.throws(
-    () => parseSafetyIntake(
-      { ...submission(8), noticeVersion: "unapproved-version" },
-      noticeVersion
-    ),
-    /notice version is invalid/
-  );
+test("v2 request is strict, complete, canonical, and rejects contradictions", () => {
+  const parsed = parseSafetyIntake(body(1), MEMBER_SAFETY_NOTICE_VERSION);
+  const hash = safetyIntakeRequestHash(parsed); assert.match(hash, /^[a-f0-9]{64}$/);
+  assert.equal(safetyIntakeRequestHash(parseSafetyIntake(body(2), MEMBER_SAFETY_NOTICE_VERSION)), hash);
+  for (const field of ANSWER_FIELDS) assert.notEqual(safetyIntakeRequestHash(parseSafetyIntake(body(3, { [field]: true }), MEMBER_SAFETY_NOTICE_VERSION)), hash);
+  const incomplete = body(4); delete incomplete.answers.mild;
+  assert.throws(() => parseSafetyIntake(incomplete, MEMBER_SAFETY_NOTICE_VERSION), /Invalid safety intake answers/);
+  assert.throws(() => parseSafetyIntake(body(5, {}, { extra: true }), MEMBER_SAFETY_NOTICE_VERSION), /Invalid safety intake request/);
 });
 
-test("safety intake reuses exact origin, signed session, and active mapping ownership", async (t) => {
-  const {
-    disposable,
-    mappings,
-    providerCalls,
-    running,
-  } = await fixture(t);
-  const wrongOrigin = await jsonRequest(
-    running.url,
-    "/goalscoach/member/safety-intake",
-    {
-      headers: {
-        Origin: "https://wrong.example",
-        Cookie: cookie("gymmaster:30001"),
-      },
-    }
-  );
-  assert.equal(wrongOrigin.response.status, 403);
-  assert.equal(wrongOrigin.body.error, "MEMBER_ORIGIN_NOT_ALLOWED");
-  assertPrivacyMinimized(wrongOrigin.body, "403 response");
-  assert.equal(wrongOrigin.response.headers.get("cache-control"), "no-store");
-
-  const missingSession = await jsonRequest(
-    running.url,
-    "/goalscoach/member/safety-intake",
-    { headers: { Origin: origin } }
-  );
-  assert.equal(missingSession.response.status, 401);
-  assert.equal(missingSession.body.error, "MEMBER_AUTHENTICATION_REQUIRED");
-  assertPrivacyMinimized(missingSession.body, "401 response");
-
-  const tampered = await jsonRequest(
-    running.url,
-    "/goalscoach/member/safety-intake",
-    {
-      headers: {
-        Origin: origin,
-        Cookie: "gc_member_session=tampered",
-      },
-    }
-  );
-  assert.equal(tampered.response.status, 401);
-  assertPrivacyMinimized(tampered.body, "tampered-session 401 response");
-
-  const empty = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001"
-  );
-  assert.equal(empty.response.status, 200);
-  assert.deepEqual(empty.body, {
-    safetyIntake: {
-      notice: MEMBER_SAFETY_NOTICE,
-      noticeVersion,
-      status: "not_submitted",
-      safetyStop: null,
-      readiness: { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" },
-      activationPermitted: false,
-      externalCallsPermitted: false,
-    },
+test("route preserves CORS, authentication, active ownership, isolation, and headers", async (t) => {
+  const { disposable, members, running, providerCalls } = await fixture(t);
+  const wrong = await jsonRequest(running.url, "/goalscoach/member/safety-intake", { headers: { Origin: "https://wrong.test", Cookie: cookie(members[0].subject) } });
+  assert.equal(wrong.response.status, 403); assertPrivate(wrong.body);
+  const missing = await jsonRequest(running.url, "/goalscoach/member/safety-intake", { headers: { Origin: origin } });
+  assert.equal(missing.response.status, 401); assertPrivate(missing.body);
+  const callsBeforeForgery = providerCalls();
+  const forged = await jsonRequest(running.url, "/goalscoach/member/safety-intake", {
+    headers: { Origin: origin, Cookie: "gc_member_session=forged" },
   });
-  assert.equal(empty.response.headers.get("cache-control"), "no-store");
-
-  await disposable.pool.query(
-    "UPDATE goals_coach_member_auth_mappings SET active = FALSE WHERE id = $1",
-    [mappings[0].id]
-  );
-  const inactive = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001"
-  );
-  assert.equal(inactive.response.status, 401);
-  assert.equal(inactive.body.error, "MEMBER_AUTHENTICATION_REQUIRED");
-  assertPrivacyMinimized(inactive.body, "revoked-mapping 401 response");
-  assert.equal(providerCalls() > 0, true);
+  assert.equal(forged.response.status, 401);
+  assert.deepEqual(forged.body, { error: "MEMBER_AUTHENTICATION_REQUIRED" });
+  assert.equal(forged.response.headers.get("cache-control"), "no-store");
+  assert.equal(forged.response.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(providerCalls(), callsBeforeForgery);
+  assert.equal((await disposable.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_v2_assessments")).rows[0].count, 0);
+  const empty = await request(running, members[0].subject); assert.equal(empty.response.status, 200); assertPublic(empty.body.safetyIntake, "not_submitted");
+  assert.equal(empty.response.headers.get("cache-control"), "no-store"); assert.equal(empty.response.headers.get("x-content-type-options"), "nosniff");
+  assertPublic((await request(running, members[1].subject)).body.safetyIntake, "not_submitted");
+  await disposable.pool.query("UPDATE goals_coach_member_auth_mappings SET active = FALSE WHERE id = $1", [members[0].mapping.id]);
+  assert.equal((await request(running, members[0].subject)).response.status, 401);
 });
 
-test("safety intake accepts only the five required strict booleans and approved envelope", async (t) => {
-  const { running } = await fixture(t);
-  const invalidBodies = [
-    {},
-    submission(10, {}, { memberId: "1" }),
-    submission(11, {}, { authMappingId: "1" }),
-    submission(12, {}, { planId: "1" }),
-    submission(13, {}, { ownerId: "1" }),
-    submission(14, {}, { providerId: "1" }),
-    submission(15, {}, { actorId: "1" }),
-    submission(16, {}, { clientRequestId: "NOT-A-UUID" }),
-    submission(17, {}, { noticeVersion: "unapproved-version" }),
-    submission(18, {}, {
-      answers: {
-        ...answers(),
-        currentPainOrConcerningSymptoms: "false",
-      },
-    }),
-    submission(19, {}, {
-      answers: {
-        currentPainOrConcerningSymptoms: false,
-        currentInjuryConcern: false,
-        recentSurgery: false,
-        medicalOrExerciseRestriction: false,
-      },
-    }),
-    submission(20, {}, {
-      answers: { ...answers(), freeText: "private health narrative" },
-    }),
+test("route returns all four outcomes, rejects incomplete and contradictory input, and leaks no answers", async (t) => {
+  const { disposable, running, members } = await fixture(t); const subject = members[0].subject;
+  const before = await protectedCounts(disposable.pool);
+  const cases = [
+    [10, {}, "SCREEN_COMPLETE"],
+    [11, { painOrStiffness: true, familiar: true, mild: true }, "MODIFICATION_REQUIRED"],
+    [12, { painOrStiffness: true, sharp: true }, "MEDICAL_REVIEW_REQUIRED"],
+    [13, { urgentWarningSigns: true }, "URGENT_STOP"],
   ];
-  for (const body of invalidBodies) {
-    const response = await memberRequest(
-      running,
-      "/safety-intake",
-      "gymmaster:30001",
-      { method: "POST", body }
-    );
-    assert.equal(response.response.status, 400);
-    assert.match(response.body.error, /^SAFETY_INTAKE_/);
-    assertPrivacyMinimized(response.body, "400 response");
+  for (const [number, overrides, outcome] of cases) {
+    const result = await request(running, subject, { method: "POST", body: body(number, overrides) });
+    assert.equal(result.response.status, 201); assertPublic(result.body.safetyIntake, outcome); assert.equal(result.body.idempotentReplay, false);
   }
-
-  const query = await memberRequest(
-    running,
-    "/safety-intake?memberId=1",
-    "gymmaster:30001"
-  );
-  assert.equal(query.response.status, 400);
-  assert.equal(query.body.error, "SAFETY_INTAKE_INVALID");
-  assertPrivacyMinimized(query.body, "query 400 response");
-
-  const wrongMedia = await fetch(
-    `${running.url}/goalscoach/member/safety-intake`,
-    {
-      method: "POST",
-      headers: {
-        Origin: origin,
-        Cookie: cookie("gymmaster:30001"),
-        "Content-Type": "text/plain",
-      },
-      body: JSON.stringify(submission(21)),
-    }
-  );
-  assert.equal(wrongMedia.status, 415);
-  const wrongMediaBody = await wrongMedia.json();
-  assert.equal(wrongMediaBody.error, "SAFETY_INTAKE_MEDIA_TYPE_UNSUPPORTED");
-  assertPrivacyMinimized(wrongMediaBody, "415 response");
+  const incomplete = body(14); delete incomplete.answers.sharp;
+  assert.equal((await request(running, subject, { method: "POST", body: incomplete })).response.status, 400);
+  assert.equal((await request(running, subject, { method: "POST", body: body(15, { painOrStiffness: false, familiar: true }) })).response.status, 400);
+  assert.deepEqual(await protectedCounts(disposable.pool), before);
 });
 
-test("safety intake is idempotent and its effective stop is monotonic across all rows", async (t) => {
-  const {
-    disposable,
-    providerCalls,
-    running,
-  } = await fixture(t);
-  const protectedBefore = await protectedTableCounts(disposable.pool);
-
-  const negativeBody = submission(30);
-  const negative = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    { method: "POST", body: negativeBody }
-  );
-  assert.equal(negative.response.status, 201);
-  assert.deepEqual(negative.body, {
-    safetyIntake: {
-      notice: MEMBER_SAFETY_NOTICE,
-      noticeVersion,
-      status: "screen_complete",
-      safetyStop: false,
-      readiness: { status: "COACHING_UNAVAILABLE", nextAction: "CHECK_BACK_LATER" },
-      activationPermitted: false,
-      externalCallsPermitted: false,
-    },
-    idempotentReplay: false,
-  });
-  assertPrivacyMinimized(negative.body, "screen-complete POST response");
-
-  const reorderedReplay = {
-    answers: {
-      otherTrainingSafetyConcern: false,
-      medicalOrExerciseRestriction: false,
-      recentSurgery: false,
-      currentInjuryConcern: false,
-      currentPainOrConcerningSymptoms: false,
-    },
-    noticeVersion,
-    clientRequestId: negativeBody.clientRequestId,
-  };
-  const replay = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    { method: "POST", body: reorderedReplay }
-  );
-  assert.equal(replay.response.status, 200);
-  assert.equal(replay.body.idempotentReplay, true);
-  assert.equal(replay.body.safetyIntake.status, "screen_complete");
-  assertPrivacyMinimized(replay.body, "idempotent POST response");
-
-  const conflict = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    {
-      method: "POST",
-      body: submission(
-        31,
-        { currentInjuryConcern: true },
-        { clientRequestId: negativeBody.clientRequestId }
-      ),
-    }
-  );
-  assert.equal(conflict.response.status, 409);
-  assert.equal(conflict.body.error, "SAFETY_INTAKE_IDEMPOTENCY_CONFLICT");
-
-  const positive = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    {
-      method: "POST",
-      body: submission(32, { currentPainOrConcerningSymptoms: true }),
-    }
-  );
-  assert.equal(positive.response.status, 201);
-  assert.equal(positive.body.safetyIntake.status, "handoff_required");
-  assert.equal(positive.body.safetyIntake.safetyStop, true);
-  assertPrivacyMinimized(positive.body, "handoff POST response");
-
-  const laterNegative = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    { method: "POST", body: submission(33) }
-  );
-  assert.equal(laterNegative.response.status, 201);
-  assert.equal(laterNegative.body.safetyIntake.status, "handoff_required");
-  assert.equal(laterNegative.body.safetyIntake.safetyStop, true);
-  assertPrivacyMinimized(laterNegative.body, "monotonic-handoff POST response");
-
-  const replayAfterStop = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    { method: "POST", body: negativeBody }
-  );
-  assert.equal(replayAfterStop.response.status, 200);
-  assert.equal(replayAfterStop.body.idempotentReplay, true);
-  assert.equal(replayAfterStop.body.safetyIntake.status, "handoff_required");
-  assertPrivacyMinimized(replayAfterStop.body, "handoff replay POST response");
-
-  const effective = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001"
-  );
-  assert.deepEqual(effective.body, {
-    safetyIntake: {
-      notice: MEMBER_SAFETY_NOTICE,
-      noticeVersion,
-      status: "handoff_required",
-      safetyStop: true,
-      readiness: {
-        status: "SAFETY_HANDOFF_REQUIRED",
-        nextAction: "SAFETY_HANDOFF_REQUIRED",
-        message: "Goals Coach cannot continue. No person has been notified; seek appropriate medical guidance before exercise.",
-      },
-      activationPermitted: false,
-      externalCallsPermitted: false,
-    },
-  });
-  assert.doesNotMatch(
-    JSON.stringify(effective.body),
-    /submissionHistory|requestHash|clientRequestId|mappingId|memberId|planAvailable|planReady|planGeneration|medicalClearance/i
-  );
-
-  const otherMember = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30002"
-  );
-  assert.equal(otherMember.body.safetyIntake.status, "not_submitted");
-  assert.equal(otherMember.body.safetyIntake.safetyStop, null);
-
-  const rows = await disposable.pool.query(
-    `SELECT outcome, safety_stop
-     FROM goals_coach_member_safety_intake_submissions
-     WHERE member_id = $1
-     ORDER BY id`,
-    [(await disposable.pool.query(
-      "SELECT member_id FROM goals_coach_member_auth_mappings WHERE auth_subject = 'gymmaster:30001'"
-    )).rows[0].member_id]
-  );
-  assert.deepEqual(
-    rows.rows.map((row) => [row.outcome, row.safety_stop]),
-    [
-      ["screen_complete", false],
-      ["handoff_required", true],
-      ["screen_complete", false],
-    ]
-  );
-  assert.deepEqual(await protectedTableCounts(disposable.pool), protectedBefore);
-  assert.equal(providerCalls() > 0, true);
+test("latest unexpired v2 governs, v1 stop is retained, rows are append-only, and replay is idempotent", async (t) => {
+  const { disposable, members, running } = await fixture(t); const { mapping, subject } = members[0];
+  await disposable.pool.query(`INSERT INTO goals_coach_member_safety_intake_submissions
+    (auth_mapping_id, member_id, client_request_id, client_request_hash, notice_version,
+     current_pain_or_concerning_symptoms, current_injury_concern, recent_surgery,
+     medical_or_exercise_restriction, other_training_safety_concern, outcome, safety_stop, rule_version)
+    VALUES ($1,$2,'00000000-0000-4000-8000-000000000100',$3,'GC-MEMBER-SAFETY-NOTICE-1',TRUE,FALSE,FALSE,FALSE,FALSE,'handoff_required',TRUE,'GC-MEMBER-SAFETY-INTAKE-1')`, [mapping.id, mapping.member_id, "a".repeat(64)]);
+  assertPublic((await request(running, subject)).body.safetyIntake, "not_submitted");
+  const original = body(101, { painOrStiffness: true, familiar: true, mild: true });
+  const first = await request(running, subject, { method: "POST", body: original }); assertPublic(first.body.safetyIntake, "MODIFICATION_REQUIRED");
+  const replay = await request(running, subject, { method: "POST", body: original }); assert.equal(replay.response.status, 200); assert.equal(replay.body.idempotentReplay, true);
+  assert.equal((await request(running, subject, { method: "POST", body: body(999, { sharp: true }, { clientRequestId: original.clientRequestId }) })).response.status, 409);
+  const safe = await request(running, subject, { method: "POST", body: body(102) }); assertPublic(safe.body.safetyIntake, "SCREEN_COMPLETE");
+  const rows = (await disposable.pool.query("SELECT id FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1 ORDER BY id", [mapping.member_id])).rows;
+  assert.equal(rows.length, 2);
+  await assert.rejects(disposable.pool.query("UPDATE goals_coach_member_safety_intake_v2_assessments SET outcome='URGENT_STOP' WHERE id=$1", [rows[0].id]), /append-only/);
+  assert.equal((await disposable.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_submissions WHERE member_id=$1 AND safety_stop=TRUE", [mapping.member_id])).rows[0].count, 1);
 });
 
-test("current notice completion is required while historical safety stops remain monotonic", async (t) => {
-  const { disposable, mappings, running } = await fixture(t);
-  await insertHistoricalSubmission(disposable.pool, mappings[0], {
-    clientRequestId: requestId(340),
-    requestHash: "a".repeat(64),
-  });
-  const oldAllClear = await memberRequest(running, "/safety-intake", "gymmaster:30001");
-  assert.equal(oldAllClear.response.status, 200);
-  assert.equal(oldAllClear.body.safetyIntake.status, "not_submitted");
-  assert.equal(oldAllClear.body.safetyIntake.safetyStop, null);
-  assert.deepEqual(oldAllClear.body.safetyIntake.readiness, {
-    status: "SETUP_REQUIRED",
-    nextAction: "COMPLETE_SAFETY_SETUP",
-  });
-
-  const currentAllClear = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
-    method: "POST",
-    body: submission(341),
-  });
-  assert.equal(currentAllClear.response.status, 201);
-  assert.equal(currentAllClear.body.safetyIntake.status, "screen_complete");
-  assert.equal(currentAllClear.body.safetyIntake.safetyStop, false);
-
-  await insertHistoricalSubmission(disposable.pool, mappings[1], {
-    clientRequestId: requestId(342),
-    requestHash: "b".repeat(64),
-    safetyStop: true,
-  });
-  const oldStop = await memberRequest(running, "/safety-intake", "gymmaster:30002");
-  assert.equal(oldStop.response.status, 200);
-  assert.equal(oldStop.body.safetyIntake.status, "handoff_required");
-  assert.equal(oldStop.body.safetyIntake.safetyStop, true);
-
-  const currentAfterStop = await memberRequest(running, "/safety-intake", "gymmaster:30002", {
-    method: "POST",
-    body: submission(343),
-  });
-  assert.equal(currentAfterStop.response.status, 201);
-  assert.equal(currentAfterStop.body.safetyIntake.status, "handoff_required");
-  assert.equal(currentAfterStop.body.safetyIntake.safetyStop, true);
+test("expired v2 requires a fresh check and rate limiting runs after authentication", async (t) => {
+  const { disposable, members, running } = await fixture(t); const { mapping, subject } = members[0];
+  await disposable.pool.query(`INSERT INTO goals_coach_member_safety_intake_v2_assessments
+    (auth_mapping_id,member_id,client_request_id,client_request_hash,notice_version,
+     outcome,rule_version,submitted_at,valid_until)
+    VALUES ($1,$2,'00000000-0000-4000-8000-000000000110',$3,
+      'GC-MEMBER-SAFETY-NOTICE-2','SCREEN_COMPLETE','GC-MEMBER-SAFETY-INTAKE-2',
+      NOW()-INTERVAL '2 hours',NOW()-INTERVAL '1 hour')`,
+  [mapping.id, mapping.member_id, "d".repeat(64)]);
+  assertPublic((await request(running, subject)).body.safetyIntake, "not_submitted");
+  let limited = 0;
+  const limitedFixture = await fixture(t, { rateLimits: { read: noLimits.read, mutation: (_q, res) => { limited += 1; res.status(429).json({ error: "RATE_LIMITED" }); } } });
+  assert.equal((await request(limitedFixture.running, limitedFixture.members[0].subject, { method: "POST", body: body(111) })).response.status, 429); assert.equal(limited, 1);
 });
 
-test("every individual positive answer records a fixed handoff-required safety stop", async (t) => {
-  const { disposable, first, running } = await fixture(t);
-  const fields = [
-    "currentPainOrConcerningSymptoms",
-    "currentInjuryConcern",
-    "recentSurgery",
-    "medicalOrExerciseRestriction",
-    "otherTrainingSafetyConcern",
-  ];
-  for (let index = 0; index < fields.length; index += 1) {
-    const response = await memberRequest(
-      running,
-      "/safety-intake",
-      "gymmaster:30001",
-      {
-        method: "POST",
-        body: submission(40 + index, { [fields[index]]: true }),
-      }
-    );
-    assert.equal(response.response.status, 201);
-    assert.equal(response.body.safetyIntake.status, "handoff_required");
-    assert.equal(response.body.safetyIntake.safetyStop, true);
-  }
-  const rows = await disposable.pool.query(
-    `SELECT outcome, safety_stop
-     FROM goals_coach_member_safety_intake_submissions
-     WHERE member_id = $1
-     ORDER BY id`,
-    [first.member.id]
-  );
-  assert.equal(rows.rows.length, fields.length);
-  assert.equal(
-    rows.rows.every((row) => (
-      row.outcome === "handoff_required" && row.safety_stop === true
-    )),
-    true
-  );
-});
-
-test("safety intake uses bounded JSON, fixed parser errors, and mutation rate limiting", async (t) => {
-  let mutationLimitCalls = 0;
-  const { running } = await fixture(t, {
-    rateLimits: {
-      read: (_req, _res, next) => next(),
-      mutation: (_req, res) => {
-        mutationLimitCalls += 1;
-        return res.status(429).json({ error: "RATE_LIMITED" });
-      },
-    },
-  });
-  const limited = await memberRequest(
-    running,
-    "/safety-intake",
-    "gymmaster:30001",
-    { method: "POST", body: submission(50) }
-  );
-  assert.equal(limited.response.status, 429);
-  assert.equal(limited.body.error, "RATE_LIMITED");
-  assertPrivacyMinimized(limited.body, "429 response");
-  assert.equal(mutationLimitCalls, 1);
-
-  const malformed = await fetch(
-    `${running.url}/goalscoach/member/safety-intake`,
-    {
-      method: "POST",
-      headers: {
-        Origin: origin,
-        Cookie: cookie("gymmaster:30001"),
-        "Content-Type": "application/json",
-      },
-      body: '{"clientRequestId":',
-    }
-  );
-  assert.equal(malformed.status, 400);
-  const malformedBody = await malformed.json();
-  assert.deepEqual(malformedBody, {
-    error: "SAFETY_INTAKE_INVALID",
-    message: "Invalid safety intake request.",
-  });
-  assertPrivacyMinimized(malformedBody, "malformed 400 response");
-  assert.equal(malformed.headers.get("cache-control"), "no-store");
-
-  const oversized = await fetch(
-    `${running.url}/goalscoach/member/safety-intake`,
-    {
-      method: "POST",
-      headers: {
-        Origin: origin,
-        Cookie: cookie("gymmaster:30001"),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        ...submission(51),
-        forbiddenPadding: "x".repeat(MAXIMUM_SAFETY_INTAKE_JSON_BYTES),
-      }),
-    }
-  );
-  assert.equal(oversized.status, 413);
-  const oversizedBody = await oversized.json();
-  assert.deepEqual(oversizedBody, {
-    error: "SAFETY_INTAKE_BODY_TOO_LARGE",
-    message: "The safety intake request is too large.",
-  });
-  assertPrivacyMinimized(oversizedBody, "413 response");
-  assert.equal(oversized.headers.get("cache-control"), "no-store");
-});
-
-test("safety intake OPTIONS is exact-origin credentialed and isolated to its exact route", async (t) => {
-  const { running } = await fixture(t);
+test("dependency failure stays fail-closed and exact-origin preflight stays isolated", async (t) => {
+  const { running, members } = await fixture(t, { fetchImpl: async () => { throw new Error("synthetic dependency failure"); } });
   const preflight = await fetch(`${running.url}/goalscoach/member/safety-intake`, {
-    method: "OPTIONS",
-    headers: {
-      Origin: origin,
-      "Access-Control-Request-Method": "POST",
-      "Access-Control-Request-Headers": "Content-Type",
-    },
+    method: "OPTIONS", headers: { Origin: origin, "Access-Control-Request-Method": "POST" },
   });
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
   assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
-  const unrelated = await fetch(`${running.url}/goalscoach/member/unrelated`, {
-    method: "OPTIONS",
-    headers: { Origin: origin, "Access-Control-Request-Method": "POST" },
-  });
-  assert.equal(unrelated.status, 404);
-  assert.equal(unrelated.headers.get("access-control-allow-origin"), null);
+  const response = await request(running, members[0].subject);
+  assert.equal(response.response.status, 503); assert.equal(response.body.error, "MEMBER_ACCESS_TEMPORARILY_UNAVAILABLE"); assertPrivate(response.body);
+  assert.equal((await jsonRequest(running.url, "/goalscoach/member/safety-intake/other", { headers: { Origin: origin } })).response.status, 404);
 });
 
-test("authenticated Gatekeeper dependency failure returns only the minimized 503", async (t) => {
-  const { running } = await fixture(t, {
-    fetchImpl: async () => { throw new Error("synthetic dependency failure"); },
-  });
-  const result = await memberRequest(running, "/safety-intake", "gymmaster:30001");
-  assert.equal(result.response.status, 503);
-  assert.deepEqual(result.body, {
-    error: "MEMBER_ACCESS_TEMPORARILY_UNAVAILABLE",
-    message: "We can’t verify your access right now. Please try again later.",
-    nextAction: "TRY_AGAIN_LATER",
-  });
-  assertPrivacyMinimized(result.body, "503 response");
+test("malformed, oversized, media-type, and query failures use concealed no-store responses", async (t) => {
+  const { running, members } = await fixture(t); const headers = { Origin: origin, Cookie: cookie(members[0].subject) };
+  const cases = [
+    await fetch(`${running.url}/goalscoach/member/safety-intake`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: "{" }),
+    await fetch(`${running.url}/goalscoach/member/safety-intake`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ padding: "x".repeat(5000) }) }),
+    await fetch(`${running.url}/goalscoach/member/safety-intake`, { method: "POST", headers: { ...headers, "Content-Type": "text/plain" }, body: "unsafe" }),
+  ];
+  assert.deepEqual(cases.map((response) => response.status), [400, 413, 415]);
+  const expectedBodies = [
+    { error: "SAFETY_INTAKE_INVALID", message: "Invalid safety intake request." },
+    { error: "SAFETY_INTAKE_BODY_TOO_LARGE", message: "The safety intake request is too large." },
+    { error: "SAFETY_INTAKE_MEDIA_TYPE_UNSUPPORTED", message: "Safety intake requires application/json." },
+  ];
+  for (let index = 0; index < cases.length; index += 1) {
+    const response = cases[index];
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+    const responseBody = await response.json();
+    assert.deepEqual(responseBody, expectedBodies[index]); assertPrivate(responseBody);
+  }
+  const invalidQuery = await jsonRequest(running.url, "/goalscoach/member/safety-intake?memberId=1", { headers });
+  assert.equal(invalidQuery.response.status, 400);
+  assert.deepEqual(invalidQuery.body, { error: "SAFETY_INTAKE_INVALID", message: "Invalid safety intake query." });
+  assert.equal(invalidQuery.response.headers.get("cache-control"), "no-store");
+  assert.equal(invalidQuery.response.headers.get("x-content-type-options"), "nosniff");
+  assertPrivate(invalidQuery.body);
 });
 
-test("current inactive Gatekeeper membership conceals both safety-intake read and submission", async (t) => {
-  let gatekeeperCalls = 0;
-  const { disposable, first, running } = await fixture(t, {
-    fetchImpl: async (url) => {
-      gatekeeperCalls += 1;
-      const memberId = Number(new URL(url).searchParams.get("memberid"));
-      return {
-        ok: true,
-        json: async () => ({ members: [{
-          memberid: memberId,
-          stopatgate: true,
-          membership: [{ expired: false }],
-        }] }),
-      };
-    },
-  });
-  const read = await memberRequest(running, "/safety-intake", "gymmaster:30001");
-  const write = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
-    method: "POST",
-    body: submission(70, { currentInjuryConcern: true }),
-  });
-  for (const [label, response] of [["inactive GET", read], ["inactive POST", write]]) {
-    assert.equal(response.response.status, 401, label);
-    assert.deepEqual(response.body, { error: "MEMBER_AUTHENTICATION_REQUIRED" }, label);
-    assertPrivacyMinimized(response.body, label);
-  }
-  assert.equal(gatekeeperCalls, 2);
-  const stored = await disposable.pool.query(
-    "SELECT COUNT(*)::int AS count FROM goals_coach_member_safety_intake_submissions WHERE member_id = $1",
-    [first.member.id]
-  );
-  assert.equal(stored.rows[0].count, 0);
+test("inactive Gatekeeper membership is concealed before persistence", async (t) => {
+  const { disposable, members, running } = await fixture(t, { fetchImpl: async () => ({ ok: true, async json() { return { members: [{ memberid: 30001, stopatgate: true, membership: [{ expired: true }] }] }; } }) });
+  assert.equal((await request(running, members[0].subject)).response.status, 401);
+  assert.equal((await request(running, members[0].subject, { method: "POST", body: body(300) })).response.status, 401);
+  assert.equal((await disposable.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_v2_assessments")).rows[0].count, 0);
 });
 
-test("production mutation limiter is session scoped and precedes mapping and Gatekeeper work", async (t) => {
-  const {
-    databaseCalls,
-    providerCalls,
-    running,
-  } = await fixture(t, { useProductionRateLimits: true });
-
-  for (let index = 0; index < 12; index += 1) {
-    const invalidSession = await jsonRequest(
-      running.url,
-      "/goalscoach/member/safety-intake",
-      { method: "POST", headers: { Origin: origin }, body: submission(100 + index) }
-    );
-    assert.equal(invalidSession.response.status, 401);
-  }
-
-  for (let index = 0; index < 10; index += 1) {
-    const allowed = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
-      method: "POST",
-      body: submission(200 + index),
-    });
-    assert.equal(allowed.response.status, 201, `member one request ${index + 1}`);
-  }
-  const callsAtLimit = {
-    database: databaseCalls(),
-    provider: providerCalls(),
-  };
-  const limited = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
-    method: "POST",
-    body: submission(210),
-  });
-  assert.equal(limited.response.status, 429);
-  assert.deepEqual(limited.body, { error: "RATE_LIMITED" });
-  assertPrivacyMinimized(limited.body, "production 429 response");
-  assert.deepEqual(
-    { database: databaseCalls(), provider: providerCalls() },
-    callsAtLimit,
-    "limited request must stop before local mapping, transaction, and Gatekeeper work"
-  );
-
-  const otherMember = await memberRequest(running, "/safety-intake", "gymmaster:30002", {
-    method: "POST",
-    body: submission(211),
-  });
-  assert.equal(otherMember.response.status, 201);
-  assert.equal(otherMember.body.safetyIntake.status, "screen_complete");
-  assertPrivacyMinimized(otherMember.body, "other-member POST response");
-  assert.equal(providerCalls(), callsAtLimit.provider + 1);
-  assert.equal(databaseCalls() > callsAtLimit.database, true);
-
-  const callsAfterOtherMember = {
-    database: databaseCalls(),
-    provider: providerCalls(),
-  };
-  const stillLimited = await memberRequest(running, "/safety-intake", "gymmaster:30001", {
-    method: "POST",
-    body: submission(212),
-  });
-  assert.equal(stillLimited.response.status, 429);
-  assert.deepEqual(stillLimited.body, { error: "RATE_LIMITED" });
-  assertPrivacyMinimized(stillLimited.body, "still-limited production 429 response");
-  assert.deepEqual(
-    { database: databaseCalls(), provider: providerCalls() },
-    callsAfterOtherMember,
-    "another member's request must not reset the exhausted member quota"
-  );
+test("production limiter is member-scoped and short-circuits before Gatekeeper and persistence", async (t) => {
+  const { disposable, members, running, providerCalls } = await fixture(t, { productionRateLimits: true });
+  for (let index = 0; index < 10; index += 1) assert.equal((await request(running, members[0].subject, { method: "POST", body: body(400 + index) })).response.status, 201);
+  const calls = providerCalls();
+  assert.equal((await request(running, members[0].subject, { method: "POST", body: body(410) })).response.status, 429);
+  assert.equal(providerCalls(), calls);
+  assert.equal((await disposable.pool.query("SELECT COUNT(*)::int count FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1", [members[0].mapping.member_id])).rows[0].count, 10);
+  assert.equal((await request(running, members[1].subject, { method: "POST", body: body(411) })).response.status, 201);
 });

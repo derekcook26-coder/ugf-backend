@@ -22,8 +22,10 @@
     "migrate:member-safety-intake": "node migrate_009.js",
     "migrate:member-pending-enrollment": "node migrate_010.js",
     "migrate:nullable-member-names-post-login-provisioning": "node migrate_011.js",
+    "migrate:safety-intake-v2": "node migrate_012.js",
     "rollback:phase1d-safety-review": "node rollback_006.js",
     "rollback:member-safety-intake": "node rollback_009.js",
+    "rollback:safety-intake-v2": "node rollback_012.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },

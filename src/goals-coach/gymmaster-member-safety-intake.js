@@ -10,19 +10,19 @@ const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-me
 
 const MEMBER_SAFETY_INTAKE_FLAG =
   "GOALS_COACH_MEMBER_SAFETY_INTAKE_ALPHA_ENABLED";
-const MEMBER_SAFETY_NOTICE_VERSION = "GC-MEMBER-SAFETY-NOTICE-1";
+const MEMBER_SAFETY_NOTICE_VERSION = "GC-MEMBER-SAFETY-NOTICE-2";
 const MEMBER_SAFETY_NOTICE = "Goals Coach uses the information you choose to provide, including fitness goals, workout feedback, and safety-related responses, to personalize your coaching experience. It does not replace medical advice. Your information is kept private and used only to provide and safely operate Goals Coach. You may stop using Goals Coach at any time.";
-const MEMBER_SAFETY_INTAKE_RULE_VERSION = "GC-MEMBER-SAFETY-INTAKE-1";
+const MEMBER_SAFETY_INTAKE_RULE_VERSION = "GC-MEMBER-SAFETY-INTAKE-2";
+const ASSESSMENT_VALID_MILLISECONDS = (12 * 60 * 60 - 60) * 1000;
 const MAXIMUM_SAFETY_INTAKE_JSON_BYTES = 4096;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DATABASE_ID = /^[1-9]\d{0,18}$/;
 const ANSWER_FIELDS = Object.freeze([
-  "currentPainOrConcerningSymptoms",
-  "currentInjuryConcern",
-  "recentSurgery",
-  "medicalOrExerciseRestriction",
-  "otherTrainingSafetyConcern",
+  "urgentWarningSigns", "painOrStiffness", "familiar", "mild", "severe",
+  "sharp", "newOrWorsening", "movementLimited", "injuryOrInstability",
+  "recentSurgery", "surgeryCleared", "medicalOrExerciseRestriction",
+  "restrictionCanBeHonored", "neurologicalSymptoms", "otherUnsafeConcern",
 ]);
 
 function memberSafetyIntakeEnabled(value) {
@@ -37,14 +37,26 @@ function readinessFor(effective) {
   if (effective.status === "not_submitted") {
     return { status: "SETUP_REQUIRED", nextAction: "COMPLETE_SAFETY_SETUP" };
   }
-  if (effective.safetyStop === true) {
-    return {
-      status: "SAFETY_HANDOFF_REQUIRED",
-      nextAction: "SAFETY_HANDOFF_REQUIRED",
-      message: "Goals Coach cannot continue. No person has been notified; seek appropriate medical guidance before exercise.",
-    };
-  }
-  return { status: "COACHING_UNAVAILABLE", nextAction: "CHECK_BACK_LATER" };
+  return { status: effective.status, nextAction: effective.nextAction };
+}
+
+function publicAssessment(effective) {
+  const messages = {
+    not_submitted: "Complete a fresh safety check before this session.",
+    SCREEN_COMPLETE: "No safety concern was identified in this check.",
+    MODIFICATION_REQUIRED: "Use comfortable, pain-free movement; reduce intensity or range, and stop if symptoms increase.",
+    MEDICAL_REVIEW_REQUIRED: "Stop this session and contact an appropriate qualified healthcare professional.",
+    URGENT_STOP: "Stop now and seek immediate emergency help.",
+  };
+  const ready = readinessFor(effective);
+  return {
+    status: effective.status,
+    message: messages[effective.status],
+    nextAction: ready.nextAction,
+    validUntil: effective.validUntil || null,
+    activationPermitted: false,
+    externalCallsPermitted: false,
+  };
 }
 
 function intakeError(statusCode, code, message) {
@@ -123,16 +135,7 @@ function parseSafetyIntake(body, expectedNoticeVersion) {
 function canonicalSafetyIntakeRequest(input) {
   return {
     noticeVersion: input.noticeVersion,
-    answers: {
-      currentPainOrConcerningSymptoms:
-        input.answers.currentPainOrConcerningSymptoms,
-      currentInjuryConcern: input.answers.currentInjuryConcern,
-      recentSurgery: input.answers.recentSurgery,
-      medicalOrExerciseRestriction:
-        input.answers.medicalOrExerciseRestriction,
-      otherTrainingSafetyConcern:
-        input.answers.otherTrainingSafetyConcern,
-    },
+    answers: Object.fromEntries(ANSWER_FIELDS.map((field) => [field, input.answers[field]])),
   };
 }
 
@@ -143,8 +146,24 @@ function safetyIntakeRequestHash(input) {
     .digest("hex");
 }
 
-function submissionSafetyStop(answers) {
-  return ANSWER_FIELDS.some((field) => answers[field] === true);
+function classifySafetyIntake(answers) {
+  if (answers.urgentWarningSigns === true) return "URGENT_STOP";
+  const painDetails = ["familiar", "mild", "severe", "sharp", "newOrWorsening"];
+  if ((!answers.painOrStiffness && painDetails.some((field) => answers[field]))
+      || (answers.mild && answers.severe)
+      || (answers.recentSurgery === false && answers.surgeryCleared)
+      || (!answers.medicalOrExerciseRestriction && answers.restrictionCanBeHonored)) {
+    throw intakeError(400, "SAFETY_INTAKE_INVALID", "Invalid safety intake answers.");
+  }
+  if (answers.neurologicalSymptoms || answers.movementLimited
+      || answers.injuryOrInstability || (answers.recentSurgery && !answers.surgeryCleared)
+      || (answers.medicalOrExerciseRestriction && !answers.restrictionCanBeHonored)
+      || answers.otherUnsafeConcern || answers.severe || answers.sharp
+      || answers.newOrWorsening || (answers.painOrStiffness && (!answers.familiar || !answers.mild))) {
+    return "MEDICAL_REVIEW_REQUIRED";
+  }
+  if (answers.painOrStiffness) return "MODIFICATION_REQUIRED";
+  return "SCREEN_COMPLETE";
 }
 
 function validAuthorization(authorization) {
@@ -181,38 +200,28 @@ async function withTransaction(db, action) {
 
 async function aggregateEffectiveState(client, memberId, noticeVersion) {
   const result = await client.query(
-    `SELECT COUNT(*) FILTER (WHERE notice_version = $2)::int AS current_submission_count,
-            COALESCE(BOOL_OR(safety_stop), FALSE) AS safety_stop
-     FROM goals_coach_member_safety_intake_submissions
-     WHERE member_id = $1`,
+    `SELECT outcome, valid_until
+     FROM goals_coach_member_safety_intake_v2_assessments
+     WHERE member_id = $1 AND notice_version = $2
+       AND valid_until > NOW()
+     ORDER BY submitted_at DESC, id DESC LIMIT 1`,
     [memberId, noticeVersion]
   );
+  if (!result.rows.length) return { status: "not_submitted", nextAction: "COMPLETE_SAFETY_SETUP" };
   const row = result.rows[0];
-  const safetyStop = row.safety_stop === true;
-  if (safetyStop) {
-    return { status: "handoff_required", safetyStop: true };
-  }
-  if (Number(row.current_submission_count) === 0) {
-    return { status: "not_submitted", safetyStop: null };
-  }
-  return {
-    status: "screen_complete",
-    safetyStop: false,
+  const actions = {
+    SCREEN_COMPLETE: "CONTINUE_WHEN_COACHING_IS_AVAILABLE",
+    MODIFICATION_REQUIRED: "USE_COMFORTABLE_PAIN_FREE_MOVEMENT",
+    MEDICAL_REVIEW_REQUIRED: "CONTACT_A_QUALIFIED_HEALTHCARE_PROFESSIONAL",
+    URGENT_STOP: "SEEK_IMMEDIATE_EMERGENCY_HELP",
   };
+  return { status: row.outcome, nextAction: actions[row.outcome], validUntil: row.valid_until };
 }
 
 async function readEffectiveSafetyIntake(db, memberId, noticeVersion) {
   if (!DATABASE_ID.test(String(memberId))) throw memberAuthenticationError();
   const effective = await aggregateEffectiveState(db, String(memberId), noticeVersion);
-  return {
-    notice: MEMBER_SAFETY_NOTICE,
-    noticeVersion,
-    status: effective.status,
-    safetyStop: effective.safetyStop,
-    readiness: readinessFor(effective),
-    activationPermitted: false,
-    externalCallsPermitted: false,
-  };
+  return publicAssessment(effective);
 }
 
 async function submitSafetyIntake(db, authorization, input) {
@@ -241,7 +250,7 @@ async function submitSafetyIntake(db, authorization, input) {
 
     const existing = await client.query(
       `SELECT client_request_hash
-       FROM goals_coach_member_safety_intake_submissions
+       FROM goals_coach_member_safety_intake_v2_assessments
        WHERE member_id = $1 AND client_request_id = $2`,
       [memberId, input.clientRequestId]
     );
@@ -255,16 +264,14 @@ async function submitSafetyIntake(db, authorization, input) {
         );
       }
     } else {
-      const safetyStop = submissionSafetyStop(input.answers);
+      const outcome = classifySafetyIntake(input.answers);
+      const validUntil = new Date(Date.now() + ASSESSMENT_VALID_MILLISECONDS);
       await client.query(
-        `INSERT INTO goals_coach_member_safety_intake_submissions
+        `INSERT INTO goals_coach_member_safety_intake_v2_assessments
           (auth_mapping_id, member_id, client_request_id, client_request_hash,
-           notice_version, current_pain_or_concerning_symptoms,
-           current_injury_concern, recent_surgery,
-           medical_or_exercise_restriction, other_training_safety_concern,
-           outcome, safety_stop, rule_version)
+           notice_version, outcome, rule_version, valid_until)
          VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+           $1, $2, $3, $4, $5, $6, $7, $8
          )`,
         [
           mappingId,
@@ -272,14 +279,9 @@ async function submitSafetyIntake(db, authorization, input) {
           input.clientRequestId,
           hash,
           input.noticeVersion,
-          input.answers.currentPainOrConcerningSymptoms,
-          input.answers.currentInjuryConcern,
-          input.answers.recentSurgery,
-          input.answers.medicalOrExerciseRestriction,
-          input.answers.otherTrainingSafetyConcern,
-          safetyStop ? "handoff_required" : "screen_complete",
-          safetyStop,
+          outcome,
           MEMBER_SAFETY_INTAKE_RULE_VERSION,
+          validUntil,
         ]
       );
       created = true;
@@ -287,15 +289,7 @@ async function submitSafetyIntake(db, authorization, input) {
     const effective = await aggregateEffectiveState(client, memberId, input.noticeVersion);
     return {
       created,
-      safetyIntake: {
-        notice: MEMBER_SAFETY_NOTICE,
-        noticeVersion: input.noticeVersion,
-        status: effective.status,
-        safetyStop: effective.safetyStop,
-        readiness: readinessFor(effective),
-        activationPermitted: false,
-        externalCallsPermitted: false,
-      },
+      safetyIntake: publicAssessment(effective),
     };
   });
 }
@@ -438,5 +432,6 @@ module.exports = {
   parseSafetyIntake,
   readEffectiveSafetyIntake,
   safetyIntakeRequestHash,
+  classifySafetyIntake,
   submitSafetyIntake,
 };
