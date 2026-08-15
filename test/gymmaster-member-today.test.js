@@ -5,7 +5,8 @@ const test=require("node:test");
 const {GUIDANCE,MEMBER_TODAY_FLAG,enabled,execute,hash,parse}=require("../src/goals-coach/gymmaster-member-today");
 const {createGymMasterMemberTodayStartup}=require("../src/goals-coach/gymmaster-member-today-startup");
 const {createApplicationJsonParser}=require("../src/goals-coach/transcription-route");
-function database(query){return {async connect(){return {query,release(){}};}};}
+const {goalsCoachErrorHandler}=require("../src/goals-coach/http-error-handler");
+function database(query){return {async connect(){return {query(sql,params){if(String(sql).includes("set_config('lock_timeout'"))return Promise.resolve({rows:[]});return query(sql,params);},release(){}};}};}
 const identity={authProvider:"gymmaster",authSubject:"gymmaster:10482"},authorization={active:true,memberId:"1",mappingId:"2"};
 
 test("member today flag is exact-string disabled and startup isolated",()=>{
@@ -31,6 +32,14 @@ test("application JSON parser leaves the today body for its authenticated route 
     let continued=false;
     parser({method:"POST",originalUrl,headers:{}},{},()=>{continued=true;});
     assert.equal(continued,true,originalUrl);
+  }
+});
+test("member today parser errors are concealed for both accepted path forms",()=>{
+  for(const path of ["/goalscoach/member/today","/goalscoach/member/today/"]){
+    let result;
+    const res={headers:{},setHeader(name,value){this.headers[name]=value;},status(status){result={status};return this;},json(body){result.body=body;return this;}};
+    goalsCoachErrorHandler(Object.assign(new Error("body parser detail"),{type:"entity.parse.failed"}),{path},res,()=>assert.fail("error should be handled"));
+    assert.deepEqual(result,{status:400,body:{error:"MEMBER_TODAY_INVALID"}}); assert.equal(res.headers["Cache-Control"],"no-store");
   }
 });
 test("every replay applies current mandatory safety-stop guidance",async(t)=>{
@@ -116,4 +125,24 @@ test("continuation keeps the originally offered item after retirement, insertion
   });
   const result=await execute(db,identity,authorization,input);
   assert.deepEqual(selectedQuery,["99","10"]); assert.equal(result.body.action.itemId,"99"); assert.equal(result.body.action.name,"Original choice");
+});
+test("continuation keeps the original choice when every active item was retired",async()=>{
+  const attemptId="00000000-0000-4000-8000-000000000014",input={clientRequestId:"00000000-0000-4000-8000-000000000015",continuation:{attemptId,optionId:"option-1"}};
+  const plan={id:"10",created_at:new Date("2026-01-01T00:00:00.000Z")}; let activeItemsQueried=false;
+  const db=database(async(sql)=>{
+    if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
+    if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
+    if(sql.includes("safety_intake_v2"))return {rows:[{outcome:"SCREEN_COMPLETE"}]};
+    if(sql.includes("member_today_attempts WHERE member_id=$1 AND client_request_id=$2")&&!sql.includes("state_code"))return {rows:[]};
+    if(sql.includes("coaching_consents"))return {rows:[{}]};
+    if(sql.includes("FROM coach_plans"))return {rows:[plan]};
+    if(sql.includes("status='active'")){activeItemsQueried=true;return {rows:[]};}
+    if(sql.includes("state_code='QUESTION_REQUIRED'"))return {rows:[{id:"30",plan_id:"10",plan_version:plan.created_at,option_ids:["option-1"],option_item_ids:{"option-1":"99"}}]};
+    if(sql.includes("FROM coach_plan_exercises WHERE id=$1"))return {rows:[{id:"99",exercise_name:"Retired original choice",prescription_json:{reps:8}}]};
+    if(sql.startsWith("UPDATE goals_coach_member_today_attempts"))return {rows:[]};
+    if(sql.startsWith("INSERT INTO goals_coach_member_today_attempts"))return {rows:[{state_code:"READY",safety_outcome:"SCREEN_COMPLETE",plan_id:"10",plan_version:plan.created_at,plan_item_id:"99"}]};
+    assert.fail(`unexpected query: ${sql}`);
+  });
+  const result=await execute(db,identity,authorization,input);
+  assert.equal(activeItemsQueried,false); assert.equal(result.body.state,"READY"); assert.equal(result.body.action.itemId,"99");
 });

@@ -5,6 +5,12 @@ const express = require("express");
 const rateLimit = require("express-rate-limit");
 const { validGymMasterIdentity } = require("./gymmaster-member-authorization");
 const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-membership");
+const {
+  createTerminalState,
+  deadlineAfter,
+  monotonicNow,
+  runBoundedPostgresTransaction,
+} = require("./bounded-postgres-transaction");
 
 const MEMBER_TODAY_FLAG = "GOALS_COACH_MEMBER_TODAY_ENABLED";
 const CONSENT_VERSION = "GC-MEMBER-COACHING-CONSENT-1";
@@ -64,16 +70,19 @@ async function decide(client, memberId, mappingId, identity, input) {
     if (!consent) state="CONSENT_REQUIRED";
     else {
       plan=(await client.query("SELECT id,created_at FROM coach_plans WHERE member_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1",[memberId])).rows[0];
-      let items=[]; if (plan) items=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE plan_id=$1 AND status='active' AND intent_validation_status='validated' ORDER BY sequence_number,id",[plan.id])).rows;
-      if (!plan || !items.length) { state="UNAVAILABLE"; plan=null; }
+      if (!plan) { state="UNAVAILABLE"; }
       else if (input.continuation) {
         original=(await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2 AND state_code='QUESTION_REQUIRED' FOR UPDATE",[memberId,input.continuation.attemptId])).rows[0];
         const selectedItemId=original&&original.option_item_ids&&original.option_item_ids[input.continuation.optionId];
         if (!original || original.consumed_at || String(original.plan_id)!==String(plan.id) || new Date(original.plan_version).getTime()!==new Date(plan.created_at).getTime() || !(original.option_ids||[]).includes(input.continuation.optionId) || !selectedItemId) throw error(409,"MEMBER_TODAY_CONTINUATION_CONFLICT");
         item=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2",[selectedItemId,original.plan_id])).rows[0]; if (!item) throw error(409,"MEMBER_TODAY_CONTINUATION_CONFLICT"); state="READY";
         await client.query("UPDATE goals_coach_member_today_attempts SET consumed_at=NOW() WHERE id=$1 AND consumed_at IS NULL",[original.id]);
-      } else if (items.length===1) { state="READY"; item=items[0]; }
-      else { state="QUESTION_REQUIRED"; options=items.slice(0,20).map((entry,index)=>({ id:`option-${index+1}`, label:entry.exercise_name })); optionItemIds=Object.fromEntries(options.map((entry,index)=>[entry.id,String(items[index].id)])); }
+      } else {
+        const items=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE plan_id=$1 AND status='active' AND intent_validation_status='validated' ORDER BY sequence_number,id",[plan.id])).rows;
+        if (!items.length) { state="UNAVAILABLE"; plan=null; }
+        else if (items.length===1) { state="READY"; item=items[0]; }
+        else { state="QUESTION_REQUIRED"; options=items.slice(0,20).map((entry,index)=>({ id:`option-${index+1}`, label:entry.exercise_name })); optionItemIds=Object.fromEntries(options.map((entry,index)=>[entry.id,String(items[index].id)])); }
+      }
     }
   }
   const inserted=(await client.query("INSERT INTO goals_coach_member_today_attempts(member_id,auth_mapping_id,client_request_id,request_hash,original_attempt_id,state_code,safety_outcome,plan_id,plan_version,plan_item_id,option_ids,option_item_ids,selected_option_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",[memberId,mappingId,input.clientRequestId,requestHash,original&&original.id,state,safety&&safety.outcome,plan&&plan.id,plan&&plan.created_at,item&&item.id,JSON.stringify(options.map((entry)=>entry.id)),JSON.stringify(optionItemIds),input.continuation&&input.continuation.optionId])).rows[0];
@@ -81,7 +90,14 @@ async function decide(client, memberId, mappingId, identity, input) {
 }
 async function execute(db, identity, authorization, input) {
   if (!validGymMasterIdentity(identity) || !authorization || authorization.active!==true || !ID.test(String(authorization.memberId)) || !ID.test(String(authorization.mappingId))) throw authError();
-  const client=await db.connect(); try { await client.query("BEGIN"); const result=await decide(client,String(authorization.memberId),String(authorization.mappingId),identity,input); await client.query("COMMIT"); return result; } catch(e){try{await client.query("ROLLBACK");}catch(_){} throw e;} finally{client.release();}
+  const started=monotonicNow();
+  try {
+    const result=await runBoundedPostgresTransaction({pool:db,outerDeadlineNs:deadlineAfter(started,5000),phaseMilliseconds:5000,terminalState:createTerminalState(),work:(client)=>decide(client,String(authorization.memberId),String(authorization.mappingId),identity,input)});
+    return result.value;
+  } catch(e) {
+    if(e&&e.code==="work_failed"&&e.cause)throw e.cause;
+    throw e;
+  }
 }
 function createRateLimit(){return rateLimit({windowMs:15*60*1000,max:30,standardHeaders:true,legacyHeaders:false,keyGenerator:(req)=>`member:${req.alphaMemberIdentity.authSubject}`,handler:(_req,res)=>res.status(429).json({error:"RATE_LIMITED"})});}
 function createRouter(options={}) {
