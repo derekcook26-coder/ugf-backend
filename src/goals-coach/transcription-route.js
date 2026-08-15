@@ -121,7 +121,11 @@ function createApplicationJsonParser() {
     // Do not consume or inspect their bodies at the application-wide boundary.
     if (
       req.method === "POST"
-      && (rawPath === memberCoachingConsentPath || rawPath === memberTodayPath)
+      && (
+        rawPath === memberCoachingConsentPath
+        || rawPath === memberTodayPath
+        || rawPath === `${memberTodayPath}/`
+      )
     ) return next();
     if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
       return memberSafetyIntakeJsonParser(req, res, next);

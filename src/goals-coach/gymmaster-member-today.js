@@ -44,9 +44,10 @@ async function decide(client, memberId, mappingId, identity, input) {
   const replay = await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2", [memberId,input.clientRequestId]);
   if (replay.rows.length) {
     if (replay.rows[0].request_hash !== requestHash) throw error(409,"MEMBER_TODAY_IDEMPOTENCY_CONFLICT");
+    if (safety && ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) return { body:responseFrom({state_code:safety.outcome}),replay:true };
     let row=replay.rows[0];
     if (["READY","QUESTION_REQUIRED"].includes(row.state_code)) {
-      if (!safety || ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) return { body:responseFrom({state_code:safety?safety.outcome:"SAFETY_REQUIRED"}),replay:true };
+      if (!safety) return { body:responseFrom({state_code:"SAFETY_REQUIRED"}),replay:true };
       const consent=(await client.query("SELECT 1 FROM goals_coach_member_coaching_consents WHERE member_id=$1 AND notice_version=$2 AND status='accepted'",[memberId,CONSENT_VERSION])).rows[0];
       if (!consent) return { body:responseFrom({state_code:"CONSENT_REQUIRED"}),replay:true };
       row={...row,safety_outcome:safety.outcome};

@@ -26,9 +26,30 @@ test("member today uses fixed safety wording and imports no provider",()=>{
   assert.doesNotMatch(source,/require\(["'](?:openai|\.\/transcription-adapter|\.\/coaching-engine)["']\)/i);
 });
 test("application JSON parser leaves the today body for its authenticated route parser",()=>{
-  const parser=createApplicationJsonParser(); let continued=false;
-  parser({method:"POST",originalUrl:"/goalscoach/member/today",headers:{}},{},()=>{continued=true;});
-  assert.equal(continued,true);
+  const parser=createApplicationJsonParser();
+  for(const originalUrl of ["/goalscoach/member/today","/goalscoach/member/today/"]){
+    let continued=false;
+    parser({method:"POST",originalUrl,headers:{}},{},()=>{continued=true;});
+    assert.equal(continued,true,originalUrl);
+  }
+});
+test("every replay applies current mandatory safety-stop guidance",async(t)=>{
+  const input={clientRequestId:"00000000-0000-4000-8000-000000000007"};
+  for(const state of ["SAFETY_REQUIRED","CONSENT_REQUIRED","UNAVAILABLE"]){
+    for(const safety of ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"])await t.test(`${state} replay with ${safety}`,async()=>{
+      let downstreamQueries=0;
+      const db=database(async(sql)=>{
+        if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
+        if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
+        if(sql.includes("safety_intake_v2"))return {rows:[{outcome:safety}]};
+        if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:state,request_hash:hash(input)}]};
+        downstreamQueries++;
+        assert.fail(`unexpected query: ${sql}`);
+      });
+      assert.deepEqual(await execute(db,identity,authorization,input),{body:{state:safety,guidance:GUIDANCE[safety]},replay:true});
+      assert.equal(downstreamQueries,0);
+    });
+  }
 });
 test("READY replay applies expired and newer safety outcomes before returning an action",async(t)=>{
   const cases=[
