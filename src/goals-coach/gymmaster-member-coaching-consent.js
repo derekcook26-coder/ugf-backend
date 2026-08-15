@@ -12,6 +12,7 @@ const MEMBER_COACHING_CONSENT_NOTICE = "Goals Coach may use your approved member
 const MAXIMUM_COACHING_CONSENT_JSON_BYTES = 512;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DATABASE_ID = /^[1-9]\d{0,18}$/;
+const NOTICE_VERSION = /^GC-MEMBER-COACHING-CONSENT-[1-9][0-9]*$/;
 
 function memberCoachingConsentEnabled(value) { return value === "true"; }
 function consentError(statusCode, code, message) {
@@ -27,8 +28,8 @@ function parseCoachingConsent(body, expectedNoticeVersion) {
       || !["accept", "decline", "withdraw"].includes(body.action)) {
     throw consentError(400, "COACHING_CONSENT_INVALID", "Invalid coaching consent request.");
   }
-  if (body.noticeVersion !== expectedNoticeVersion) throw consentError(400, "COACHING_CONSENT_NOTICE_VERSION_INVALID", "The coaching consent notice version is invalid.");
-  const input = { clientRequestId: body.clientRequestId, noticeVersion: expectedNoticeVersion, action: body.action };
+  if (typeof body.noticeVersion !== "string" || !NOTICE_VERSION.test(body.noticeVersion)) throw consentError(400, "COACHING_CONSENT_NOTICE_VERSION_INVALID", "The coaching consent notice version is invalid.");
+  const input = { clientRequestId: body.clientRequestId, noticeVersion: body.noticeVersion, action: body.action };
   if (Buffer.byteLength(JSON.stringify(input), "utf8") > MAXIMUM_COACHING_CONSENT_JSON_BYTES) throw consentError(413, "COACHING_CONSENT_BODY_TOO_LARGE", "The coaching consent request is too large.");
   return input;
 }
@@ -54,18 +55,18 @@ async function withTransaction(db, action) {
   catch (error) { try { await client.query("ROLLBACK"); } catch (_) {} throw error; }
   finally { client.release(); }
 }
-async function submitCoachingConsent(db, identity, authorization, input) {
+async function submitCoachingConsent(db, identity, authorization, input, requiredNoticeVersion = MEMBER_COACHING_CONSENT_NOTICE_VERSION) {
   if (!validGymMasterIdentity(identity) || !validAuthorization(authorization)) throw authenticationError();
   const memberId = String(authorization.memberId); const mappingId = String(authorization.mappingId); const hash = coachingConsentRequestHash(input);
   return withTransaction(db, async (client) => {
     const mapping = await client.query("SELECT id FROM goals_coach_member_auth_mappings WHERE id=$1 AND member_id=$2 AND auth_provider=$3 AND auth_subject=$4 AND active=TRUE FOR UPDATE", [mappingId, memberId, identity.authProvider, identity.authSubject]);
     if (!mapping.rows.length) throw authenticationError();
-    const replay = await client.query("SELECT client_request_hash FROM goals_coach_member_coaching_consent_events WHERE member_id=$1 AND client_request_id=$2", [memberId, input.clientRequestId]);
+    const replay = await client.query("SELECT client_request_hash,result_notice_version,result_status FROM goals_coach_member_coaching_consent_events WHERE member_id=$1 AND client_request_id=$2", [memberId, input.clientRequestId]);
     if (replay.rows.length) {
       if (replay.rows[0].client_request_hash !== hash) throw consentError(409, "COACHING_CONSENT_IDEMPOTENCY_CONFLICT", "The clientRequestId was already used for a different coaching consent request.");
-      const state = await client.query("SELECT notice_version,status FROM goals_coach_member_coaching_consents WHERE member_id=$1", [memberId]);
-      return { created: false, consent: publicConsent(state.rows[0], input.noticeVersion) };
+      return { created: false, consent: publicConsent({ notice_version: replay.rows[0].result_notice_version, status: replay.rows[0].result_status }, replay.rows[0].result_notice_version) };
     }
+    if (input.noticeVersion !== requiredNoticeVersion) throw consentError(400, "COACHING_CONSENT_NOTICE_VERSION_INVALID", "The coaching consent notice version is invalid.");
     const currentResult = await client.query("SELECT notice_version,status,accepted_at FROM goals_coach_member_coaching_consents WHERE member_id=$1 FOR UPDATE", [memberId]);
     const current = currentResult.rows[0]; const eventType = `${input.action}${input.action === "accept" ? "ed" : input.action === "decline" ? "d" : "n"}`;
     if (input.action === "decline" && current && current.notice_version === input.noticeVersion && current.status === "accepted") throw consentError(409, "COACHING_CONSENT_WITHDRAW_REQUIRED", "Withdraw accepted coaching consent before recording another choice.");
@@ -76,7 +77,7 @@ async function submitCoachingConsent(db, identity, authorization, input) {
     } else {
       await client.query(`INSERT INTO goals_coach_member_coaching_consents (member_id,auth_mapping_id,notice_version,status,${timestampColumn},updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW()) ON CONFLICT (member_id) DO UPDATE SET auth_mapping_id=EXCLUDED.auth_mapping_id,notice_version=EXCLUDED.notice_version,status=EXCLUDED.status,accepted_at=EXCLUDED.accepted_at,declined_at=EXCLUDED.declined_at,withdrawn_at=NULL,updated_at=EXCLUDED.updated_at`, [memberId, mappingId, input.noticeVersion, eventType]);
     }
-    await client.query("INSERT INTO goals_coach_member_coaching_consent_events (member_id,auth_mapping_id,auth_provider,auth_subject,notice_version,event_type,client_request_id,client_request_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [memberId, mappingId, identity.authProvider, identity.authSubject, input.noticeVersion, eventType, input.clientRequestId, hash]);
+    await client.query("INSERT INTO goals_coach_member_coaching_consent_events (member_id,auth_mapping_id,auth_provider,auth_subject,notice_version,event_type,client_request_id,client_request_hash,result_notice_version,result_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$5,$6)", [memberId, mappingId, identity.authProvider, identity.authSubject, input.noticeVersion, eventType, input.clientRequestId, hash]);
     const state = await client.query("SELECT notice_version,status FROM goals_coach_member_coaching_consents WHERE member_id=$1", [memberId]);
     return { created: true, consent: publicConsent(state.rows[0], input.noticeVersion) };
   });
@@ -90,6 +91,7 @@ function createGymMasterMemberCoachingConsentRouter(options = {}) {
   if (!db || typeof db.query !== "function" || typeof db.connect !== "function") throw new Error("Member coaching consent requires a transactional database");
   if (typeof authenticateSession !== "function" || typeof authorizeIdentity !== "function" || !origin || !noticeVersion) throw new Error("Member coaching consent dependencies are incomplete");
   const limits = options.rateLimits || createRateLimits(); const router = express.Router();
+  const parseRawJson = express.json({ inflate: false, limit: MAXIMUM_COACHING_CONSENT_JSON_BYTES, strict: true });
   function protect(req, res, next) { res.setHeader("Cache-Control", "no-store"); res.setHeader("X-Content-Type-Options", "nosniff"); if (req.headers.origin !== origin) return res.status(403).json({ error: "MEMBER_ORIGIN_NOT_ALLOWED" }); return authenticateSession(req, res, next); }
   async function authorize(req, res, next) {
     try {
@@ -101,7 +103,9 @@ function createGymMasterMemberCoachingConsentRouter(options = {}) {
     } catch (_) { return res.status(503).json({ error: "MEMBER_ACCESS_TEMPORARILY_UNAVAILABLE", message: "We can’t verify your access right now. Please try again later.", nextAction: "TRY_AGAIN_LATER" }); }
   }
   router.get("/", protect, limits.read, authorize, async (req, res, next) => { try { rejectUnknownKeys(req.query, []); const consent = await readCoachingConsent(db, req.memberCoachingConsentAuthorization.memberId, noticeVersion); return res.status(200).json({ notice: MEMBER_COACHING_CONSENT_NOTICE, consent }); } catch (error) { return next(error); } });
-  router.post("/", protect, limits.mutation, authorize, async (req, res, next) => { try { rejectUnknownKeys(req.query, []); if (!req.is("application/json")) throw consentError(415, "COACHING_CONSENT_MEDIA_TYPE_UNSUPPORTED", "Coaching consent requires application/json."); const input = parseCoachingConsent(req.body, noticeVersion); const result = await submitCoachingConsent(db, req.alphaMemberIdentity, req.memberCoachingConsentAuthorization, input); return res.status(result.created ? 201 : 200).json({ consent: result.consent, idempotentReplay: !result.created }); } catch (error) { return next(error); } });
+  router.post("/", protect, limits.mutation, (req, res, next) => {
+    try { rejectUnknownKeys(req.query, []); if (!req.is("application/json")) throw consentError(415, "COACHING_CONSENT_MEDIA_TYPE_UNSUPPORTED", "Coaching consent requires application/json."); return parseRawJson(req, res, next); } catch (error) { return next(error); }
+  }, authorize, async (req, res, next) => { try { const input = parseCoachingConsent(req.body, noticeVersion); const result = await submitCoachingConsent(db, req.alphaMemberIdentity, req.memberCoachingConsentAuthorization, input, noticeVersion); return res.status(result.created ? 201 : 200).json({ consent: result.consent, idempotentReplay: !result.created }); } catch (error) { return next(error); } });
   return router;
 }
 module.exports = { MAXIMUM_COACHING_CONSENT_JSON_BYTES, MEMBER_COACHING_CONSENT_FLAG, MEMBER_COACHING_CONSENT_NOTICE, MEMBER_COACHING_CONSENT_NOTICE_VERSION, coachingConsentRequestHash, createGymMasterMemberCoachingConsentRouter, memberCoachingConsentEnabled, parseCoachingConsent, readCoachingConsent, submitCoachingConsent };

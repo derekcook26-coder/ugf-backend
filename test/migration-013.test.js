@@ -42,6 +42,28 @@ test("Migration and rollback bound checkout and release late clients", async () 
     await new Promise((resolve) => setTimeout(resolve, 40)); assert.equal(released, true);
   }
 });
+test("Migration and rollback discard clients with uncertain statement outcomes", async () => {
+  for (const operation of [
+    (pool) => migrate013({ pool, overallMilliseconds: 10 }),
+    (pool) => runRollback({ pool, overallMilliseconds: 10, skipConfirmation: true }),
+  ]) {
+    let discarded;
+    const client = { query(sql) { if (sql === "BEGIN") return Promise.resolve({ rows: [] }); return new Promise((_resolve, reject) => setTimeout(() => reject(new Error("synthetic statement timeout")), 30)); }, release(error) { discarded = error; } };
+    await assert.rejects(operation({ connect: async () => client })); assert.ok(discarded instanceof Error);
+  }
+});
+test("Rollback 013 refuses later migrations and immutable event history", async (t) => {
+  const laterDb = await at012(t); await migrate013({ pool: laterDb.pool });
+  await laterDb.pool.query("INSERT INTO app_schema_migrations(version,checksum) VALUES ('014_synthetic_later',$1)", ["f".repeat(64)]);
+  await assert.rejects(runRollback({ pool: laterDb.pool, skipConfirmation: true }), (error) => error.code === "later_migration_applied");
+
+  const rowsDb = await at012(t); await migrate013({ pool: rowsDb.pool });
+  await rowsDb.pool.query("INSERT INTO coach_members(gymmaster_member_id,first_name,last_name) VALUES ('91301','Test','Member')");
+  const member = (await rowsDb.pool.query("SELECT id FROM coach_members WHERE gymmaster_member_id='91301'")).rows[0];
+  const mapping = (await rowsDb.pool.query("INSERT INTO goals_coach_member_auth_mappings(member_id,auth_provider,auth_subject,verified_email_snapshot,active,provisioning_method,provisioning_reference) VALUES ($1,'gymmaster','gymmaster:91301','synthetic@example.test',TRUE,'owner_approved_script','m013-test') RETURNING id", [member.id])).rows[0];
+  await rowsDb.pool.query("INSERT INTO goals_coach_member_coaching_consent_events(member_id,auth_mapping_id,auth_provider,auth_subject,notice_version,event_type,client_request_id,client_request_hash,result_notice_version,result_status) VALUES ($1,$2,'gymmaster','gymmaster:91301','GC-MEMBER-COACHING-CONSENT-1','declined','00000000-0000-4000-8000-000000091301',$3,'GC-MEMBER-COACHING-CONSENT-1','declined')", [member.id, mapping.id, "a".repeat(64)]);
+  await assert.rejects(runRollback({ pool: rowsDb.pool, skipConfirmation: true }), (error) => error.code === "immutable_rows_present");
+});
 test("Migration 013 declares composite ownership, immutable history, and minimized data", () => {
   const sql = fs.readFileSync(MIGRATION_FILE, "utf8");
   assert.match(sql, /FOREIGN KEY \(auth_mapping_id, member_id\)/);

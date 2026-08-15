@@ -31,6 +31,8 @@ CREATE TABLE goals_coach_member_coaching_consent_events (
   event_type TEXT NOT NULL CHECK (event_type IN ('accepted', 'declined', 'withdrawn')),
   client_request_id UUID NOT NULL,
   client_request_hash TEXT NOT NULL CHECK (client_request_hash ~ '^[a-f0-9]{64}$'),
+  result_notice_version TEXT NOT NULL CHECK (result_notice_version = notice_version),
+  result_status TEXT NOT NULL CHECK (result_status IN ('accepted', 'declined', 'withdrawn')),
   occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   FOREIGN KEY (auth_mapping_id, member_id)
     REFERENCES goals_coach_member_auth_mappings(id, member_id) ON DELETE RESTRICT,
