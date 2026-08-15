@@ -12,6 +12,7 @@ CREATE TABLE goals_coach_member_today_attempts (
   plan_version TIMESTAMPTZ,
   plan_item_id BIGINT,
   option_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(option_ids)='array'),
+  option_item_ids JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(option_item_ids)='object'),
   selected_option_id TEXT,
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -25,7 +26,7 @@ CREATE TABLE goals_coach_member_today_attempts (
 CREATE INDEX idx_goals_coach_member_today_attempts_scope ON goals_coach_member_today_attempts(member_id,created_at DESC,id DESC);
 CREATE OR REPLACE FUNCTION preserve_goals_coach_member_today_attempt() RETURNS TRIGGER AS $$
 BEGIN
-  IF TG_OP='DELETE' OR OLD.id<>NEW.id OR OLD.member_id<>NEW.member_id OR OLD.auth_mapping_id<>NEW.auth_mapping_id OR OLD.client_request_id<>NEW.client_request_id OR OLD.request_hash<>NEW.request_hash OR OLD.original_attempt_id IS DISTINCT FROM NEW.original_attempt_id OR OLD.state_code<>NEW.state_code OR OLD.safety_outcome IS DISTINCT FROM NEW.safety_outcome OR OLD.plan_id IS DISTINCT FROM NEW.plan_id OR OLD.plan_version IS DISTINCT FROM NEW.plan_version OR OLD.plan_item_id IS DISTINCT FROM NEW.plan_item_id OR OLD.option_ids<>NEW.option_ids OR OLD.selected_option_id IS DISTINCT FROM NEW.selected_option_id OR OLD.created_at<>NEW.created_at OR OLD.consumed_at IS NOT NULL OR NEW.consumed_at IS NULL THEN
+  IF TG_OP='DELETE' OR OLD.id<>NEW.id OR OLD.member_id<>NEW.member_id OR OLD.auth_mapping_id<>NEW.auth_mapping_id OR OLD.client_request_id<>NEW.client_request_id OR OLD.request_hash<>NEW.request_hash OR OLD.original_attempt_id IS DISTINCT FROM NEW.original_attempt_id OR OLD.state_code<>NEW.state_code OR OLD.safety_outcome IS DISTINCT FROM NEW.safety_outcome OR OLD.plan_id IS DISTINCT FROM NEW.plan_id OR OLD.plan_version IS DISTINCT FROM NEW.plan_version OR OLD.plan_item_id IS DISTINCT FROM NEW.plan_item_id OR OLD.option_ids<>NEW.option_ids OR OLD.option_item_ids<>NEW.option_item_ids OR OLD.selected_option_id IS DISTINCT FROM NEW.selected_option_id OR OLD.created_at<>NEW.created_at OR OLD.consumed_at IS NOT NULL OR NEW.consumed_at IS NULL THEN
     RAISE EXCEPTION 'member today attempts are immutable except one-time consumption' USING ERRCODE='23514', CONSTRAINT='goals_coach_member_today_attempts_append_only';
   END IF;
   RETURN NEW;
