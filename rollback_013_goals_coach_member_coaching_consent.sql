@@ -1,0 +1,5 @@
+DROP TRIGGER trg_preserve_goals_coach_member_coaching_consent_event
+  ON goals_coach_member_coaching_consent_events;
+DROP FUNCTION preserve_goals_coach_member_coaching_consent_event();
+DROP TABLE goals_coach_member_coaching_consent_events;
+DROP TABLE goals_coach_member_coaching_consents;

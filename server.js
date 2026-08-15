@@ -41,6 +41,8 @@ var { createGymMasterMemberPrivateScreenLoginStartup } = require("./src/goals-co
 var { composeGymMasterMemberPrivateScreenLoginRoute } = require("./src/goals-coach/gymmaster-member-private-screen-login-route-composition");
 var { createGymMasterMemberSafetyIntakeStartup } = require("./src/goals-coach/gymmaster-member-safety-intake-startup");
 var { composeGymMasterMemberSafetyIntakeRoutes } = require("./src/goals-coach/gymmaster-member-safety-intake-route-composition");
+var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach/gymmaster-member-coaching-consent-startup");
+var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -140,6 +142,14 @@ var memberSafetyIntakeStartup = createGymMasterMemberSafetyIntakeStartup({
   fetchImpl: fetch,
 });
 composeGymMasterMemberSafetyIntakeRoutes(app, memberSafetyIntakeStartup);
+
+// General-member coaching consent is an independently disabled authority
+// record. Composition performs no startup calls and activates no coaching.
+var memberCoachingConsentStartup = createGymMasterMemberCoachingConsentStartup({
+  db: db,
+  fetchImpl: fetch,
+});
+composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider

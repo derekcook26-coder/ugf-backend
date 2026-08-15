@@ -38,6 +38,15 @@ function goalsCoachErrorHandler(error, req, res, next) {
     }
   }
 
+  if (req.path === "/goalscoach/member/coaching-consent") {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (error && error.type === "entity.too.large") return res.status(413).json({ error: "COACHING_CONSENT_BODY_TOO_LARGE", message: "The coaching consent request is too large." });
+    if (error && ["encoding.unsupported", "entity.parse.failed", "request.aborted", "request.size.invalid"].includes(error.type)) {
+      return res.status(error.type === "encoding.unsupported" ? 415 : 400).json({ error: error.type === "encoding.unsupported" ? "COACHING_CONSENT_MEDIA_TYPE_UNSUPPORTED" : "COACHING_CONSENT_INVALID", message: error.type === "encoding.unsupported" ? "Coaching consent requires uncompressed application/json." : "Invalid coaching consent request." });
+    }
+  }
+
   if (req.path === "/goalscoach/member/private-screen/login") {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
