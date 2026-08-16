@@ -62,3 +62,68 @@ test("question replay recomputes every original association and conceals any has
     assert.deepEqual(result.body, changed ? { state: "UNAVAILABLE" } : { state: "QUESTION_REQUIRED", attemptId: input.clientRequestId, question: { id: "TODAY_PLAN_ITEM", prompt: "Which planned item are you ready to start?", options: [{ id: "option-1", label: "Squat" }, { id: "option-2", label: "Row" }] } });
   }
 });
+
+const planVersion = new Date("2026-01-01T00:00:00.000Z");
+const eligibleItem = { id: "20", exercise_name: "Squat", prescription_json: { reps: 8 }, status: "active", intent_validation_status: "validated" };
+function liveRows(sql, rows) {
+  assert.match(sql, /status='active'/);
+  assert.match(sql, /intent_validation_status='validated'/);
+  return { rows: rows.filter((row) => row.status === "active" && row.intent_validation_status === "validated") };
+}
+for (const [label, mutate] of [
+  ["retirement", (item) => { item.status = "retired"; }],
+  ["validation revocation", (item) => { item.intent_validation_status = "rejected"; }],
+]) {
+  test(\`READY replay conceals \${label} after the original attempt\`, async () => {
+    const input = { clientRequestId: "00000000-0000-4000-8000-000000000020" };
+    const changed = { ...eligibleItem }; mutate(changed);
+    const original = { state_code: "READY", client_request_id: input.clientRequestId, request_hash: hash(input), plan_id: "10", plan_version: planVersion, plan_item_id: "20", plan_item_hash: itemHash(eligibleItem) };
+    const db = database(async (sql) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("auth_mappings")) return { rows: [{ id: "2" }] };
+      if (sql.includes("safety_intake_v2")) return { rows: [{ outcome: "SCREEN_COMPLETE" }] };
+      if (sql.includes("member_today_attempts WHERE")) return { rows: [original] };
+      if (sql.includes("coaching_consents")) return { rows: [{}] };
+      if (sql.includes("FROM coach_plans")) return { rows: [{ id: "10", created_at: planVersion }] };
+      if (sql.includes("id=ANY")) return liveRows(sql, [changed]);
+      assert.fail(\`unexpected query: \${sql}\`);
+    });
+    assert.deepEqual((await execute(db, identity, authorization, input)).body, { state: "UNAVAILABLE" });
+  });
+
+  test(\`QUESTION_REQUIRED replay conceals \${label} after the original attempt\`, async () => {
+    const input = { clientRequestId: "00000000-0000-4000-8000-000000000021" };
+    const second = { ...eligibleItem, id: "21", exercise_name: "Row" }, changed = { ...eligibleItem }; mutate(changed);
+    const original = { state_code: "QUESTION_REQUIRED", client_request_id: input.clientRequestId, request_hash: hash(input), plan_id: "10", plan_version: planVersion, option_ids: ["option-1", "option-2"], option_item_ids: { "option-1": "20", "option-2": "21" }, option_item_hashes: { "option-1": itemHash(eligibleItem), "option-2": itemHash(second) } };
+    const db = database(async (sql) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("auth_mappings")) return { rows: [{ id: "2" }] };
+      if (sql.includes("safety_intake_v2")) return { rows: [{ outcome: "SCREEN_COMPLETE" }] };
+      if (sql.includes("member_today_attempts WHERE")) return { rows: [original] };
+      if (sql.includes("coaching_consents")) return { rows: [{}] };
+      if (sql.includes("FROM coach_plans")) return { rows: [{ id: "10", created_at: planVersion }] };
+      if (sql.includes("id=ANY")) return liveRows(sql, [changed, second]);
+      assert.fail(\`unexpected query: \${sql}\`);
+    });
+    assert.deepEqual((await execute(db, identity, authorization, input)).body, { state: "UNAVAILABLE" });
+  });
+
+  test(\`continuation conceals \${label} after the original attempt\`, async () => {
+    const input = { clientRequestId: "00000000-0000-4000-8000-000000000022", continuation: { attemptId: "00000000-0000-4000-8000-000000000021", optionId: "option-1" } };
+    const second = { ...eligibleItem, id: "21", exercise_name: "Row" }, changed = { ...eligibleItem }; mutate(changed);
+    const original = { id: "30", state_code: "QUESTION_REQUIRED", client_request_id: input.continuation.attemptId, plan_id: "10", plan_version: planVersion, option_ids: ["option-1", "option-2"], option_item_ids: { "option-1": "20", "option-2": "21" }, option_item_hashes: { "option-1": itemHash(eligibleItem), "option-2": itemHash(second) } };
+    const db = database(async (sql, params) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("auth_mappings")) return { rows: [{ id: "2" }] };
+      if (sql.includes("safety_intake_v2")) return { rows: [{ outcome: "SCREEN_COMPLETE" }] };
+      if (sql.includes("member_today_attempts WHERE") && !sql.includes("state_code")) return { rows: [] };
+      if (sql.includes("coaching_consents")) return { rows: [{}] };
+      if (sql.includes("FROM coach_plans")) return { rows: [{ id: "10", created_at: planVersion }] };
+      if (sql.includes("state_code='QUESTION_REQUIRED'")) return { rows: [original] };
+      if (sql.includes("id=ANY")) return liveRows(sql, [changed, second]);
+      if (sql.includes("INSERT INTO goals_coach_member_today_attempts")) return { rows: [{ state_code: params[5] }] };
+      assert.fail(\`unexpected query: \${sql}\`);
+    });
+    assert.deepEqual((await execute(db, identity, authorization, input)).body, { state: "UNAVAILABLE" });
+  });
+}
