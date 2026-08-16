@@ -75,6 +75,32 @@ test("Migration discards its pre-acquired client when the deadline expires durin
   assert.equal(releases.length, 1);
   assert.ok(releases[0] instanceof Error);
 });
+test("Rollback discards its pre-acquired client when the deadline expires during transaction handoff", async () => {
+  const releases = [];
+  const queries = [];
+  let connectCalls = 0;
+  let calls = 0;
+  const now = () => {
+    calls += 1;
+    return calls <= 4 ? 0n : 20000000n;
+  };
+  const client = {
+    async query(sql) { queries.push(sql); return { rows: [] }; },
+    release(error) { releases.push(error); },
+  };
+
+  await assert.rejects(runRollback({
+    pool: { async connect() { connectCalls += 1; return client; } },
+    overallMilliseconds: 10,
+    monotonicNow: now,
+    skipConfirmation: true,
+  }));
+
+  assert.equal(connectCalls, 1);
+  assert.deepEqual(queries, []);
+  assert.equal(releases.length, 1);
+  assert.ok(releases[0] instanceof Error);
+});
 test("Rollback 013 refuses later migrations and immutable event history", async (t) => {
   const laterDb = await at012(t); await migrate013({ pool: laterDb.pool });
   await laterDb.pool.query("INSERT INTO app_schema_migrations(version,checksum) VALUES ('014_synthetic_later',$1)", ["f".repeat(64)]);
