@@ -49,8 +49,8 @@ async function decide(client, memberId, mappingId, identity, input) {
   const safety=(await client.query("SELECT outcome FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1 AND notice_version=$2 AND valid_until>NOW() ORDER BY submitted_at DESC,id DESC LIMIT 1",[memberId,SAFETY_VERSION])).rows[0];
   const replay = await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2", [memberId,input.clientRequestId]);
   if (replay.rows.length) {
-    if (replay.rows[0].request_hash !== requestHash) throw error(409,"MEMBER_TODAY_IDEMPOTENCY_CONFLICT");
     if (safety && ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) return { body:responseFrom({state_code:safety.outcome}),replay:true };
+    if (replay.rows[0].request_hash !== requestHash) throw error(409,"MEMBER_TODAY_IDEMPOTENCY_CONFLICT");
     let row=replay.rows[0];
     if (["READY","QUESTION_REQUIRED"].includes(row.state_code)) {
       if (!safety) return { body:responseFrom({state_code:"SAFETY_REQUIRED"}),replay:true };

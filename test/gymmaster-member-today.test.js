@@ -42,7 +42,7 @@ test("member today parser errors are concealed for both accepted path forms",()=
     assert.deepEqual(result,{status:400,body:{error:"MEMBER_TODAY_INVALID"}}); assert.equal(res.headers["Cache-Control"],"no-store");
   }
 });
-test("every replay applies current mandatory safety-stop guidance",async(t)=>{
+test("every replay applies current mandatory safety-stop guidance before hash conflicts",async(t)=>{
   const input={clientRequestId:"00000000-0000-4000-8000-000000000007"};
   for(const state of ["SAFETY_REQUIRED","CONSENT_REQUIRED","UNAVAILABLE"]){
     for(const safety of ["URGENT_STOP","MEDICAL_REVIEW_REQUIRED"])await t.test(`${state} replay with ${safety}`,async()=>{
@@ -51,7 +51,7 @@ test("every replay applies current mandatory safety-stop guidance",async(t)=>{
         if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
         if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
         if(sql.includes("safety_intake_v2"))return {rows:[{outcome:safety}]};
-        if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:state,request_hash:hash(input)}]};
+        if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:state,request_hash:hash({...input,continuation:{attemptId:"00000000-0000-4000-8000-000000000008",optionId:"option-1"}})}]};
         downstreamQueries++;
         assert.fail(`unexpected query: ${sql}`);
       });
