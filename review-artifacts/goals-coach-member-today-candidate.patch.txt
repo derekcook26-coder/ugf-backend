@@ -1,0 +1,489 @@
+diff --git a/.env.example b/.env.example
+index a01476d476872a7275f7a162b6a9953bf82f53df..09e9f6c686e90e73d1653e84c294a9777cd80d17 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,6 +6,7 @@ GOALS_COACH_MEMBER_PRIVATE_SCREEN_ENABLED=false
+ GOALS_COACH_MEMBER_PRIVATE_SCREEN_LOGIN_ENABLED=false
+ GOALS_COACH_MEMBER_SAFETY_INTAKE_ALPHA_ENABLED=false
+ GOALS_COACH_MEMBER_COACHING_CONSENT_ENABLED=false
++GOALS_COACH_MEMBER_TODAY_ENABLED=false
+ 
+ # Goals Coach Phase 1A private-alpha foundation. Disabled by default.
+ GOALS_COACH_ALPHA_ENABLED=false
+diff --git a/package.json b/package.json
+index a2e7b66d686675d3bfb56c84d4f3e7c5644a8306..98f1fd13bc1c328d08d22d83a1a4e71df02b5156 100644
+--- a/package.json
++++ b/package.json
+@@ -28,6 +28,8 @@
+     "rollback:safety-intake-v2": "node rollback_012.js",
+     "migrate:member-coaching-consent": "node migrate_013.js",
+     "rollback:member-coaching-consent": "node rollback_013.js",
++    "migrate:member-today": "node migrate_014.js",
++    "rollback:member-today": "node rollback_014.js",
+     "provision:staff": "node scripts/provision-staff-user.js",
+     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
+   },
+diff --git a/server.js b/server.js
+index 75e945d8d8833e86101aeefc0ed0185780c86ff8..bf57c6a55dc659398e17b1da0ed028f2c139c7ff 100644
+--- a/server.js
++++ b/server.js
+@@ -43,6 +43,8 @@ var { createGymMasterMemberSafetyIntakeStartup } = require("./src/goals-coach/gy
+ var { composeGymMasterMemberSafetyIntakeRoutes } = require("./src/goals-coach/gymmaster-member-safety-intake-route-composition");
+ var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach/gymmaster-member-coaching-consent-startup");
+ var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
++var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
++var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
+ var {
+   completeNamePair,
+   createPlanRouteTerminalContext,
+@@ -151,6 +153,11 @@ var memberCoachingConsentStartup = createGymMasterMemberCoachingConsentStartup({
+ });
+ composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
+ 
++// Provider-free, existing-plan-only member guidance is independently gated.
++// Construction performs no database, Gatekeeper, or provider calls.
++var memberTodayStartup = createGymMasterMemberTodayStartup({ db: db, fetchImpl: fetch });
++composeGymMasterMemberTodayRoute(app, memberTodayStartup);
++
+ // Pending enrollment is disabled unless its exact flag is "true". Startup only
+ // composes injected database and Gatekeeper boundaries; it performs no provider
+ // request or database mutation. Its service is shared by the existing member
+diff --git a/src/goals-coach/http-error-handler.js b/src/goals-coach/http-error-handler.js
+index 61fd6ac6680e4263a824e4bb4222860322b08c23..43b31144fab8abababaeec8f2168009d9c27bf17 100644
+--- a/src/goals-coach/http-error-handler.js
++++ b/src/goals-coach/http-error-handler.js
+@@ -1,10 +1,11 @@
+ function goalsCoachErrorHandler(error, req, res, next) {
+   if (res.headersSent) return next(error);
++  const normalizedPath = req.path.toLowerCase();
+   if (
+-    !(req.path === "/staff" || req.path.startsWith("/staff/"))
+-    && !(req.path === "/goals-coach" || req.path.startsWith("/goals-coach/"))
+-    && !(req.path === "/alpha/goals-coach" || req.path.startsWith("/alpha/goals-coach/"))
+-    && !(req.path === "/goalscoach" || req.path.startsWith("/goalscoach/"))
++    !(normalizedPath === "/staff" || normalizedPath.startsWith("/staff/"))
++    && !(normalizedPath === "/goals-coach" || normalizedPath.startsWith("/goals-coach/"))
++    && !(normalizedPath === "/alpha/goals-coach" || normalizedPath.startsWith("/alpha/goals-coach/"))
++    && !(normalizedPath === "/goalscoach" || normalizedPath.startsWith("/goalscoach/"))
+   ) {
+     return next(error);
+   }
+@@ -47,6 +48,13 @@ function goalsCoachErrorHandler(error, req, res, next) {
+     }
+   }
+ 
++  if (normalizedPath === "/goalscoach/member/today" || normalizedPath === "/goalscoach/member/today/") {
++    res.setHeader("Cache-Control", "no-store");
++    res.setHeader("X-Content-Type-Options", "nosniff");
++    if (error && error.type === "entity.too.large") return res.status(413).json({ error: "MEMBER_TODAY_INVALID" });
++    if (error && ["encoding.unsupported", "entity.parse.failed", "request.aborted", "request.size.invalid"].includes(error.type)) return res.status(400).json({ error: "MEMBER_TODAY_INVALID" });
++  }
++
+   if (req.path === "/goalscoach/member/private-screen/login") {
+     res.setHeader("Cache-Control", "no-store");
+     res.setHeader("X-Content-Type-Options", "nosniff");
+diff --git a/src/goals-coach/transcription-route.js b/src/goals-coach/transcription-route.js
+index 97be73c88d8409bb5077416ebbe2cfc7af9535f5..025f36cae460afc175551226af8e672db4c32f59 100644
+--- a/src/goals-coach/transcription-route.js
++++ b/src/goals-coach/transcription-route.js
+@@ -18,6 +18,7 @@ const missingRequestIdPath = /^\/alpha\/goals-coach\/conversations\/([^/]+)\/tra
+ const encodedPathSeparator = /%(?:2f|5c)/i;
+ const memberSafetyIntakePath = "/goalscoach/member/safety-intake";
+ const memberCoachingConsentPath = "/goalscoach/member/coaching-consent";
++const memberTodayPathPattern = /^\/goalscoach\/member\/today\/?$/i;
+ const serviceResultFields = Object.freeze([
+   "transcriptionId",
+   "requestId",
+@@ -118,7 +119,7 @@ function createApplicationJsonParser() {
+     const rawPath = queryOffset === -1 ? originalUrl : originalUrl.slice(0, queryOffset);
+     // Coaching consent owns a post-authentication, post-rate-limit raw parser.
+     // Do not consume or inspect that body at the application-wide boundary.
+-    if (req.method === "POST" && rawPath === memberCoachingConsentPath) return next();
++    if (req.method === "POST" && (rawPath === memberCoachingConsentPath || memberTodayPathPattern.test(rawPath))) return next();
+     if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
+       return memberSafetyIntakeJsonParser(req, res, next);
+     }
+diff --git a/docs/goals-coach-member-today.md b/docs/goals-coach-member-today.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e882e2e1b8242c2ffd33715af3ac72ba6dce390
+--- /dev/null
++++ b/docs/goals-coach-member-today.md
+@@ -0,0 +1,20 @@
++# Provider-free member “today” boundary
++
++Slice B adds only `POST /goalscoach/member/today`, behind the exact-string
++`GOALS_COACH_MEMBER_TODAY_ENABLED=true` gate (default `false`). Requests require
++the configured HTTPS member origin, credentials, `application/json`, no query
++parameters, and a strict closed-choice body. Responses are always `no-store`
++and `nosniff`.
++
++Safety stops precede consent and plan disclosure. The boundary reads only the
++current Safety Intake V2 result, accepted `GC-MEMBER-COACHING-CONSENT-1`
++consent, the member's latest owned plan, and its validated plan items. It makes
++no workout, plan, conversation, safety, consent, enrollment, or profile
++mutation and imports no AI/provider adapter.
++
++Migration 014 stores minimized ownership, request, state, plan/item/option
++identifiers and canonical SHA-256 hashes of the live item fields exposed by the
++API. It stores no response prose, health answers, plan markdown, provider
++payloads, or member text. Replay and continuation recompute every stored item
++binding and hash and fail closed if any binding is missing, stale, cross-scope,
++or changed.
+diff --git a/migrate_014.js b/migrate_014.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..33d9416fb43685f1ad34b8b33c0c4f77defdee6f
+--- /dev/null
++++ b/migrate_014.js
+@@ -0,0 +1,37 @@
++"use strict";
++const crypto = require("node:crypto");
++const fs = require("node:fs");
++const path = require("node:path");
++const { Pool } = require("pg");
++const { checkoutClientOnce, createTerminalState, deadlineAfter, minimumDeadline, monotonicNow, runBoundedPostgresTransaction } = require("./src/goals-coach/bounded-postgres-transaction");
++const MIGRATION_VERSION = "014_goals_coach_member_today";
++const REQUIRED_MIGRATION_VERSION = "013_goals_coach_member_coaching_consent";
++const REQUIRED_MIGRATION_CHECKSUM = "6a41a536d248557ca54b05f4b925d1afcd9245868280e823259ff1bab1ada0f5";
++const MIGRATION_FILE = path.join(__dirname, "migration_014_goals_coach_member_today.sql");
++const MIGRATION_LOCK_KEY = "82720513";
++const CONNECTION_MILLISECONDS = 5000, OVERALL_MILLISECONDS = 60000;
++class Migration014Error extends Error { constructor(code, cause) { super("Migration 014 is unavailable for this database state"); this.name = "Migration014Error"; this.code = code; if (cause !== undefined) this.cause = cause; } }
++function checksum(sql) { return crypto.createHash("sha256").update(sql).digest("hex"); }
++function createPool(connectionString, environment = process.env) { if (!connectionString) throw new Migration014Error("database_url_required"); return new Pool({ connectionString, ssl: environment.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false }, max: 1 }); }
++async function runMigration(options = {}) {
++  const sql = fs.readFileSync(MIGRATION_FILE, "utf8"), sqlChecksum = checksum(sql);
++  const pool = options.pool || createPool(options.connectionString || process.env.DATABASE_URL, options.environment), ownsPool = !options.pool;
++  const now = options.monotonicNow || monotonicNow, terminalState = createTerminalState(), overallDeadlineNs = deadlineAfter(now(), options.overallMilliseconds || OVERALL_MILLISECONDS);
++  try {
++    const client = await checkoutClientOnce({ pool, deadlineNs: minimumDeadline(deadlineAfter(now(), options.connectionMilliseconds || CONNECTION_MILLISECONDS), overallDeadlineNs), terminalState, now });
++    const transaction = await runBoundedPostgresTransaction({ preAcquiredClient: client, terminalState, monotonicNow: now, outerDeadlineNs: overallDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
++      await query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_KEY]);
++      const required = await query("SELECT checksum FROM app_schema_migrations WHERE version = $1", [REQUIRED_MIGRATION_VERSION]);
++      if (!required.rows.length || required.rows[0].checksum !== REQUIRED_MIGRATION_CHECKSUM) throw new Migration014Error("required_migration_mismatch");
++      const existing = await query("SELECT checksum FROM app_schema_migrations WHERE version = $1", [MIGRATION_VERSION]);
++      if (existing.rows.length) { if (existing.rows[0].checksum !== sqlChecksum) throw new Migration014Error("checksum_mismatch"); return { status: "already_applied", version: MIGRATION_VERSION, checksum: sqlChecksum }; }
++      await query(sql); await query("INSERT INTO app_schema_migrations (version, checksum) VALUES ($1, $2)", [MIGRATION_VERSION, sqlChecksum]);
++      if (remainingMilliseconds() === null) throw new Migration014Error("deadline_before_commit");
++      return { status: "applied", version: MIGRATION_VERSION, checksum: sqlChecksum };
++    } });
++    return transaction.value;
++  } catch (error) { for (let cause = error; cause; cause = cause.cause) if (cause instanceof Migration014Error) throw cause; throw new Migration014Error("migration_failed", error); }
++  finally { if (ownsPool) await pool.end(); }
++}
++if (require.main === module) runMigration().then((result) => console.log(`[UGF] Migration ${result.version}: ${result.status}`)).catch(() => { console.error("[UGF] Migration 014 is unavailable for this database state"); process.exitCode = 1; });
++module.exports = { CONNECTION_MILLISECONDS, MIGRATION_FILE, MIGRATION_VERSION, Migration014Error, OVERALL_MILLISECONDS, REQUIRED_MIGRATION_CHECKSUM, REQUIRED_MIGRATION_VERSION, checksum, runMigration };
+diff --git a/migration_014_goals_coach_member_today.sql b/migration_014_goals_coach_member_today.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c03ee630f91a27e972896f3e5508a7b00bca728
+--- /dev/null
++++ b/migration_014_goals_coach_member_today.sql
+@@ -0,0 +1,37 @@
++-- Provider-free member-today minimized provenance. No response or member prose is stored.
++CREATE TABLE goals_coach_member_today_attempts (
++  id BIGSERIAL PRIMARY KEY,
++  member_id BIGINT NOT NULL,
++  auth_mapping_id BIGINT NOT NULL,
++  client_request_id UUID NOT NULL,
++  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[a-f0-9]{64}$'),
++  original_attempt_id BIGINT,
++  state_code TEXT NOT NULL CHECK (state_code IN ('SAFETY_REQUIRED','URGENT_STOP','MEDICAL_REVIEW_REQUIRED','CONSENT_REQUIRED','UNAVAILABLE','QUESTION_REQUIRED','READY')),
++  safety_outcome TEXT CHECK (safety_outcome IN ('SCREEN_COMPLETE','MODIFICATION_REQUIRED','MEDICAL_REVIEW_REQUIRED','URGENT_STOP')),
++  plan_id BIGINT,
++  plan_version TIMESTAMPTZ,
++  plan_item_id BIGINT,
++  plan_item_hash TEXT CHECK (plan_item_hash IS NULL OR plan_item_hash ~ '^[a-f0-9]{64}$'),
++  option_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(option_ids)='array'),
++  option_item_ids JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(option_item_ids)='object'),
++  option_item_hashes JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(option_item_hashes)='object'),
++  selected_option_id TEXT,
++  consumed_at TIMESTAMPTZ,
++  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  FOREIGN KEY (auth_mapping_id, member_id) REFERENCES goals_coach_member_auth_mappings(id, member_id) ON DELETE RESTRICT,
++  FOREIGN KEY (original_attempt_id, member_id) REFERENCES goals_coach_member_today_attempts(id, member_id) ON DELETE RESTRICT,
++  FOREIGN KEY (plan_id, member_id) REFERENCES coach_plans(id, member_id) ON DELETE RESTRICT,
++  FOREIGN KEY (plan_item_id, plan_id) REFERENCES coach_plan_exercises(id, plan_id) ON DELETE RESTRICT,
++  UNIQUE (member_id, client_request_id), UNIQUE (id, member_id),
++  CHECK ((state_code IN ('QUESTION_REQUIRED','READY') AND plan_id IS NOT NULL AND plan_version IS NOT NULL) OR (state_code NOT IN ('QUESTION_REQUIRED','READY') AND plan_id IS NULL AND plan_version IS NULL)),
++  CHECK ((state_code='READY' AND plan_item_id IS NOT NULL AND plan_item_hash IS NOT NULL) OR (state_code<>'READY' AND plan_item_id IS NULL AND plan_item_hash IS NULL))
++);
++CREATE INDEX idx_goals_coach_member_today_attempts_scope ON goals_coach_member_today_attempts(member_id,created_at DESC,id DESC);
++CREATE OR REPLACE FUNCTION preserve_goals_coach_member_today_attempt() RETURNS TRIGGER AS $$
++BEGIN
++  IF TG_OP='DELETE' OR (to_jsonb(OLD) - 'consumed_at') <> (to_jsonb(NEW) - 'consumed_at') OR OLD.consumed_at IS NOT NULL OR NEW.consumed_at IS NULL THEN
++    RAISE EXCEPTION 'member today attempts are immutable except one-time consumption' USING ERRCODE='23514', CONSTRAINT='goals_coach_member_today_attempts_append_only';
++  END IF;
++  RETURN NEW;
++END; $$ LANGUAGE plpgsql;
++CREATE TRIGGER trg_preserve_goals_coach_member_today_attempt BEFORE UPDATE OR DELETE ON goals_coach_member_today_attempts FOR EACH ROW EXECUTE FUNCTION preserve_goals_coach_member_today_attempt();
+diff --git a/rollback_014.js b/rollback_014.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..6faa7c85840632b64ce1e28854b3b332d788536b
+--- /dev/null
++++ b/rollback_014.js
+@@ -0,0 +1,31 @@
++"use strict";
++const fs = require("node:fs");
++const path = require("node:path");
++const { Pool } = require("pg");
++const { checkoutClientOnce, createTerminalState, deadlineAfter, minimumDeadline, monotonicNow, runBoundedPostgresTransaction } = require("./src/goals-coach/bounded-postgres-transaction");
++const { CONNECTION_MILLISECONDS, MIGRATION_FILE, MIGRATION_VERSION, OVERALL_MILLISECONDS, Migration014Error, checksum } = require("./migrate_014");
++const ROLLBACK_FILE = path.join(__dirname, "rollback_014_goals_coach_member_today.sql"), MIGRATION_LOCK_KEY = "82720513";
++function createPool(connectionString, environment = process.env) { if (!connectionString) throw new Migration014Error("database_url_required"); return new Pool({ connectionString, ssl: environment.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false }, max: 1 }); }
++async function runRollback(options = {}) {
++  if (!options.skipConfirmation && process.env.CONFIRM_GOALS_COACH_MEMBER_TODAY_ROLLBACK !== "YES") throw new Migration014Error("confirmation_required");
++  const pool = options.pool || createPool(options.connectionString || process.env.DATABASE_URL, options.environment), ownsPool = !options.pool;
++  const now = options.monotonicNow || monotonicNow, terminalState = createTerminalState(), outerDeadlineNs = deadlineAfter(now(), options.overallMilliseconds || OVERALL_MILLISECONDS);
++  try {
++    const client = await checkoutClientOnce({ pool, deadlineNs: minimumDeadline(deadlineAfter(now(), options.connectionMilliseconds || CONNECTION_MILLISECONDS), outerDeadlineNs), terminalState, now });
++    const transaction = await runBoundedPostgresTransaction({ preAcquiredClient: client, terminalState, monotonicNow: now, outerDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
++      await query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_KEY]);
++      const applied = await query("SELECT checksum FROM app_schema_migrations WHERE version = $1", [MIGRATION_VERSION]);
++      if (!applied.rows.length) return { status: "not_applied", version: MIGRATION_VERSION };
++      if (applied.rows[0].checksum !== checksum(fs.readFileSync(MIGRATION_FILE, "utf8"))) throw new Migration014Error("checksum_mismatch");
++      const later = await query("SELECT candidate.version FROM app_schema_migrations current JOIN app_schema_migrations candidate ON candidate.applied_at > current.applied_at WHERE current.version = $1 ORDER BY candidate.applied_at, candidate.version LIMIT 1", [MIGRATION_VERSION]);
++      if (later.rows.length) throw new Migration014Error("later_migration_applied");
++      const count = await query("SELECT COUNT(*)::int AS count FROM goals_coach_member_today_attempts");
++      if (count.rows[0].count !== 0) throw new Migration014Error("immutable_rows_present");
++      await query(fs.readFileSync(ROLLBACK_FILE, "utf8")); await query("DELETE FROM app_schema_migrations WHERE version = $1", [MIGRATION_VERSION]);
++      if (remainingMilliseconds() === null) throw new Migration014Error("deadline_before_commit"); return { status: "rolled_back", version: MIGRATION_VERSION };
++    } }); return transaction.value;
++  } catch (error) { for (let cause = error; cause; cause = cause.cause) if (cause instanceof Migration014Error) throw cause; throw new Migration014Error("rollback_failed", error); }
++  finally { if (ownsPool) await pool.end(); }
++}
++if (require.main === module) { runRollback().then(() => console.log("[UGF] Member Today rollback completed.")).catch(() => { console.error("[UGF] Member Today rollback failed."); process.exitCode = 1; }); }
++module.exports = { runRollback };
+diff --git a/rollback_014_goals_coach_member_today.sql b/rollback_014_goals_coach_member_today.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ed6b2bdf1614edf5d44ed67359e25e366fb99bf
+--- /dev/null
++++ b/rollback_014_goals_coach_member_today.sql
+@@ -0,0 +1,3 @@
++DROP TRIGGER trg_preserve_goals_coach_member_today_attempt ON goals_coach_member_today_attempts;
++DROP FUNCTION preserve_goals_coach_member_today_attempt();
++DROP TABLE goals_coach_member_today_attempts;
+diff --git a/src/goals-coach/gymmaster-member-today-route-composition.js b/src/goals-coach/gymmaster-member-today-route-composition.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe8ac41a83ba48c4816a679269755c37ebd68b5b
+--- /dev/null
++++ b/src/goals-coach/gymmaster-member-today-route-composition.js
+@@ -0,0 +1,11 @@
++"use strict";
++const cors = require("cors");
++const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
++function composeGymMasterMemberTodayRoute(app, startup) {
++  if (!app || typeof app.use !== "function") throw new Error("Member today composition requires an Express application");
++  if (!startup || startup.status !== "ready_for_separate_route_composition" || typeof startup.router !== "function" || !exactHttpsOrigin(startup.origin)) return Object.freeze({ mounted: false, path: null });
++  const path = "/goalscoach/member/today";
++  app.use(path, (req, res, next) => { res.setHeader("Cache-Control", "no-store"); res.setHeader("X-Content-Type-Options", "nosniff"); if (req.headers.origin !== startup.origin) return res.status(403).json({ error: "MEMBER_ORIGIN_NOT_ALLOWED" }); next(); }, cors({ origin: startup.origin, credentials: true, methods: ["POST", "OPTIONS"], allowedHeaders: ["Content-Type"], optionsSuccessStatus: 204 }), startup.router);
++  return Object.freeze({ mounted: true, path });
++}
++module.exports = { composeGymMasterMemberTodayRoute };
+diff --git a/src/goals-coach/gymmaster-member-today-startup.js b/src/goals-coach/gymmaster-member-today-startup.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..24be1fe8784717b9f098378d45ae3c07a7244673
+--- /dev/null
++++ b/src/goals-coach/gymmaster-member-today-startup.js
+@@ -0,0 +1,19 @@
++"use strict";
++const { createGymMasterGatekeeperMembershipVerifier, createGymMasterMemberAccessAuthorizer, exactGatekeeperMembersEndpoint } = require("./gymmaster-gatekeeper-membership");
++const { createGymMasterMemberAuthorization } = require("./gymmaster-member-authorization");
++const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
++const { createGymMasterMemberSessionAuthenticator, createGymMasterMemberSessionService } = require("./gymmaster-member-session");
++const { MEMBER_TODAY_FLAG, createRouter, enabled } = require("./gymmaster-member-today");
++function validEndpoint(value) { try { exactGatekeeperMembersEndpoint(value); return true; } catch (_) { return false; } }
++function createGymMasterMemberTodayStartup(options = {}) {
++  const environment = options.environment || process.env;
++  const on = enabled(environment[MEMBER_TODAY_FLAG]);
++  const origin = exactHttpsOrigin(environment.GOALS_COACH_MEMBER_LOGIN_ORIGIN);
++  const endpoint = environment.GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL;
++  const common = Object.freeze({ status: on ? "not_ready" : "disabled", router: null, origin: null, activationPermitted: false, providerCallsPermitted: false });
++  if (!on || !origin || !validEndpoint(endpoint) || !/^[a-z0-9_-]{1,40}$/i.test(environment.GYMMASTER_SITE || "") || !environment.GYMMASTER_API_KEY || typeof environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET !== "string" || environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET.length < 32 || !options.db || typeof options.db.connect !== "function" || typeof options.fetchImpl !== "function") return common;
++  const session = createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}) });
++  const access = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer: createGymMasterMemberAuthorization({ db: options.db }), membershipVerifier: createGymMasterGatekeeperMembershipVerifier({ endpoint, site: environment.GYMMASTER_SITE, apiKey: environment.GYMMASTER_API_KEY, fetchImpl: options.fetchImpl, ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }) }) });
++  return Object.freeze({ ...common, status: "ready_for_separate_route_composition", origin, router: createRouter({ db: options.db, authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService: session }), authorizeIdentity: access.authorizeIdentity, origin, ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}) }) });
++}
++module.exports = { createGymMasterMemberTodayStartup };
+diff --git a/src/goals-coach/gymmaster-member-today.js b/src/goals-coach/gymmaster-member-today.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..4fb51e6adea20f8a2f5fda9e7cf28f8558d9ebe9
+--- /dev/null
++++ b/src/goals-coach/gymmaster-member-today.js
+@@ -0,0 +1,90 @@
++"use strict";
++const crypto = require("node:crypto");
++const express = require("express");
++const rateLimit = require("express-rate-limit");
++const { validGymMasterIdentity } = require("./gymmaster-member-authorization");
++const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-membership");
++const { createTerminalState, deadlineAfter, monotonicNow, runBoundedPostgresTransaction } = require("./bounded-postgres-transaction");
++const MEMBER_TODAY_FLAG = "GOALS_COACH_MEMBER_TODAY_ENABLED", CONSENT_VERSION = "GC-MEMBER-COACHING-CONSENT-1", SAFETY_VERSION = "GC-MEMBER-SAFETY-NOTICE-2", MAX_BYTES = 512;
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ID = /^[1-9]\d{0,18}$/;
++const GUIDANCE = Object.freeze({ URGENT_STOP: "Stop now and seek immediate emergency help.", MEDICAL_REVIEW_REQUIRED: "Stop this session and contact an appropriate qualified healthcare professional.", MODIFICATION_REQUIRED: "Use comfortable, pain-free movement; reduce intensity or range, and stop if symptoms increase." });
++function enabled(value) { return value === "true"; }
++function error(statusCode, code) { const e = new Error(code); e.statusCode = statusCode; e.code = code; e.exposeMessage = false; return e; }
++function exact(value) { return value && typeof value === "object" && !Array.isArray(value); }
++function parse(body) {
++  if (!exact(body) || Object.keys(body).some((key) => !["clientRequestId", "continuation"].includes(key)) || !UUID.test(body.clientRequestId)) throw error(400, "MEMBER_TODAY_INVALID");
++  if (body.continuation === undefined) return { clientRequestId: body.clientRequestId };
++  const c = body.continuation;
++  if (!exact(c) || Object.keys(c).some((key) => !["attemptId", "optionId"].includes(key)) || !UUID.test(c.attemptId) || typeof c.optionId !== "string" || !/^option-[1-9]\d{0,2}$/.test(c.optionId)) throw error(400, "MEMBER_TODAY_INVALID");
++  return { clientRequestId: body.clientRequestId, continuation: { attemptId: c.attemptId, optionId: c.optionId } };
++}
++function canonical(value) { if (Array.isArray(value)) return value.map(canonical); if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])); return value; }
++function sha(value) { return crypto.createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex"); }
++function hash(input) { return sha(input.continuation || {}); }
++function itemHash(item) { return sha({ name: item.exercise_name, prescription: item.prescription_json }); }
++function authError() { return error(401, "MEMBER_AUTHENTICATION_REQUIRED"); }
++function responseFrom(row, item) {
++  const out = { state: row.state_code };
++  if (["URGENT_STOP", "MEDICAL_REVIEW_REQUIRED"].includes(row.state_code)) out.guidance = GUIDANCE[row.state_code];
++  if (row.state_code === "QUESTION_REQUIRED") { out.attemptId = row.client_request_id; out.question = { id: "TODAY_PLAN_ITEM", prompt: "Which planned item are you ready to start?", options: row.options }; if (row.safety_outcome === "MODIFICATION_REQUIRED") out.safetyConstraint = GUIDANCE.MODIFICATION_REQUIRED; }
++  if (row.state_code === "READY") { out.action = { planId: String(row.plan_id), planVersion: new Date(row.plan_version).toISOString(), itemId: String(row.plan_item_id), name: item.exercise_name, prescription: item.prescription_json }; if (row.safety_outcome === "MODIFICATION_REQUIRED") out.safetyConstraint = GUIDANCE.MODIFICATION_REQUIRED; }
++  return out;
++}
++async function loadBoundItems(client, row) {
++  const ids = row.state_code === "READY" ? [String(row.plan_item_id)] : (row.option_ids || []).map((option) => row.option_item_ids && row.option_item_ids[option]).filter(Boolean).map(String);
++  if (!ids.length || (row.state_code === "QUESTION_REQUIRED" && ids.length !== row.option_ids.length)) return null;
++  const items = (await client.query("SELECT id,exercise_name,prescription_json FROM coach_plan_exercises WHERE plan_id=$1 AND id=ANY($2::bigint[])", [row.plan_id, ids])).rows;
++  const byId = new Map(items.map((item) => [String(item.id), item]));
++  if (byId.size !== new Set(ids).size) return null;
++  if (row.state_code === "READY") return itemHash(byId.get(ids[0])) === row.plan_item_hash ? { item: byId.get(ids[0]), options: [] } : null;
++  const options = [];
++  for (const option of row.option_ids) { const id = String(row.option_item_ids[option]), item = byId.get(id); if (!item || itemHash(item) !== (row.option_item_hashes || {})[option]) return null; options.push({ id: option, label: item.exercise_name }); }
++  return { item: null, options };
++}
++async function decide(client, memberId, mappingId, identity, input) {
++  const requestHash = hash(input);
++  const mapping = await client.query("SELECT id FROM goals_coach_member_auth_mappings WHERE id=$1 AND member_id=$2 AND auth_provider=$3 AND auth_subject=$4 AND active=TRUE FOR UPDATE", [mappingId, memberId, identity.authProvider, identity.authSubject]);
++  if (!mapping.rows.length) throw authError();
++  const safety = (await client.query("SELECT outcome FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1 AND notice_version=$2 AND valid_until>NOW() ORDER BY submitted_at DESC,id DESC LIMIT 1", [memberId, SAFETY_VERSION])).rows[0];
++  const replay = await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2", [memberId, input.clientRequestId]);
++  if (replay.rows.length) {
++    if (safety && ["URGENT_STOP", "MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) return { body: responseFrom({ state_code: safety.outcome }), replay: true };
++    if (replay.rows[0].request_hash !== requestHash) throw error(409, "MEMBER_TODAY_IDEMPOTENCY_CONFLICT");
++    let row = replay.rows[0];
++    if (["READY", "QUESTION_REQUIRED"].includes(row.state_code)) {
++      if (!safety) return { body: responseFrom({ state_code: "SAFETY_REQUIRED" }), replay: true };
++      const consent = (await client.query("SELECT 1 FROM goals_coach_member_coaching_consents WHERE member_id=$1 AND notice_version=$2 AND status='accepted'", [memberId, CONSENT_VERSION])).rows[0];
++      if (!consent) return { body: responseFrom({ state_code: "CONSENT_REQUIRED" }), replay: true };
++      const latest = (await client.query("SELECT id,created_at FROM coach_plans WHERE member_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1", [memberId])).rows[0];
++      if (!latest || String(row.plan_id) !== String(latest.id) || new Date(row.plan_version).getTime() !== new Date(latest.created_at).getTime()) return { body: responseFrom({ state_code: "UNAVAILABLE" }), replay: true };
++      const bound = await loadBoundItems(client, row); if (!bound) return { body: responseFrom({ state_code: "UNAVAILABLE" }), replay: true };
++      row = { ...row, safety_outcome: safety.outcome, options: bound.options }; return { body: responseFrom(row, bound.item), replay: true };
++    }
++    return { body: responseFrom(row), replay: true };
++  }
++  let state, plan = null, item = null, options = [], optionItemIds = {}, optionItemHashes = {}, original = null;
++  if (!safety) state = "SAFETY_REQUIRED";
++  else if (["URGENT_STOP", "MEDICAL_REVIEW_REQUIRED"].includes(safety.outcome)) state = safety.outcome;
++  else {
++    const consent = (await client.query("SELECT 1 FROM goals_coach_member_coaching_consents WHERE member_id=$1 AND notice_version=$2 AND status='accepted'", [memberId, CONSENT_VERSION])).rows[0];
++    if (!consent) state = "CONSENT_REQUIRED";
++    else {
++      plan = (await client.query("SELECT id,created_at FROM coach_plans WHERE member_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1", [memberId])).rows[0];
++      if (!plan) state = "UNAVAILABLE";
++      else if (input.continuation) {
++        original = (await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2 AND state_code='QUESTION_REQUIRED' FOR UPDATE", [memberId, input.continuation.attemptId])).rows[0];
++        if (!original || original.consumed_at || String(original.plan_id) !== String(plan.id) || new Date(original.plan_version).getTime() !== new Date(plan.created_at).getTime() || !(original.option_ids || []).includes(input.continuation.optionId)) { state = "UNAVAILABLE"; plan = null; original = null; }
++        else { const bound = await loadBoundItems(client, original); const selected = bound && String(original.option_item_ids[input.continuation.optionId]); item = bound && (await client.query("SELECT id,exercise_name,prescription_json FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2", [selected, original.plan_id])).rows[0]; if (!bound || !item || itemHash(item) !== original.option_item_hashes[input.continuation.optionId]) { state = "UNAVAILABLE"; plan = null; item = null; original = null; } else { state = "READY"; await client.query("UPDATE goals_coach_member_today_attempts SET consumed_at=NOW() WHERE id=$1 AND consumed_at IS NULL", [original.id]); } }
++      } else {
++        const items = (await client.query("SELECT id,exercise_name,prescription_json FROM coach_plan_exercises WHERE plan_id=$1 AND status='active' AND intent_validation_status='validated' ORDER BY sequence_number,id", [plan.id])).rows;
++        if (!items.length) { state = "UNAVAILABLE"; plan = null; } else if (items.length === 1) { state = "READY"; item = items[0]; } else { state = "QUESTION_REQUIRED"; options = items.slice(0, 20).map((entry, index) => ({ id: `option-${index + 1}`, label: entry.exercise_name })); optionItemIds = Object.fromEntries(options.map((entry, index) => [entry.id, String(items[index].id)])); optionItemHashes = Object.fromEntries(options.map((entry, index) => [entry.id, itemHash(items[index])])); }
++      }
++    }
++  }
++  const inserted = (await client.query("INSERT INTO goals_coach_member_today_attempts(member_id,auth_mapping_id,client_request_id,request_hash,original_attempt_id,state_code,safety_outcome,plan_id,plan_version,plan_item_id,plan_item_hash,option_ids,option_item_ids,option_item_hashes,selected_option_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *", [memberId, mappingId, input.clientRequestId, requestHash, original && original.id, state, safety && safety.outcome, plan && plan.id, plan && plan.created_at, item && item.id, item && itemHash(item), JSON.stringify(options.map((entry) => entry.id)), JSON.stringify(optionItemIds), JSON.stringify(optionItemHashes), input.continuation && input.continuation.optionId])).rows[0];
++  inserted.options = options; return { body: responseFrom(inserted, item), replay: false };
++}
++async function execute(db, identity, authorization, input) { if (!validGymMasterIdentity(identity) || !authorization || authorization.active !== true || !ID.test(String(authorization.memberId)) || !ID.test(String(authorization.mappingId))) throw authError(); try { const result = await runBoundedPostgresTransaction({ pool: db, outerDeadlineNs: deadlineAfter(monotonicNow(), 5000), phaseMilliseconds: 5000, terminalState: createTerminalState(), work: (client) => decide(client, String(authorization.memberId), String(authorization.mappingId), identity, input) }); return result.value; } catch (e) { if (e && e.code === "work_failed" && e.cause) throw e.cause; throw e; } }
++function createRateLimit() { return rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, keyGenerator: (req) => `member:${req.alphaMemberIdentity.authSubject}`, handler: (_req, res) => res.status(429).json({ error: "RATE_LIMITED" }) }); }
++function createRouter(options = {}) { const { db, authenticateSession, authorizeIdentity, origin } = options; if (!db || typeof db.connect !== "function" || typeof authenticateSession !== "function" || typeof authorizeIdentity !== "function" || !origin) throw new Error("Member today dependencies are incomplete"); const router = express.Router(), limiter = options.rateLimit || createRateLimit(), parser = express.json({ inflate: false, limit: MAX_BYTES, strict: true }); router.post("/", (req, res, next) => { res.setHeader("Cache-Control", "no-store"); res.setHeader("X-Content-Type-Options", "nosniff"); if (req.headers.origin !== origin) return res.status(403).json({ error: "MEMBER_ORIGIN_NOT_ALLOWED" }); return authenticateSession(req, res, next); }, limiter, (req, res, next) => { if (Object.keys(req.query).length || req.headers["content-type"] !== "application/json") return next(error(400, "MEMBER_TODAY_INVALID")); return parser(req, res, next); }, async (req, res, next) => { try { const authorization = await authorizeIdentity(req.alphaMemberIdentity); if (memberAccessDependencyUnavailable(authorization)) return res.status(503).json({ error: "MEMBER_TODAY_UNAVAILABLE" }); if (!authorization.active) throw authError(); req.todayAuthorization = authorization; next(); } catch (e) { if (e.statusCode) return next(e); return res.status(503).json({ error: "MEMBER_TODAY_UNAVAILABLE" }); } }, async (req, res, next) => { try { const result = await execute(db, req.alphaMemberIdentity, req.todayAuthorization, parse(req.body)); return res.status(200).json({ ...result.body, idempotentReplay: result.replay }); } catch (e) { return next(e); } }); return router; }
++module.exports = { CONSENT_VERSION, GUIDANCE, MAX_BYTES, MEMBER_TODAY_FLAG, SAFETY_VERSION, canonical, createRouter, enabled, execute, hash, itemHash, parse };
+diff --git a/test/gymmaster-member-today.test.js b/test/gymmaster-member-today.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..c982aa67e5cef498b238349304890544d24a9e11
+--- /dev/null
++++ b/test/gymmaster-member-today.test.js
+@@ -0,0 +1,64 @@
++"use strict";
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const test = require("node:test");
++const { GUIDANCE, MEMBER_TODAY_FLAG, canonical, enabled, execute, hash, itemHash, parse } = require("../src/goals-coach/gymmaster-member-today");
++const { createGymMasterMemberTodayStartup } = require("../src/goals-coach/gymmaster-member-today-startup");
++const { createApplicationJsonParser } = require("../src/goals-coach/transcription-route");
++const { goalsCoachErrorHandler } = require("../src/goals-coach/http-error-handler");
++
++test("member today flag is exact-string disabled and startup isolated", () => {
++  assert.equal(MEMBER_TODAY_FLAG, "GOALS_COACH_MEMBER_TODAY_ENABLED");
++  assert.equal(enabled("true"), true); for (const value of [undefined, "false", "TRUE", " true", true]) assert.equal(enabled(value), false);
++  let calls = 0; const startup = createGymMasterMemberTodayStartup({ environment: { GOALS_COACH_MEMBER_TODAY_ENABLED: "false" }, db: { connect() { calls++; } }, fetchImpl() { calls++; } });
++  assert.equal(startup.status, "disabled"); assert.equal(startup.router, null); assert.equal(calls, 0); assert.equal(startup.providerCallsPermitted, false);
++  assert.match(fs.readFileSync(".env.example", "utf8"), /^GOALS_COACH_MEMBER_TODAY_ENABLED=false$/m);
++});
++test("strict closed-choice contracts reject free text", () => {
++  const id = "00000000-0000-4000-8000-000000000001";
++  assert.deepEqual(parse({ clientRequestId: id }), { clientRequestId: id });
++  assert.throws(() => parse({ clientRequestId: id, text: "pain" }), (error) => error.code === "MEMBER_TODAY_INVALID");
++});
++test("canonical item hashes cover exactly exposed live fields and key ordering", () => {
++  assert.deepEqual(canonical({ z: 1, a: { y: 2, x: 3 } }), { a: { x: 3, y: 2 }, z: 1 });
++  const a = itemHash({ exercise_name: "Squat", prescription_json: { reps: 8, load: { unit: "kg", value: 20 } }, status: "active" });
++  assert.equal(a, itemHash({ exercise_name: "Squat", prescription_json: { load: { value: 20, unit: "kg" }, reps: 8 }, status: "retired" }));
++  assert.notEqual(a, itemHash({ exercise_name: "Squat", prescription_json: { reps: 9, load: { unit: "kg", value: 20 } } }));
++  assert.notEqual(a, itemHash({ exercise_name: "Squat edited", prescription_json: { reps: 8, load: { unit: "kg", value: 20 } } }));
++});
++test("fixed safety wording and provider isolation", () => {
++  assert.equal(GUIDANCE.MODIFICATION_REQUIRED, "Use comfortable, pain-free movement; reduce intensity or range, and stop if symptoms increase.");
++  const source = fs.readFileSync("src/goals-coach/gymmaster-member-today.js", "utf8") + fs.readFileSync("src/goals-coach/gymmaster-member-today-startup.js", "utf8");
++  assert.doesNotMatch(source, /require\(["'](?:openai|\.\/transcription-adapter|\.\/coaching-engine)["']\)/i);
++});
++test("application parser and concealed errors accept canonical case and slash variants", () => {
++  const parser = createApplicationJsonParser();
++  for (const path of ["/goalscoach/member/today", "/goalscoach/member/today/", "/GOALSCOACH/MEMBER/TODAY"]) { let continued = false; parser({ method: "POST", originalUrl: path, headers: {} }, {}, () => { continued = true; }); assert.equal(continued, true); let result; const res = { setHeader() {}, status(status) { result = { status }; return this; }, json(body) { result.body = body; return this; } }; goalsCoachErrorHandler(Object.assign(new Error("secret"), { type: "entity.parse.failed" }), { path }, res, () => assert.fail()); assert.deepEqual(result, { status: 400, body: { error: "MEMBER_TODAY_INVALID" } }); }
++});
++test("source recomputes all bindings without advisory timestamps", () => {
++  const source = fs.readFileSync("src/goals-coach/gymmaster-member-today.js", "utf8");
++  assert.doesNotMatch(source, /updated_at/); assert.match(source, /for \(const option of row\.option_ids\)/); assert.match(source, /itemHash\(item\)/);
++});
++function database(query) { return { async connect() { return { query(sql, params) { if (String(sql).includes("set_config('lock_timeout'")) return Promise.resolve({ rows: [] }); return query(sql, params); }, release() {} }; } }; }
++const identity = { authProvider: "gymmaster", authSubject: "gymmaster:10482" }, authorization = { active: true, memberId: "1", mappingId: "2" };
++test("question replay recomputes every original association and conceals any hash mismatch", async () => {
++  const input = { clientRequestId: "00000000-0000-4000-8000-000000000019" };
++  const planVersion = new Date("2026-01-01T00:00:00.000Z");
++  const offered = [{ id: "20", exercise_name: "Squat", prescription_json: { reps: 8 } }, { id: "21", exercise_name: "Row", prescription_json: { reps: 10 } }];
++  for (const changed of [false, true]) {
++    let bindingQueries = 0;
++    const db = database(async (sql) => {
++      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
++      if (sql.includes("auth_mappings")) return { rows: [{ id: "2" }] };
++      if (sql.includes("safety_intake_v2")) return { rows: [{ outcome: "SCREEN_COMPLETE" }] };
++      if (sql.includes("member_today_attempts WHERE")) return { rows: [{ state_code: "QUESTION_REQUIRED", client_request_id: input.clientRequestId, request_hash: hash(input), plan_id: "10", plan_version: planVersion, option_ids: ["option-1", "option-2"], option_item_ids: { "option-1": "20", "option-2": "21" }, option_item_hashes: { "option-1": itemHash(offered[0]), "option-2": itemHash(offered[1]) } }] };
++      if (sql.includes("coaching_consents")) return { rows: [{}] };
++      if (sql.includes("FROM coach_plans")) return { rows: [{ id: "10", created_at: planVersion }] };
++      if (sql.includes("id=ANY")) { bindingQueries++; return { rows: changed ? [offered[0], { ...offered[1], prescription_json: { reps: 11 } }] : offered }; }
++      assert.fail(`unexpected query: ${sql}`);
++    });
++    const result = await execute(db, identity, authorization, input);
++    assert.equal(bindingQueries, 1);
++    assert.deepEqual(result.body, changed ? { state: "UNAVAILABLE" } : { state: "QUESTION_REQUIRED", attemptId: input.clientRequestId, question: { id: "TODAY_PLAN_ITEM", prompt: "Which planned item are you ready to start?", options: [{ id: "option-1", label: "Squat" }, { id: "option-2", label: "Row" }] } });
++  }
++});
+diff --git a/test/migration-014.test.js b/test/migration-014.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..fff211ab83427a8a58d9d2eae63e9188fa4217c3
+--- /dev/null
++++ b/test/migration-014.test.js
+@@ -0,0 +1,12 @@
++"use strict";
++const assert = require("node:assert/strict");
++const crypto = require("node:crypto");
++const fs = require("node:fs");
++const test = require("node:test");
++const { createDisposableDatabase } = require("./helpers/disposable-db");
++const { runMigration: m009 } = require("../migrate_009"); const { runMigration: m010 } = require("../migrate_010"); const { runMigration: m011 } = require("../migrate_011"); const { runMigration: m012 } = require("../migrate_012"); const { runMigration: m013 } = require("../migrate_013");
++const { MIGRATION_FILE, MIGRATION_VERSION, REQUIRED_MIGRATION_CHECKSUM, runMigration: m014 } = require("../migrate_014"); const { runRollback } = require("../rollback_014");
++async function at013(t) { const db = await createDisposableDatabase({ ownerEditableWorkoutSessions: true }); t.after(() => db.close()); await m009({ pool: db.pool }); await m010({ pool: db.pool }); await m011({ pool: db.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } }); await m012({ pool: db.pool }); await m013({ pool: db.pool }); return db; }
++test("Migration 014 is ordered, checksummed, replayable and guarded", async (t) => { assert.equal(crypto.createHash("sha256").update(fs.readFileSync("migration_013_goals_coach_member_coaching_consent.sql")).digest("hex"), REQUIRED_MIGRATION_CHECKSUM); assert.doesNotMatch(fs.readFileSync("server.js", "utf8"), /migrate_014/); const db = await at013(t); const result = await m014({ pool: db.pool }); assert.equal(result.version, MIGRATION_VERSION); assert.equal((await m014({ pool: db.pool })).status, "already_applied"); assert.equal((await runRollback({ pool: db.pool, skipConfirmation: true })).status, "rolled_back"); });
++test("Migration 014 stores only minimized immutable hash provenance", () => { const sql = fs.readFileSync(MIGRATION_FILE, "utf8"); for (const required of [/plan_item_hash TEXT/, /option_item_hashes JSONB/, /UNIQUE \(member_id, client_request_id\)/, /BEFORE UPDATE OR DELETE/]) assert.match(sql, required); for (const prohibited of ["health_answers", "plan_markdown", "coaching_prose", "provider_payload", "member_text", "exercise_name", "prescription_json"]) assert.doesNotMatch(sql, new RegExp(prohibited, "i")); });
++test("Migration 014 rollback CLI is protected", () => { const source = fs.readFileSync("rollback_014.js", "utf8"); assert.match(source, /if \(require\.main === module\)/); assert.match(source, /confirmation_required/); });
