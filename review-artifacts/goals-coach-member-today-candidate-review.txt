@@ -1,0 +1,12 @@
+Corrected Goals Coach member-today candidate review artifact
+
+Repository: derekcook26-coder/ugf-backend
+Exact base: 8c96b4378483c04323a22d537d7b9dd8587ff640
+Exact head: 7cfb1aa33f5a8d0af7073764364e719ff4e532af
+Draft PR: #38
+Changed paths: 15
+GitHub Actions run: 31941059463
+Full suite: 518 passed; 0 failed, cancelled, skipped, or todo
+JavaScript syntax: 193 files passed
+
+The sibling patch file is the exact unified diff returned by GitHub for PR #38 at the head above.
