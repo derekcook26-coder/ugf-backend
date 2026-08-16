@@ -42,6 +42,24 @@ test("Migration and rollback bound checkout and release late clients", async () 
     await new Promise((resolve) => setTimeout(resolve, 40)); assert.equal(released, true);
   }
 });
+test("Migration discards its pre-acquired client when the deadline expires during transaction handoff", async () => {
+  let calls = 0;
+  const queries = [];
+  const releases = [];
+  const client = {
+    query(sql) { queries.push(sql); throw new Error("must not query"); },
+    release(error) { releases.push(error); },
+  };
+  await assert.rejects(migrate013({
+    pool: { connect: async () => client },
+    monotonicNow: () => calls++ < 4 ? 0n : 20000000n,
+    overallMilliseconds: 10,
+  }));
+  assert.equal(calls >= 5, true);
+  assert.equal(queries.length, 0);
+  assert.equal(releases.length, 1);
+  assert.ok(releases[0] instanceof Error);
+});
 test("Migration and rollback discard clients with uncertain statement outcomes", async () => {
   for (const operation of [
     (pool) => migrate013({ pool, overallMilliseconds: 10 }),
