@@ -131,6 +131,28 @@ test("plan-guidance replays fail closed when the stored plan is no longer latest
     assert.equal(itemQueries,0);
   });
 });
+test("changed or missing replay guidance fails closed without returning mutable details",async(t)=>{
+  const cases=[
+    {name:"READY exercise rename",state:"READY",rows:[]},
+    {name:"READY prescription change",state:"READY",rows:[]},
+    {name:"QUESTION_REQUIRED option edit",state:"QUESTION_REQUIRED",rows:[]},
+    {name:"QUESTION_REQUIRED option deletion",state:"QUESTION_REQUIRED",rows:[]},
+  ];
+  for(const entry of cases)await t.test(entry.name,async()=>{
+    const input={clientRequestId:"00000000-0000-4000-8000-000000000019"};
+    const db=database(async(sql,params)=>{
+      if(["BEGIN","COMMIT","ROLLBACK"].includes(sql))return {rows:[]};
+      if(sql.includes("auth_mappings"))return {rows:[{id:"2"}]};
+      if(sql.includes("safety_intake_v2"))return {rows:[{outcome:"SCREEN_COMPLETE"}]};
+      if(sql.includes("member_today_attempts WHERE"))return {rows:[{state_code:entry.state,client_request_id:input.clientRequestId,request_hash:hash(input),plan_id:"10",plan_version:new Date("2026-01-01T00:00:00.000Z"),plan_item_id:entry.state==="READY"?"20":null,option_ids:["option-1"],option_item_ids:{"option-1":"20"},created_at:new Date("2026-01-01T01:00:00.000Z")}]};
+      if(sql.includes("coaching_consents"))return {rows:[{}]};
+      if(sql.includes("FROM coach_plans"))return {rows:[{id:"10",created_at:new Date("2026-01-01T00:00:00.000Z")}]};
+      if(sql.includes("FROM coach_plan_exercises")){assert.equal(new Date(params[2]).toISOString(),"2026-01-01T01:00:00.000Z");return {rows:entry.rows};}
+      assert.fail(`unexpected query: ${sql}`);
+    });
+    assert.deepEqual(await execute(db,identity,authorization,input),{body:{state:"UNAVAILABLE"},replay:true});
+  });
+});
 test("continuation keeps the originally offered item after retirement, insertion, and reordering",async()=>{
   const attemptId="00000000-0000-4000-8000-000000000004",input={clientRequestId:"00000000-0000-4000-8000-000000000005",continuation:{attemptId,optionId:"option-1"}};
   const plan={id:"10",created_at:new Date("2026-01-01T00:00:00.000Z")}; let selectedQuery;
