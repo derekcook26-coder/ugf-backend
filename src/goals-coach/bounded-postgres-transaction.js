@@ -187,7 +187,6 @@ async function runBoundedPostgresTransaction(options = {}) {
   );
 
   let client = options.preAcquiredClient || null;
-  const hasPreAcquiredClient = Boolean(client);
   let released = false;
   let discarded = false;
   let began = false;
@@ -290,7 +289,7 @@ async function runBoundedPostgresTransaction(options = {}) {
       });
     }
     if (remainingMilliseconds() === null || terminalState.isTerminal()) {
-      if (hasPreAcquiredClient) {
+      if (options.preAcquiredClient) {
         discard(new Error("Pre-acquired PostgreSQL client crossed transaction handoff deadline"));
       } else {
         ordinaryRelease();
