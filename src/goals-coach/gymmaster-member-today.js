@@ -77,7 +77,7 @@ async function decide(client, memberId, mappingId, identity, input) {
         original=(await client.query("SELECT * FROM goals_coach_member_today_attempts WHERE member_id=$1 AND client_request_id=$2 AND state_code='QUESTION_REQUIRED' FOR UPDATE",[memberId,input.continuation.attemptId])).rows[0];
         const selectedItemId=original&&original.option_item_ids&&original.option_item_ids[input.continuation.optionId];
         if (!original || original.consumed_at || String(original.plan_id)!==String(plan.id) || new Date(original.plan_version).getTime()!==new Date(plan.created_at).getTime() || !(original.option_ids||[]).includes(input.continuation.optionId) || !selectedItemId) throw error(409,"MEMBER_TODAY_CONTINUATION_CONFLICT");
-        item=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2",[selectedItemId,original.plan_id])).rows[0]; if (!item) throw error(409,"MEMBER_TODAY_CONTINUATION_CONFLICT"); state="READY";
+        item=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE id=$1 AND plan_id=$2 AND updated_at<=$3",[selectedItemId,original.plan_id,original.created_at])).rows[0]; if (!item) throw error(409,"MEMBER_TODAY_CONTINUATION_CONFLICT"); state="READY";
         await client.query("UPDATE goals_coach_member_today_attempts SET consumed_at=NOW() WHERE id=$1 AND consumed_at IS NULL",[original.id]);
       } else {
         const items=(await client.query("SELECT id,exercise_name,prescription_json,sequence_number FROM coach_plan_exercises WHERE plan_id=$1 AND status='active' AND intent_validation_status='validated' ORDER BY sequence_number,id",[plan.id])).rows;
