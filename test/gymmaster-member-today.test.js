@@ -26,6 +26,11 @@ test("member today uses fixed safety wording and imports no provider",()=>{
   const source=fs.readFileSync("src/goals-coach/gymmaster-member-today.js","utf8")+fs.readFileSync("src/goals-coach/gymmaster-member-today-startup.js","utf8");
   assert.doesNotMatch(source,/require\(["'](?:openai|\.\/transcription-adapter|\.\/coaching-engine)["']\)/i);
 });
+test("continuations fail closed when the originally offered item changed",()=>{
+  const source=fs.readFileSync("src/goals-coach/gymmaster-member-today.js","utf8");
+  assert.match(source,/WHERE id=\$1 AND plan_id=\$2 AND updated_at<=\$3"\s*,\[selectedItemId,original\.plan_id,original\.created_at\]/);
+  assert.match(source,/if \(!item\) throw error\(409,"MEMBER_TODAY_CONTINUATION_CONFLICT"\)/);
+});
 test("application JSON parser leaves the today body for its authenticated route parser",()=>{
   const parser=createApplicationJsonParser();
   for(const originalUrl of ["/goalscoach/member/today","/goalscoach/member/today/","/GOALSCOACH/MEMBER/TODAY","/GoalsCoach/Member/Today/"]){
