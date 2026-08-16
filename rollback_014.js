@@ -17,7 +17,7 @@ async function runRollback(options = {}) {
   const now = options.monotonicNow || monotonicNow; const terminalState = createTerminalState(); const outerDeadlineNs = deadlineAfter(now(), options.overallMilliseconds || OVERALL_MILLISECONDS);
   try {
     const client = await checkoutClientOnce({ pool, deadlineNs: minimumDeadline(deadlineAfter(now(), options.connectionMilliseconds || CONNECTION_MILLISECONDS), outerDeadlineNs), terminalState, now });
-    const transaction = await runBoundedPostgresTransaction({ pool: { connect: async () => client }, terminalState, monotonicNow: now, outerDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
+    const transaction = await runBoundedPostgresTransaction({ preAcquiredClient: client, terminalState, monotonicNow: now, outerDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
       await query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_KEY]);
       const applied = await query("SELECT checksum FROM app_schema_migrations WHERE version = $1", [MIGRATION_VERSION]);
       if (!applied.rows.length) return { status: "not_applied", version: MIGRATION_VERSION };
