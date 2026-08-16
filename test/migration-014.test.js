@@ -1,0 +1,12 @@
+"use strict";
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const test = require("node:test");
+const { createDisposableDatabase } = require("./helpers/disposable-db");
+const { runMigration: m009 } = require("../migrate_009"); const { runMigration: m010 } = require("../migrate_010"); const { runMigration: m011 } = require("../migrate_011"); const { runMigration: m012 } = require("../migrate_012"); const { runMigration: m013 } = require("../migrate_013");
+const { MIGRATION_FILE, MIGRATION_VERSION, REQUIRED_MIGRATION_CHECKSUM, runMigration: m014 } = require("../migrate_014"); const { runRollback } = require("../rollback_014");
+async function at013(t) { const db = await createDisposableDatabase({ ownerEditableWorkoutSessions: true }); t.after(() => db.close()); await m009({ pool: db.pool }); await m010({ pool: db.pool }); await m011({ pool: db.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } }); await m012({ pool: db.pool }); await m013({ pool: db.pool }); return db; }
+test("Migration 014 is ordered, checksummed, replayable and guarded", async (t) => { assert.equal(crypto.createHash("sha256").update(fs.readFileSync("migration_013_goals_coach_member_coaching_consent.sql")).digest("hex"), REQUIRED_MIGRATION_CHECKSUM); assert.doesNotMatch(fs.readFileSync("server.js", "utf8"), /migrate_014/); const db = await at013(t); const result = await m014({ pool: db.pool }); assert.equal(result.version, MIGRATION_VERSION); assert.equal((await m014({ pool: db.pool })).status, "already_applied"); assert.equal((await runRollback({ pool: db.pool, skipConfirmation: true })).status, "rolled_back"); });
+test("Migration 014 stores only minimized immutable hash provenance", () => { const sql = fs.readFileSync(MIGRATION_FILE, "utf8"); for (const required of [/plan_item_hash TEXT/, /option_item_hashes JSONB/, /UNIQUE \(member_id, client_request_id\)/, /BEFORE UPDATE OR DELETE/]) assert.match(sql, required); for (const prohibited of ["health_answers", "plan_markdown", "coaching_prose", "provider_payload", "member_text", "exercise_name", "prescription_json"]) assert.doesNotMatch(sql, new RegExp(prohibited, "i")); });
+test("Migration 014 rollback CLI is protected", () => { const source = fs.readFileSync("rollback_014.js", "utf8"); assert.match(source, /if \(require\.main === module\)/); assert.match(source, /confirmation_required/); });

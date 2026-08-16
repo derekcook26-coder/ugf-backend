@@ -43,6 +43,8 @@ var { createGymMasterMemberSafetyIntakeStartup } = require("./src/goals-coach/gy
 var { composeGymMasterMemberSafetyIntakeRoutes } = require("./src/goals-coach/gymmaster-member-safety-intake-route-composition");
 var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach/gymmaster-member-coaching-consent-startup");
 var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
+var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
+var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -150,6 +152,11 @@ var memberCoachingConsentStartup = createGymMasterMemberCoachingConsentStartup({
   fetchImpl: fetch,
 });
 composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
+
+// Provider-free, existing-plan-only member guidance is independently gated.
+// Construction performs no database, Gatekeeper, or provider calls.
+var memberTodayStartup = createGymMasterMemberTodayStartup({ db: db, fetchImpl: fetch });
+composeGymMasterMemberTodayRoute(app, memberTodayStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider

@@ -1,0 +1,3 @@
+DROP TRIGGER trg_preserve_goals_coach_member_today_attempt ON goals_coach_member_today_attempts;
+DROP FUNCTION preserve_goals_coach_member_today_attempt();
+DROP TABLE goals_coach_member_today_attempts;
