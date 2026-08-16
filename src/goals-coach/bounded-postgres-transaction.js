@@ -186,7 +186,8 @@ async function runBoundedPostgresTransaction(options = {}) {
     "database_phase_deadline"
   );
 
-  let client = null;
+  let client = options.preAcquiredClient || null;
+  const hasPreAcquiredClient = Boolean(client);
   let released = false;
   let discarded = false;
   let began = false;
@@ -280,14 +281,20 @@ async function runBoundedPostgresTransaction(options = {}) {
   }
 
   try {
-    client = await checkoutClientOnce({
-      pool,
-      deadlineNs: phaseDeadlineNs,
-      terminalState,
-      now,
-    });
+    if (!client) {
+      client = await checkoutClientOnce({
+        pool,
+        deadlineNs: phaseDeadlineNs,
+        terminalState,
+        now,
+      });
+    }
     if (remainingMilliseconds() === null || terminalState.isTerminal()) {
-      ordinaryRelease();
+      if (hasPreAcquiredClient) {
+        discard(new Error("Pre-acquired PostgreSQL client crossed transaction handoff deadline"));
+      } else {
+        ordinaryRelease();
+      }
       throw new BoundedTransactionError("terminal_before_begin");
     }
     await issue("BEGIN", [], { serverBounded: false });
