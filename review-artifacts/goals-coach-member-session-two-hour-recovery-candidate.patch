@@ -1,0 +1,735 @@
+diff --git a/migrate_015.js b/migrate_015.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f508c330187c84ebfa04a1df36227942cd66d13b
+--- /dev/null
++++ b/migrate_015.js
+@@ -0,0 +1,34 @@
++"use strict";
++const crypto = require("node:crypto");
++const fs = require("node:fs");
++const path = require("node:path");
++const { Pool } = require("pg");
++const { checkoutClientOnce, createTerminalState, deadlineAfter, minimumDeadline, monotonicNow, runBoundedPostgresTransaction } = require("./src/goals-coach/bounded-postgres-transaction");
++const MIGRATION_VERSION = "015_goals_coach_member_sessions";
++const REQUIRED_MIGRATION_VERSION = "014_goals_coach_member_today";
++const REQUIRED_MIGRATION_CHECKSUM = "7f2a066a4daec51434e8d48d546960949db502237be971720bda9fa01c512b08";
++const MIGRATION_FILE = path.join(__dirname, "migration_015_goals_coach_member_sessions.sql");
++const MIGRATION_LOCK_KEY = "82720514";
++const CONNECTION_MILLISECONDS = 5000, OVERALL_MILLISECONDS = 60000;
++class Migration015Error extends Error { constructor(code, cause) { super("Migration 015 is unavailable for this database state"); this.name = "Migration015Error"; this.code = code; if (cause) this.cause = cause; } }
++function checksum(sql) { return crypto.createHash("sha256").update(sql).digest("hex"); }
++function createPool(connectionString, environment = process.env) { if (!connectionString) throw new Migration015Error("database_url_required"); return new Pool({ connectionString, ssl: environment.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false }, max: 1 }); }
++async function runMigration(options = {}) {
++  const sql = fs.readFileSync(MIGRATION_FILE, "utf8"), sqlChecksum = checksum(sql);
++  const pool = options.pool || createPool(options.connectionString || process.env.DATABASE_URL, options.environment), ownsPool = !options.pool;
++  const now = options.monotonicNow || monotonicNow, terminalState = createTerminalState(), outerDeadlineNs = deadlineAfter(now(), options.overallMilliseconds || OVERALL_MILLISECONDS);
++  try { const client = await checkoutClientOnce({ pool, deadlineNs: minimumDeadline(deadlineAfter(now(), options.connectionMilliseconds || CONNECTION_MILLISECONDS), outerDeadlineNs), terminalState, now });
++    const tx = await runBoundedPostgresTransaction({ preAcquiredClient: client, terminalState, monotonicNow: now, outerDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
++      await query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_KEY]);
++      const required = await query("SELECT checksum FROM app_schema_migrations WHERE version=$1", [REQUIRED_MIGRATION_VERSION]);
++      if (!required.rows.length || required.rows[0].checksum !== REQUIRED_MIGRATION_CHECKSUM) throw new Migration015Error("required_migration_mismatch");
++      const existing = await query("SELECT checksum FROM app_schema_migrations WHERE version=$1", [MIGRATION_VERSION]);
++      if (existing.rows.length) { if (existing.rows[0].checksum !== sqlChecksum) throw new Migration015Error("checksum_mismatch"); return { status: "already_applied", version: MIGRATION_VERSION, checksum: sqlChecksum }; }
++      await query(sql); await query("INSERT INTO app_schema_migrations(version,checksum) VALUES($1,$2)", [MIGRATION_VERSION, sqlChecksum]);
++      if (remainingMilliseconds() === null) throw new Migration015Error("deadline_before_commit"); return { status: "applied", version: MIGRATION_VERSION, checksum: sqlChecksum };
++    } }); return tx.value;
++  } catch (error) { for (let cause = error; cause; cause = cause.cause) if (cause instanceof Migration015Error) throw cause; throw new Migration015Error("migration_failed", error); }
++  finally { if (ownsPool) await pool.end(); }
++}
++if (require.main === module) runMigration().then((r) => console.log(`[UGF] Migration ${r.version}: ${r.status}`)).catch(() => { console.error("[UGF] Migration 015 is unavailable for this database state"); process.exitCode = 1; });
++module.exports = { CONNECTION_MILLISECONDS, MIGRATION_FILE, MIGRATION_VERSION, Migration015Error, OVERALL_MILLISECONDS, REQUIRED_MIGRATION_CHECKSUM, REQUIRED_MIGRATION_VERSION, checksum, runMigration };
+diff --git a/migration_015_goals_coach_member_sessions.sql b/migration_015_goals_coach_member_sessions.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5468ab70021c5cc53274b3527c958fe3e64e6a7
+--- /dev/null
++++ b/migration_015_goals_coach_member_sessions.sql
+@@ -0,0 +1,18 @@
++-- Opaque, server-side Goals Coach member sessions. Raw bearer tokens are never stored.
++CREATE TABLE goals_coach_member_sessions (
++  id BIGSERIAL PRIMARY KEY,
++  token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[a-f0-9]{64}$'),
++  auth_mapping_id BIGINT NOT NULL,
++  member_id BIGINT NOT NULL,
++  issued_at TIMESTAMPTZ NOT NULL,
++  expires_at TIMESTAMPTZ NOT NULL,
++  revoked_at TIMESTAMPTZ,
++  last_validated_at TIMESTAMPTZ,
++  FOREIGN KEY (auth_mapping_id, member_id)
++    REFERENCES goals_coach_member_auth_mappings(id, member_id) ON DELETE RESTRICT,
++  CHECK (expires_at = issued_at + INTERVAL '7200 seconds'),
++  CHECK (revoked_at IS NULL OR revoked_at >= issued_at),
++  CHECK (last_validated_at IS NULL OR last_validated_at >= issued_at)
++);
++CREATE INDEX idx_goals_coach_member_sessions_mapping
++  ON goals_coach_member_sessions(auth_mapping_id, member_id, expires_at);
+diff --git a/package.json b/package.json
+index 98f1fd13bc1c328d08d22d83a1a4e71df02b5156..6a1791ace809b5afc04ce44065568ea8d7c01bb0 100644
+--- a/package.json
++++ b/package.json
+@@ -30,6 +30,8 @@
+     "rollback:member-coaching-consent": "node rollback_013.js",
+     "migrate:member-today": "node migrate_014.js",
+     "rollback:member-today": "node rollback_014.js",
++    "migrate:member-two-hour-session": "node migrate_015.js",
++    "rollback:member-two-hour-session": "node rollback_015.js",
+     "provision:staff": "node scripts/provision-staff-user.js",
+     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
+   },
+diff --git a/rollback_015.js b/rollback_015.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3efabc6c0bf1a6121de13dc14d587275f4b4ce5
+--- /dev/null
++++ b/rollback_015.js
+@@ -0,0 +1,29 @@
++"use strict";
++const fs = require("node:fs");
++const path = require("node:path");
++const { Pool } = require("pg");
++const { checkoutClientOnce, createTerminalState, deadlineAfter, minimumDeadline, monotonicNow, runBoundedPostgresTransaction } = require("./src/goals-coach/bounded-postgres-transaction");
++const { CONNECTION_MILLISECONDS, MIGRATION_FILE, MIGRATION_VERSION, OVERALL_MILLISECONDS, Migration015Error, checksum } = require("./migrate_015");
++const ROLLBACK_FILE = path.join(__dirname, "rollback_015_goals_coach_member_sessions.sql"), MIGRATION_LOCK_KEY = "82720514";
++function createPool(connectionString, environment = process.env) { if (!connectionString) throw new Migration015Error("database_url_required"); return new Pool({ connectionString, ssl: environment.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false }, max: 1 }); }
++async function runRollback(options = {}) {
++  if (!options.skipConfirmation && process.env.CONFIRM_GOALS_COACH_MEMBER_SESSION_ROLLBACK !== "YES") throw new Migration015Error("confirmation_required");
++  const pool = options.pool || createPool(options.connectionString || process.env.DATABASE_URL, options.environment), ownsPool = !options.pool;
++  const now = options.monotonicNow || monotonicNow, terminalState = createTerminalState(), outerDeadlineNs = deadlineAfter(now(), options.overallMilliseconds || OVERALL_MILLISECONDS);
++  try { const client = await checkoutClientOnce({ pool, deadlineNs: minimumDeadline(deadlineAfter(now(), options.connectionMilliseconds || CONNECTION_MILLISECONDS), outerDeadlineNs), terminalState, now });
++    const tx = await runBoundedPostgresTransaction({ preAcquiredClient: client, terminalState, monotonicNow: now, outerDeadlineNs, phaseMilliseconds: options.overallMilliseconds || OVERALL_MILLISECONDS, async work({ query, remainingMilliseconds }) {
++      await query("SELECT pg_advisory_xact_lock($1)", [MIGRATION_LOCK_KEY]);
++      const applied = await query("SELECT checksum FROM app_schema_migrations WHERE version=$1", [MIGRATION_VERSION]);
++      if (!applied.rows.length) return { status: "not_applied", version: MIGRATION_VERSION };
++      if (applied.rows[0].checksum !== checksum(fs.readFileSync(MIGRATION_FILE, "utf8"))) throw new Migration015Error("checksum_mismatch");
++      const later = await query("SELECT candidate.version FROM app_schema_migrations current JOIN app_schema_migrations candidate ON candidate.applied_at>current.applied_at WHERE current.version=$1 LIMIT 1", [MIGRATION_VERSION]);
++      if (later.rows.length) throw new Migration015Error("later_migration_applied");
++      const active = await query("SELECT 1 FROM goals_coach_member_sessions WHERE revoked_at IS NULL AND expires_at>NOW() LIMIT 1");
++      if (active.rows.length) throw new Migration015Error("active_sessions_present");
++      await query(fs.readFileSync(ROLLBACK_FILE, "utf8")); await query("DELETE FROM app_schema_migrations WHERE version=$1", [MIGRATION_VERSION]);
++      if (remainingMilliseconds() === null) throw new Migration015Error("deadline_before_commit"); return { status: "rolled_back", version: MIGRATION_VERSION };
++    } }); return tx.value;
++  } catch (error) { for (let cause = error; cause; cause = cause.cause) if (cause instanceof Migration015Error) throw cause; throw new Migration015Error("rollback_failed", error); }
++  finally { if (ownsPool) await pool.end(); }
++}
++module.exports = { runRollback };
+diff --git a/rollback_015_goals_coach_member_sessions.sql b/rollback_015_goals_coach_member_sessions.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..c37af8a27c0f5337bec6c7c9725e3a5017e5a7f5
+--- /dev/null
++++ b/rollback_015_goals_coach_member_sessions.sql
+@@ -0,0 +1 @@
++DROP TABLE goals_coach_member_sessions;
+diff --git a/src/goals-coach/gymmaster-member-coaching-consent-startup.js b/src/goals-coach/gymmaster-member-coaching-consent-startup.js
+index a014a8c318afee794e96d4085e2848cf496b1468..a9978fc9c1c088f287961c93375bf34eaf14508f 100644
+--- a/src/goals-coach/gymmaster-member-coaching-consent-startup.js
++++ b/src/goals-coach/gymmaster-member-coaching-consent-startup.js
+@@ -3,20 +3,21 @@
+ const { createGymMasterGatekeeperMembershipVerifier, createGymMasterMemberAccessAuthorizer, exactGatekeeperMembersEndpoint } = require("./gymmaster-gatekeeper-membership");
+ const { createGymMasterMemberAuthorization } = require("./gymmaster-member-authorization");
+ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
+-const { createGymMasterMemberSessionAuthenticator, createGymMasterMemberSessionService } = require("./gymmaster-member-session");
++const { createGymMasterMemberSessionAuthenticator, createGymMasterMemberSessionService, createGymMasterTwoHourSessionAuthenticator, createGymMasterTwoHourSessionService, TWO_HOUR_SESSION_FLAG, twoHourSessionEnabled } = require("./gymmaster-member-session");
+ const { MEMBER_COACHING_CONSENT_FLAG, MEMBER_COACHING_CONSENT_NOTICE_VERSION, createGymMasterMemberCoachingConsentRouter, memberCoachingConsentEnabled } = require("./gymmaster-member-coaching-consent");
+ 
+ function validEndpoint(value) { try { exactGatekeeperMembersEndpoint(value); return true; } catch (_) { return false; } }
+ function createGymMasterMemberCoachingConsentStartup(options = {}) {
+   const environment = options.environment || process.env; const enabled = memberCoachingConsentEnabled(environment[MEMBER_COACHING_CONSENT_FLAG]);
+   const origin = exactHttpsOrigin(environment.GOALS_COACH_MEMBER_LOGIN_ORIGIN); const endpoint = environment.GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL;
++  const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+   const common = Object.freeze({ status: enabled ? "not_ready" : "disabled", router: null, origin: null, activationPermitted: false, externalCallsPermitted: false });
+-  if (!enabled || !origin || !validEndpoint(endpoint) || typeof environment.GYMMASTER_SITE !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(environment.GYMMASTER_SITE) || typeof environment.GYMMASTER_API_KEY !== "string" || !environment.GYMMASTER_API_KEY || typeof environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET !== "string" || environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET.length < 32 || !options.db || typeof options.db.query !== "function" || typeof options.db.connect !== "function" || typeof options.fetchImpl !== "function") return common;
+-  const sessionService = createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}) });
++  if (!enabled || !origin || (!twoHour && (!validEndpoint(endpoint) || typeof environment.GYMMASTER_SITE !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(environment.GYMMASTER_SITE) || typeof environment.GYMMASTER_API_KEY !== "string" || !environment.GYMMASTER_API_KEY || typeof environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET !== "string" || environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET.length < 32 || typeof options.fetchImpl !== "function")) || !options.db || typeof options.db.query !== "function" || typeof options.db.connect !== "function") return common;
++  const sessionService = twoHour ? createGymMasterTwoHourSessionService({ db: options.db, ...(options.now ? { now: options.now } : {}) }) : createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}) });
+   const mappingAuthorizer = createGymMasterMemberAuthorization({ db: options.db });
+-  const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({ endpoint, site: environment.GYMMASTER_SITE, apiKey: environment.GYMMASTER_API_KEY, fetchImpl: options.fetchImpl, ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }) });
+-  const access = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer, membershipVerifier });
+-  const router = createGymMasterMemberCoachingConsentRouter({ db: options.db, authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService }), authorizeIdentity: access.authorizeIdentity, origin, noticeVersion: MEMBER_COACHING_CONSENT_NOTICE_VERSION, ...(options.rateLimits ? { rateLimits: options.rateLimits } : {}) });
++  const membershipVerifier = twoHour ? null : createGymMasterGatekeeperMembershipVerifier({ endpoint, site: environment.GYMMASTER_SITE, apiKey: environment.GYMMASTER_API_KEY, fetchImpl: options.fetchImpl, ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }) });
++  const access = twoHour ? null : createGymMasterMemberAccessAuthorizer({ mappingAuthorizer, membershipVerifier });
++  const router = createGymMasterMemberCoachingConsentRouter({ db: options.db, authenticateSession: twoHour ? createGymMasterTwoHourSessionAuthenticator({ sessionService }) : createGymMasterMemberSessionAuthenticator({ sessionService }), authorizeIdentity: twoHour ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId }) : access.authorizeIdentity, origin, noticeVersion: MEMBER_COACHING_CONSENT_NOTICE_VERSION, ...(options.rateLimits ? { rateLimits: options.rateLimits } : {}) });
+   return Object.freeze({ ...common, status: "ready_for_separate_route_composition", router, origin });
+ }
+ module.exports = { createGymMasterMemberCoachingConsentStartup };
+diff --git a/src/goals-coach/gymmaster-member-login-route.js b/src/goals-coach/gymmaster-member-login-route.js
+index e080167ce8562812e77b51a2b6903eb0f5bd9747..e026c9af5bc82551a8d245967d98ef08393ef781 100644
+--- a/src/goals-coach/gymmaster-member-login-route.js
++++ b/src/goals-coach/gymmaster-member-login-route.js
+@@ -53,6 +53,8 @@ function createGymMasterMemberLoginHandler(options = {}) {
+   const diagnosticSink = typeof options.diagnosticSink === "function"
+     ? options.diagnosticSink
+     : console.log;
++  const buildSessionCookie = typeof options.buildSessionCookie === "function"
++    ? options.buildSessionCookie : buildGymMasterSessionCookie;
+ 
+   function reportFailureStage(stage) {
+     if (diagnosticEnabled && OWNER_LOGIN_STAGES.has(stage)) {
+@@ -116,8 +118,8 @@ function createGymMasterMemberLoginHandler(options = {}) {
+         reportFailureStage("owner_authorization");
+         return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
+       }
+-      const session = sessionService.issue(identity);
+-      res.setHeader("Set-Cookie", buildGymMasterSessionCookie(session));
++      const session = await sessionService.issue(identity, activeMember);
++      res.setHeader("Set-Cookie", buildSessionCookie(session));
+       return res.status(204).send();
+     } catch (error) {
+       reportFailureStage(
+diff --git a/src/goals-coach/gymmaster-member-login-startup.js b/src/goals-coach/gymmaster-member-login-startup.js
+index 4f9fb0d2b5e81a398384f2b2f067b91809dc8c2c..7344388a1b56c2e12639cd68a88ac8f546f9b001 100644
+--- a/src/goals-coach/gymmaster-member-login-startup.js
++++ b/src/goals-coach/gymmaster-member-login-startup.js
+@@ -10,7 +10,15 @@ const {
+ const { createGymMasterMemberLoginRateLimiter } = require("./gymmaster-member-login-rate-limit");
+ const { createGymMasterMemberLoginService } = require("./gymmaster-member-login");
+ const { createGymMasterMemberPortalClient, validatedLoginEndpoint } = require("./gymmaster-member-portal-client");
+-const { createGymMasterMemberSessionService } = require("./gymmaster-member-session");
++const {
++  TWO_HOUR_SESSION_FLAG,
++  buildGymMasterTwoHourSessionCookie,
++  clearGymMasterTwoHourSessionCookie,
++  createGymMasterMemberSessionService,
++  createGymMasterTwoHourSessionService,
++  extractCookie,
++  twoHourSessionEnabled,
++} = require("./gymmaster-member-session");
+ const { exactGatekeeperMembersEndpoint } = require("./gymmaster-gatekeeper-membership");
+ 
+ const MEMBER_LOGIN_ENABLE_FLAG = "GOALS_COACH_MEMBER_LOGIN_ENABLED";
+@@ -70,6 +78,7 @@ function createGymMasterMemberLoginStartup(options = {}) {
+     configuration,
+     handler: null,
+     sessionService: null,
++    logoutHandler: null,
+     activationPermitted: false,
+     externalCallsPermitted: false,
+   };
+@@ -103,11 +112,10 @@ function createGymMasterMemberLoginStartup(options = {}) {
+       : { timeoutMs: options.gatekeeperTimeoutMs }),
+   });
+   const accessAuthorizer = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer, membershipVerifier });
+-  const sessionService = createGymMasterMemberSessionService({
+-    secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET,
+-    ...(options.now ? { now: options.now } : {}),
+-    ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}),
+-  });
++  const useTwoHourSession = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
++  const sessionService = useTwoHourSession
++    ? createGymMasterTwoHourSessionService({ db: options.db, ...(options.now ? { now: options.now } : {}), ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}) })
++    : createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}), ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}) });
+   const handler = createGymMasterMemberLoginHandler({
+     enabled: true,
+     origin: configuration.origin,
+@@ -120,13 +128,26 @@ function createGymMasterMemberLoginStartup(options = {}) {
+     ...(typeof options.authorizeOwner === "function" ? { authorizeOwner: options.authorizeOwner } : {}),
+     attemptLimiter: options.attemptLimiter || createGymMasterMemberLoginRateLimiter(),
+     ownerLoginStageDiagnostic: environment[OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG],
++    ...(useTwoHourSession ? { buildSessionCookie: buildGymMasterTwoHourSessionCookie } : {}),
+     ...(typeof options.diagnosticSink === "function" ? { diagnosticSink: options.diagnosticSink } : {}),
+   });
++  const logoutHandler = useTwoHourSession ? async function logout(req, res) {
++    res.setHeader("Set-Cookie", clearGymMasterTwoHourSessionCookie());
++    if (!req || typeof req.get !== "function" || req.get("Origin") !== configuration.origin) {
++      return res.status(403).json({ error: "MEMBER_LOGIN_ORIGIN_NOT_ALLOWED" });
++    }
++    try {
++      const token = extractCookie(req.headers && req.headers.cookie);
++      if (token) await sessionService.revoke(token);
++      return res.status(204).send();
++    } catch (_) { return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" }); }
++  } : null;
+   return Object.freeze({
+     ...common,
+     status: "ready_for_separate_route_composition",
+     handler,
+     sessionService,
++    logoutHandler,
+   });
+ }
+ 
+diff --git a/src/goals-coach/gymmaster-member-private-screen-login-route-composition.js b/src/goals-coach/gymmaster-member-private-screen-login-route-composition.js
+index ce9c8e7be7873d866c40898f8d13565f6da5f252..44502f7e2d491c1514b044cb083be814113cd09f 100644
+--- a/src/goals-coach/gymmaster-member-private-screen-login-route-composition.js
++++ b/src/goals-coach/gymmaster-member-private-screen-login-route-composition.js
+@@ -5,6 +5,7 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
+ 
+ const MEMBER_PRIVATE_SCREEN_LOGIN_PATH =
+   "/goalscoach/member/private-screen/login";
++const MEMBER_SESSION_LOGOUT_PATH = "/goalscoach/member/session/logout";
+ 
+ function privacySafeLoginHeaders(_req, res, next) {
+   res.setHeader("Cache-Control", "no-store");
+@@ -42,11 +43,16 @@ function composeGymMasterMemberPrivateScreenLoginRoute(app, startup) {
+     routeCors,
+     startup.handler
+   );
++  if (typeof startup.logoutHandler === "function") {
++    app.options(MEMBER_SESSION_LOGOUT_PATH, privacySafeLoginHeaders, routeCors);
++    app.post(MEMBER_SESSION_LOGOUT_PATH, privacySafeLoginHeaders, routeCors, startup.logoutHandler);
++  }
+   return Object.freeze({ mounted: true, path: MEMBER_PRIVATE_SCREEN_LOGIN_PATH });
+ }
+ 
+ module.exports = {
+   MEMBER_PRIVATE_SCREEN_LOGIN_PATH,
++  MEMBER_SESSION_LOGOUT_PATH,
+   composeGymMasterMemberPrivateScreenLoginRoute,
+   privacySafeLoginHeaders,
+ };
+diff --git a/src/goals-coach/gymmaster-member-private-screen-login-startup.js b/src/goals-coach/gymmaster-member-private-screen-login-startup.js
+index e638c30d58dd1de70cf0f7390138c4662fb81fb7..469a92ed7279a8f8c95617ad3cf9d0c3e727dc16 100644
+--- a/src/goals-coach/gymmaster-member-private-screen-login-startup.js
++++ b/src/goals-coach/gymmaster-member-private-screen-login-startup.js
+@@ -24,6 +24,7 @@ function createGymMasterMemberPrivateScreenLoginStartup(options = {}) {
+   const common = {
+     status: enabled ? "not_ready" : "disabled",
+     handler: null,
++    logoutHandler: null,
+     origin: null,
+     activationPermitted: false,
+     externalCallsPermitted: false,
+@@ -57,6 +58,7 @@ function createGymMasterMemberPrivateScreenLoginStartup(options = {}) {
+     ...common,
+     status: "ready_for_separate_route_composition",
+     handler: memberLoginStartup.handler,
++    logoutHandler: memberLoginStartup.logoutHandler,
+     origin: memberLoginStartup.configuration.origin,
+   });
+ }
+diff --git a/src/goals-coach/gymmaster-member-private-screen-startup.js b/src/goals-coach/gymmaster-member-private-screen-startup.js
+index 79bd612e78c561180187779d291a8f2c93fccbc7..de051b880ac1a462ef41152ac2ab07b6dcd9aaaf 100644
+--- a/src/goals-coach/gymmaster-member-private-screen-startup.js
++++ b/src/goals-coach/gymmaster-member-private-screen-startup.js
+@@ -10,6 +10,10 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
+ const {
+   createGymMasterMemberSessionAuthenticator,
+   createGymMasterMemberSessionService,
++  createGymMasterTwoHourSessionAuthenticator,
++  createGymMasterTwoHourSessionService,
++  TWO_HOUR_SESSION_FLAG,
++  twoHourSessionEnabled,
+ } = require("./gymmaster-member-session");
+ const {
+   createGymMasterMemberPrivateScreenHandler,
+@@ -38,6 +42,7 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
+   const site = environment.GYMMASTER_SITE;
+   const apiKey = environment.GYMMASTER_API_KEY;
+   const secret = environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET;
++  const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+   const common = Object.freeze({
+     status: enabled ? "not_ready" : "disabled",
+     handlers: null,
+@@ -48,24 +53,23 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
+   if (
+     !enabled
+     || !origin
+-    || !validEndpoint(endpoint)
+-    || typeof site !== "string"
+-    || !/^[a-z0-9_-]{1,40}$/i.test(site)
+-    || typeof apiKey !== "string"
+-    || !apiKey
+-    || typeof secret !== "string"
+-    || secret.length < 32
++    || (!twoHour && !validEndpoint(endpoint))
++    || (!twoHour && (typeof site !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(site)))
++    || (!twoHour && (typeof apiKey !== "string" || !apiKey))
++    || (!twoHour && (typeof secret !== "string" || secret.length < 32))
+     || !options.db
+     || typeof options.db.query !== "function"
+-    || typeof options.fetchImpl !== "function"
++    || (!twoHour && typeof options.fetchImpl !== "function")
+   ) return common;
+ 
+-  const sessionService = createGymMasterMemberSessionService({
++  const sessionService = twoHour ? createGymMasterTwoHourSessionService({ db: options.db,
++    ...(options.now ? { now: options.now } : {}),
++  }) : createGymMasterMemberSessionService({
+     secret,
+     ...(options.now ? { now: options.now } : {}),
+   });
+   const mappingAuthorizer = createGymMasterMemberAuthorization({ db: options.db });
+-  const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({
++  const membershipVerifier = twoHour ? null : createGymMasterGatekeeperMembershipVerifier({
+     endpoint,
+     site,
+     apiKey,
+@@ -74,17 +78,21 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
+       ? {}
+       : { timeoutMs: options.gatekeeperTimeoutMs }),
+   });
+-  const accessAuthorizer = createGymMasterMemberAccessAuthorizer({
++  const accessAuthorizer = twoHour ? null : createGymMasterMemberAccessAuthorizer({
+     mappingAuthorizer,
+     membershipVerifier,
+   });
+-  const authenticateSession = createGymMasterMemberSessionAuthenticator({ sessionService });
++  const authenticateSession = twoHour
++    ? createGymMasterTwoHourSessionAuthenticator({ sessionService })
++    : createGymMasterMemberSessionAuthenticator({ sessionService });
+   return Object.freeze({
+     ...common,
+     status: "ready_for_separate_route_composition",
+     handlers: Object.freeze(createGymMasterMemberPrivateScreenHandler({
+       authenticateSession,
+-      authorizeIdentity: accessAuthorizer.authorizeIdentity,
++      authorizeIdentity: twoHour
++        ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId })
++        : accessAuthorizer.authorizeIdentity,
+       ...(options.rateLimiter ? { rateLimiter: options.rateLimiter } : {}),
+     })),
+     origin,
+diff --git a/src/goals-coach/gymmaster-member-safety-intake-startup.js b/src/goals-coach/gymmaster-member-safety-intake-startup.js
+index 5570b574817199cc14520a8c3c7b9306185b448d..7915666ba91258bb6f64af0d6c333b7ac706708c 100644
+--- a/src/goals-coach/gymmaster-member-safety-intake-startup.js
++++ b/src/goals-coach/gymmaster-member-safety-intake-startup.js
+@@ -10,6 +10,8 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
+ const {
+   createGymMasterMemberSessionAuthenticator,
+   createGymMasterMemberSessionService,
++  createGymMasterTwoHourSessionAuthenticator, createGymMasterTwoHourSessionService,
++  TWO_HOUR_SESSION_FLAG, twoHourSessionEnabled,
+ } = require("./gymmaster-member-session");
+ const {
+   MEMBER_SAFETY_INTAKE_FLAG,
+@@ -30,6 +32,7 @@ function createGymMasterMemberSafetyIntakeStartup(options = {}) {
+   const site = environment.GYMMASTER_SITE;
+   const apiKey = environment.GYMMASTER_API_KEY;
+   const secret = environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET;
++  const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+   const common = Object.freeze({
+     status: enabled ? "not_ready" : "disabled",
+     router: null,
+@@ -37,31 +40,33 @@ function createGymMasterMemberSafetyIntakeStartup(options = {}) {
+     activationPermitted: false,
+     externalCallsPermitted: false,
+   });
+-  if (!enabled || !origin || !validEndpoint(endpoint)
+-    || typeof site !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(site)
+-    || typeof apiKey !== "string" || !apiKey
+-    || typeof secret !== "string" || secret.length < 32
++  if (!enabled || !origin || (!twoHour && !validEndpoint(endpoint))
++    || (!twoHour && (typeof site !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(site)))
++    || (!twoHour && (typeof apiKey !== "string" || !apiKey))
++    || (!twoHour && (typeof secret !== "string" || secret.length < 32))
+     || !options.db || typeof options.db.query !== "function"
+     || typeof options.db.connect !== "function"
+-    || typeof options.fetchImpl !== "function") return common;
++    || (!twoHour && typeof options.fetchImpl !== "function")) return common;
+ 
+-  const sessionService = createGymMasterMemberSessionService({
++  const sessionService = twoHour ? createGymMasterTwoHourSessionService({ db: options.db,
++    ...(options.now ? { now: options.now } : {}),
++  }) : createGymMasterMemberSessionService({
+     secret,
+     ...(options.now ? { now: options.now } : {}),
+   });
+   const mappingAuthorizer = createGymMasterMemberAuthorization({ db: options.db });
+-  const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({
++  const membershipVerifier = twoHour ? null : createGymMasterGatekeeperMembershipVerifier({
+     endpoint, site, apiKey, fetchImpl: options.fetchImpl,
+     ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }),
+   });
+-  const accessAuthorizer = createGymMasterMemberAccessAuthorizer({
++  const accessAuthorizer = twoHour ? null : createGymMasterMemberAccessAuthorizer({
+     mappingAuthorizer,
+     membershipVerifier,
+   });
+   const router = createGymMasterMemberSafetyIntakeRouter({
+     db: options.db,
+-    authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService }),
+-    authorizeIdentity: accessAuthorizer.authorizeIdentity,
++    authenticateSession: twoHour ? createGymMasterTwoHourSessionAuthenticator({ sessionService }) : createGymMasterMemberSessionAuthenticator({ sessionService }),
++    authorizeIdentity: twoHour ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId }) : accessAuthorizer.authorizeIdentity,
+     origin,
+     noticeVersion: MEMBER_SAFETY_NOTICE_VERSION,
+     ...(options.rateLimits ? { rateLimits: options.rateLimits } : {}),
+diff --git a/src/goals-coach/gymmaster-member-session.js b/src/goals-coach/gymmaster-member-session.js
+index 201d9221f37eea8766a3aea2534d286294ab2800..f853d753a7b8b87097b8f9fd868642cddf0fa758 100644
+--- a/src/goals-coach/gymmaster-member-session.js
++++ b/src/goals-coach/gymmaster-member-session.js
+@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
+ 
+ const SESSION_COOKIE_NAME = "gc_member_session";
+ const MAXIMUM_SESSION_TTL_SECONDS = 15 * 60;
++const TWO_HOUR_SESSION_TTL_SECONDS = 7200;
++const TWO_HOUR_SESSION_FLAG = "GOALS_COACH_MEMBER_TWO_HOUR_SESSION_ENABLED";
+ 
+ function base64urlJson(value) {
+   return Buffer.from(JSON.stringify(value)).toString("base64url");
+@@ -145,11 +147,108 @@ function createGymMasterMemberSessionAuthenticator(options = {}) {
+   };
+ }
+ 
++function twoHourSessionEnabled(value) {
++  return value === "true";
++}
++
++function tokenHash(token) {
++  return crypto.createHash("sha256").update(token).digest("hex");
++}
++
++function validOpaqueToken(token) {
++  return typeof token === "string" && /^[A-Za-z0-9_-]{43}$/.test(token);
++}
++
++function createGymMasterTwoHourSessionService(options = {}) {
++  const db = options.db;
++  const now = typeof options.now === "function" ? options.now : () => new Date();
++  const randomBytes = typeof options.randomBytes === "function" ? options.randomBytes : crypto.randomBytes;
++  if (!db || typeof db.query !== "function") throw new Error("Two-hour member session requires a database");
++
++  async function issue(identity, activeMember) {
++    if (!identity || identity.authProvider !== "gymmaster" || !/^gymmaster:[1-9]\d*$/.test(identity.authSubject || "")
++      || !activeMember || activeMember.active !== true || !/^[1-9]\d*$/.test(String(activeMember.mappingId))
++      || !/^[1-9]\d*$/.test(String(activeMember.memberId))) throw sessionError();
++    const token = randomBytes(32).toString("base64url");
++    await db.query(
++      `INSERT INTO goals_coach_member_sessions
++         (token_hash, auth_mapping_id, member_id, issued_at, expires_at)
++       VALUES ($1, $2, $3, $4::timestamptz, $4::timestamptz + INTERVAL '7200 seconds')`,
++      [tokenHash(token), activeMember.mappingId, activeMember.memberId, now()]
++    );
++    return token;
++  }
++
++  async function verify(token) {
++    if (!validOpaqueToken(token)) throw sessionError();
++    const result = await db.query(
++      `UPDATE goals_coach_member_sessions session
++          SET last_validated_at = $2
++         FROM goals_coach_member_auth_mappings mapping
++        WHERE session.token_hash = $1
++          AND session.auth_mapping_id = mapping.id
++          AND session.member_id = mapping.member_id
++          AND mapping.active = TRUE
++          AND session.revoked_at IS NULL
++          AND session.expires_at > $2
++      RETURNING session.auth_mapping_id, session.member_id,
++                mapping.auth_provider, mapping.auth_subject`,
++      [tokenHash(token), now()]
++    );
++    const row = result && result.rows && result.rows[0];
++    if (!row || row.auth_provider !== "gymmaster") throw sessionError();
++    return Object.freeze({ authProvider: row.auth_provider, authSubject: row.auth_subject,
++      mappingId: String(row.auth_mapping_id), memberId: String(row.member_id) });
++  }
++
++  async function revoke(token) {
++    if (!validOpaqueToken(token)) return false;
++    const result = await db.query(
++      `UPDATE goals_coach_member_sessions
++          SET revoked_at = COALESCE(revoked_at, $2)
++        WHERE token_hash = $1 AND revoked_at IS NULL
++      RETURNING id`, [tokenHash(token), now()]
++    );
++    return Boolean(result && result.rows && result.rows.length);
++  }
++  return Object.freeze({ issue, verify, revoke });
++}
++
++function createGymMasterTwoHourSessionAuthenticator(options = {}) {
++  const sessionService = options.sessionService;
++  if (!sessionService || typeof sessionService.verify !== "function") throw new Error("Two-hour session authenticator requires a service");
++  return async function authenticate(req, res, next) {
++    try {
++      const token = extractCookie(req.headers && req.headers.cookie);
++      if (!token) return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" });
++      req.alphaMemberIdentity = await sessionService.verify(token);
++      return next();
++    } catch (_) { return res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" }); }
++  };
++}
++
++function buildGymMasterTwoHourSessionCookie(token) {
++  if (!validOpaqueToken(token)) throw new Error("Opaque member session token is required");
++  return `${SESSION_COOKIE_NAME}=${token}; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=${TWO_HOUR_SESSION_TTL_SECONDS}`;
++}
++
++function clearGymMasterTwoHourSessionCookie() {
++  return `${SESSION_COOKIE_NAME}=; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
++}
++
+ module.exports = {
+   MAXIMUM_SESSION_TTL_SECONDS,
++  TWO_HOUR_SESSION_FLAG,
++  TWO_HOUR_SESSION_TTL_SECONDS,
+   SESSION_COOKIE_NAME,
+   buildGymMasterSessionCookie,
+   createGymMasterMemberSessionAuthenticator,
+   createGymMasterMemberSessionService,
+   extractCookie,
++  buildGymMasterTwoHourSessionCookie,
++  clearGymMasterTwoHourSessionCookie,
++  createGymMasterTwoHourSessionAuthenticator,
++  createGymMasterTwoHourSessionService,
++  tokenHash,
++  twoHourSessionEnabled,
+ };
+diff --git a/src/goals-coach/gymmaster-member-today-startup.js b/src/goals-coach/gymmaster-member-today-startup.js
+index 24be1fe8784717b9f098378d45ae3c07a7244673..937e9084f476961cdf25336f4f646a70d9ec9a88 100644
+--- a/src/goals-coach/gymmaster-member-today-startup.js
++++ b/src/goals-coach/gymmaster-member-today-startup.js
+@@ -2,7 +2,7 @@
+ const { createGymMasterGatekeeperMembershipVerifier, createGymMasterMemberAccessAuthorizer, exactGatekeeperMembersEndpoint } = require("./gymmaster-gatekeeper-membership");
+ const { createGymMasterMemberAuthorization } = require("./gymmaster-member-authorization");
+ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
+-const { createGymMasterMemberSessionAuthenticator, createGymMasterMemberSessionService } = require("./gymmaster-member-session");
++const { createGymMasterMemberSessionAuthenticator, createGymMasterMemberSessionService, createGymMasterTwoHourSessionAuthenticator, createGymMasterTwoHourSessionService, TWO_HOUR_SESSION_FLAG, twoHourSessionEnabled } = require("./gymmaster-member-session");
+ const { MEMBER_TODAY_FLAG, createRouter, enabled } = require("./gymmaster-member-today");
+ function validEndpoint(value) { try { exactGatekeeperMembersEndpoint(value); return true; } catch (_) { return false; } }
+ function createGymMasterMemberTodayStartup(options = {}) {
+@@ -10,10 +10,11 @@ function createGymMasterMemberTodayStartup(options = {}) {
+   const on = enabled(environment[MEMBER_TODAY_FLAG]);
+   const origin = exactHttpsOrigin(environment.GOALS_COACH_MEMBER_LOGIN_ORIGIN);
+   const endpoint = environment.GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL;
++  const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+   const common = Object.freeze({ status: on ? "not_ready" : "disabled", router: null, origin: null, activationPermitted: false, providerCallsPermitted: false });
+-  if (!on || !origin || !validEndpoint(endpoint) || !/^[a-z0-9_-]{1,40}$/i.test(environment.GYMMASTER_SITE || "") || !environment.GYMMASTER_API_KEY || typeof environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET !== "string" || environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET.length < 32 || !options.db || typeof options.db.connect !== "function" || typeof options.fetchImpl !== "function") return common;
+-  const session = createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}) });
+-  const access = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer: createGymMasterMemberAuthorization({ db: options.db }), membershipVerifier: createGymMasterGatekeeperMembershipVerifier({ endpoint, site: environment.GYMMASTER_SITE, apiKey: environment.GYMMASTER_API_KEY, fetchImpl: options.fetchImpl, ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }) }) });
+-  return Object.freeze({ ...common, status: "ready_for_separate_route_composition", origin, router: createRouter({ db: options.db, authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService: session }), authorizeIdentity: access.authorizeIdentity, origin, ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}) }) });
++  if (!on || !origin || (!twoHour && (!validEndpoint(endpoint) || !/^[a-z0-9_-]{1,40}$/i.test(environment.GYMMASTER_SITE || "") || !environment.GYMMASTER_API_KEY || typeof environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET !== "string" || environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET.length < 32 || typeof options.fetchImpl !== "function")) || !options.db || typeof options.db.connect !== "function") return common;
++  const session = twoHour ? createGymMasterTwoHourSessionService({ db: options.db, ...(options.now ? { now: options.now } : {}) }) : createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}) });
++  const access = twoHour ? null : createGymMasterMemberAccessAuthorizer({ mappingAuthorizer: createGymMasterMemberAuthorization({ db: options.db }), membershipVerifier: createGymMasterGatekeeperMembershipVerifier({ endpoint, site: environment.GYMMASTER_SITE, apiKey: environment.GYMMASTER_API_KEY, fetchImpl: options.fetchImpl, ...(options.gatekeeperTimeoutMs === undefined ? {} : { timeoutMs: options.gatekeeperTimeoutMs }) }) });
++  return Object.freeze({ ...common, status: "ready_for_separate_route_composition", origin, router: createRouter({ db: options.db, authenticateSession: twoHour ? createGymMasterTwoHourSessionAuthenticator({ sessionService: session }) : createGymMasterMemberSessionAuthenticator({ sessionService: session }), authorizeIdentity: twoHour ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId }) : access.authorizeIdentity, origin, ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}) }) });
+ }
+ module.exports = { createGymMasterMemberTodayStartup };
+diff --git a/test/gymmaster-member-two-hour-logout-route.test.js b/test/gymmaster-member-two-hour-logout-route.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..15805fc9941fb302a726f9a86736a6e05a03da5c
+--- /dev/null
++++ b/test/gymmaster-member-two-hour-logout-route.test.js
+@@ -0,0 +1,17 @@
++"use strict";
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const { createGymMasterMemberLoginStartup } = require("../src/goals-coach/gymmaster-member-login-startup");
++const token = Buffer.alloc(32, 4).toString("base64url");
++function response() { return { statusCode: 200, headers: {}, setHeader(k, v) { this.headers[k] = v; }, status(v) { this.statusCode = v; return this; }, json(v) { this.body = v; return this; }, send() { return this; } }; }
++function startup(query) { return createGymMasterMemberLoginStartup({ db: { query }, fetchImpl: async () => { throw new Error("must not call provider"); }, environment: { GOALS_COACH_MEMBER_LOGIN_ENABLED: "true", GOALS_COACH_MEMBER_TWO_HOUR_SESSION_ENABLED: "true", GOALS_COACH_MEMBER_LOGIN_ORIGIN: "https://coach.example", GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL: "https://ugf.gymmasteronline.com/portal/api/v1/login", GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL: "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members", GOALS_COACH_GYMMASTER_MEMBER_API_KEY: "test", GYMMASTER_API_KEY: "test", GYMMASTER_SITE: "test", GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: "x".repeat(32) } }); }
++test("enabled logout is exact-origin, idempotent, current-token-only, and clears matching cookie", async () => {
++  const hashes = []; const s = startup(async (_sql, values) => { hashes.push(values[0]); return { rows: hashes.length === 1 ? [{ id: 1 }] : [] }; }); assert.equal(typeof s.logoutHandler, "function");
++  for (let i = 0; i < 2; i++) { const res = response(); await s.logoutHandler({ get: () => "https://coach.example", headers: { cookie: `gc_member_session=${token}` } }, res); assert.equal(res.statusCode, 204); assert.equal(res.headers["Set-Cookie"], "gc_member_session=; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=0"); }
++  assert.equal(hashes.length, 2); const wrong = response(); await s.logoutHandler({ get: () => "https://evil.example", headers: {} }, wrong); assert.equal(wrong.statusCode, 403);
++});
++test("missing and malformed cookies are concealed and database unavailability fails closed", async () => {
++  const s = startup(async () => { throw new Error("offline"); }); const missing = response(); await s.logoutHandler({ get: () => "https://coach.example", headers: {} }, missing); assert.equal(missing.statusCode, 204);
++  const malformed = response(); await s.logoutHandler({ get: () => "https://coach.example", headers: { cookie: "gc_member_session=bad" } }, malformed); assert.equal(malformed.statusCode, 204);
++  const failed = response(); await s.logoutHandler({ get: () => "https://coach.example", headers: { cookie: `gc_member_session=${token}` } }, failed); assert.equal(failed.statusCode, 401); assert.deepEqual(failed.body, { error: "MEMBER_AUTHENTICATION_REQUIRED" });
++});
+diff --git a/test/gymmaster-member-two-hour-provider-isolation.test.js b/test/gymmaster-member-two-hour-provider-isolation.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..41d6414782d781b9f2bdfb7d505d60d940d9af35
+--- /dev/null
++++ b/test/gymmaster-member-two-hour-provider-isolation.test.js
+@@ -0,0 +1,21 @@
++"use strict";
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const { createGymMasterMemberPrivateScreenStartup } = require("../src/goals-coach/gymmaster-member-private-screen-startup");
++const { createGymMasterMemberSafetyIntakeStartup } = require("../src/goals-coach/gymmaster-member-safety-intake-startup");
++const { createGymMasterMemberCoachingConsentStartup } = require("../src/goals-coach/gymmaster-member-coaching-consent-startup");
++const { createGymMasterMemberTodayStartup } = require("../src/goals-coach/gymmaster-member-today-startup");
++const base = { GOALS_COACH_MEMBER_TWO_HOUR_SESSION_ENABLED: "true", GOALS_COACH_MEMBER_LOGIN_ORIGIN: "https://coach.example" };
++test("all protected boundaries compose provider-free while two-hour sessions revalidate locally", () => {
++  let providerCalls = 0, databaseCalls = 0;
++  const db = { async query() { databaseCalls++; return { rows: [] }; }, async connect() { return { query: db.query, release() {} }; } };
++  const fetchImpl = async () => { providerCalls++; throw new Error("provider must not be called"); };
++  const cases = [
++    [createGymMasterMemberPrivateScreenStartup, "GOALS_COACH_MEMBER_PRIVATE_SCREEN_ENABLED"],
++    [createGymMasterMemberSafetyIntakeStartup, "GOALS_COACH_MEMBER_SAFETY_INTAKE_ALPHA_ENABLED"],
++    [createGymMasterMemberCoachingConsentStartup, "GOALS_COACH_MEMBER_COACHING_CONSENT_ENABLED"],
++    [createGymMasterMemberTodayStartup, "GOALS_COACH_MEMBER_TODAY_ENABLED"],
++  ];
++  for (const [create, flag] of cases) assert.equal(create({ db, fetchImpl, environment: { ...base, [flag]: "true" } }).status, "ready_for_separate_route_composition");
++  assert.equal(providerCalls, 0); assert.equal(databaseCalls, 0);
++});
+diff --git a/test/gymmaster-member-two-hour-session.test.js b/test/gymmaster-member-two-hour-session.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d17d4182e911f4d812117f98ea15da4f5129434
+--- /dev/null
++++ b/test/gymmaster-member-two-hour-session.test.js
+@@ -0,0 +1,41 @@
++"use strict";
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const {
++  TWO_HOUR_SESSION_TTL_SECONDS, buildGymMasterTwoHourSessionCookie,
++  clearGymMasterTwoHourSessionCookie, createGymMasterTwoHourSessionService,
++  tokenHash, twoHourSessionEnabled,
++} = require("../src/goals-coach/gymmaster-member-session");
++
++test("two-hour capability uses an exact disabled-by-default flag", () => {
++  assert.equal(twoHourSessionEnabled(undefined), false);
++  for (const value of ["TRUE", " true", "true ", "1", true]) assert.equal(twoHourSessionEnabled(value), false);
++  assert.equal(twoHourSessionEnabled("true"), true);
++  assert.equal(TWO_HOUR_SESSION_TTL_SECONDS, 7200);
++});
++
++test("opaque token is hashed, scoped, and accepted just before but not at expiry", async () => {
++  let clock = new Date("2026-01-01T00:00:00.000Z"); let stored;
++  const db = { async query(sql, values) {
++    if (sql.includes("INSERT INTO")) { stored = { hash: values[0], issued: values[3] }; return { rows: [] }; }
++    const expires = new Date(stored.issued.getTime() + 7200000);
++    if (values[0] === stored.hash && values[1] < expires) return { rows: [{ auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] };
++    return { rows: [] };
++  } };
++  const service = createGymMasterTwoHourSessionService({ db, now: () => clock, randomBytes: () => Buffer.alloc(32, 7) });
++  const token = await service.issue({ authProvider: "gymmaster", authSubject: "gymmaster:7" }, { active: true, mappingId: "5", memberId: "9" });
++  assert.match(token, /^[A-Za-z0-9_-]{43}$/); assert.equal(stored.hash, tokenHash(token)); assert.notEqual(stored.hash, token);
++  assert.equal(buildGymMasterTwoHourSessionCookie(token), `gc_member_session=${token}; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=7200`);
++  assert.equal(clearGymMasterTwoHourSessionCookie(), "gc_member_session=; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
++  clock = new Date("2026-01-01T01:59:59.999Z"); assert.equal((await service.verify(token)).memberId, "9");
++  clock = new Date("2026-01-01T02:00:00.000Z"); await assert.rejects(service.verify(token), /invalid or expired/);
++  await assert.rejects(service.verify("malformed"), /invalid or expired/);
++});
++
++test("revocation is token-hash scoped and database errors fail closed", async () => {
++  const calls = []; const db = { async query(sql, values) { calls.push({ sql, values }); if (sql.includes("UPDATE")) return { rows: [{ id: 1 }] }; return { rows: [] }; } };
++  const service = createGymMasterTwoHourSessionService({ db }); const token = Buffer.alloc(32, 3).toString("base64url");
++  assert.equal(await service.revoke(token), true); assert.equal(calls[0].values[0], tokenHash(token));
++  const failed = createGymMasterTwoHourSessionService({ db: { async query() { throw new Error("unavailable"); } } });
++  await assert.rejects(failed.verify(token), /unavailable/);
++});
+diff --git a/test/migration-015-postgres.test.js b/test/migration-015-postgres.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..82b6ea86c0165b824c0c30de174dfdb6d854cda5
+--- /dev/null
++++ b/test/migration-015-postgres.test.js
+@@ -0,0 +1,38 @@
++"use strict";
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const crypto = require("node:crypto");
++const fs = require("node:fs");
++const { createRealDisposablePostgres } = require("./helpers/real-postgres");
++const migrations = ["005", "006", "007", "008", "009", "010", "011", "012", "013", "014"].map((n) => require(`../migrate_${n}`).runMigration);
++const { MIGRATION_VERSION, Migration015Error, REQUIRED_MIGRATION_CHECKSUM, runMigration } = require("../migrate_015");
++const { runRollback } = require("../rollback_015");
++const { createGymMasterTwoHourSessionService } = require("../src/goals-coach/gymmaster-member-session");
++const skip = typeof process.getuid === "function" && process.getuid() === 0 ? "requires unprivileged PostgreSQL 16" : false;
++async function at014(t) {
++  const db = await createRealDisposablePostgres({ phase1b: true }); t.after(() => db.close());
++  for (const migration of migrations) await migration({ pool: db.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } });
++  assert.match((await db.pool.query("SHOW server_version")).rows[0].server_version, /^16\./); return db;
++}
++async function member(pool, suffix = "1") {
++  const m = (await pool.query("INSERT INTO coach_members(gymmaster_member_id,first_name,last_name) VALUES($1,'Test','Member') RETURNING id", [`91${suffix}`])).rows[0];
++  const a = (await pool.query("INSERT INTO goals_coach_member_auth_mappings(member_id,auth_provider,auth_subject,verified_email_snapshot,active,provisioning_method,provisioning_reference) VALUES($1,'gymmaster',$2,$3,TRUE,'administrative',$4) RETURNING id", [m.id, `gymmaster:91${suffix}`, `member${suffix}@example.test`, `test:${suffix}`])).rows[0]; return { memberId: String(m.id), mappingId: String(a.id), active: true };
++}
++test("Migration 015 applies, replays, and enforces exact 7200 seconds", { skip }, async (t) => {
++  assert.equal(crypto.createHash("sha256").update(fs.readFileSync("migration_014_goals_coach_member_today.sql")).digest("hex"), REQUIRED_MIGRATION_CHECKSUM);
++  const db = await at014(t); assert.equal((await runMigration({ pool: db.pool })).status, "applied"); assert.equal((await runMigration({ pool: db.pool })).status, "already_applied");
++  const owner = await member(db.pool); await assert.rejects(db.pool.query("INSERT INTO goals_coach_member_sessions(token_hash,auth_mapping_id,member_id,issued_at,expires_at) VALUES($1,$2,$3,NOW(),NOW()+INTERVAL '7199 seconds')", ["a".repeat(64), owner.mappingId, owner.memberId]), /goals_coach_member_sessions_check/);
++});
++test("Migration 015 refuses prerequisite and checksum mismatches", { skip }, async (t) => {
++  const db = await at014(t); await db.pool.query("DELETE FROM app_schema_migrations WHERE version='014_goals_coach_member_today'"); await assert.rejects(runMigration({ pool: db.pool }), (e) => e instanceof Migration015Error && e.code === "required_migration_mismatch");
++  await db.pool.query("INSERT INTO app_schema_migrations(version,checksum) VALUES('014_goals_coach_member_today',$1),('015_goals_coach_member_sessions','bad')", [REQUIRED_MIGRATION_CHECKSUM]); await assert.rejects(runMigration({ pool: db.pool }), (e) => e.code === "checksum_mismatch");
++});
++test("Migration 015 rollback refuses active sessions and succeeds after revocation", { skip }, async (t) => {
++  const db = await at014(t); await runMigration({ pool: db.pool }); const owner = await member(db.pool); const service = createGymMasterTwoHourSessionService({ db: db.pool }); const token = await service.issue({ authProvider: "gymmaster", authSubject: "gymmaster:911" }, owner);
++  await assert.rejects(runRollback({ pool: db.pool, skipConfirmation: true }), (e) => e.code === "active_sessions_present"); await service.revoke(token); assert.equal((await runRollback({ pool: db.pool, skipConfirmation: true })).status, "rolled_back");
++});
++test("PostgreSQL serializes logout ahead of protected use and rejects replay", { skip }, async (t) => {
++  const db = await at014(t); await runMigration({ pool: db.pool }); const owner = await member(db.pool); const service = createGymMasterTwoHourSessionService({ db: db.pool }); const token = await service.issue({ authProvider: "gymmaster", authSubject: "gymmaster:911" }, owner);
++  const lock = await db.pool.connect(); await lock.query("BEGIN"); await lock.query("SELECT id FROM goals_coach_member_sessions WHERE token_hash=$1 FOR UPDATE", [crypto.createHash("sha256").update(token).digest("hex")]);
++  const revoke = service.revoke(token); const use = service.verify(token); await lock.query("COMMIT"); lock.release(); assert.equal(await revoke, true); await assert.rejects(use); await assert.rejects(service.verify(token));
++});
