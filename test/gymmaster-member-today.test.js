@@ -169,14 +169,14 @@ test("continuation keeps the originally offered item after retirement, insertion
     if(sql.includes("coaching_consents"))return {rows:[{}]};
     if(sql.includes("FROM coach_plans"))return {rows:[plan]};
     if(sql.includes("status='active'"))return {rows:[{id:"77",exercise_name:"Inserted item",prescription_json:{reps:5},sequence_number:1},{id:"88",exercise_name:"Reordered item",prescription_json:{reps:6},sequence_number:2}]};
-    if(sql.includes("state_code='QUESTION_REQUIRED'"))return {rows:[{id:"30",plan_id:"10",plan_version:plan.created_at,option_ids:["option-1"],option_item_ids:{"option-1":"99"}}]};
+    if(sql.includes("state_code='QUESTION_REQUIRED'"))return {rows:[{id:"30",plan_id:"10",plan_version:plan.created_at,option_ids:["option-1"],option_item_ids:{"option-1":"99"},created_at:new Date("2026-01-01T00:30:00.000Z")}]};
     if(sql.includes("FROM coach_plan_exercises WHERE id=$1")){selectedQuery=params;return {rows:[{id:"99",exercise_name:"Original choice",prescription_json:{reps:8},sequence_number:2}]};}
     if(sql.startsWith("UPDATE goals_coach_member_today_attempts"))return {rows:[]};
     if(sql.startsWith("INSERT INTO goals_coach_member_today_attempts"))return {rows:[{state_code:"READY",safety_outcome:"SCREEN_COMPLETE",plan_id:"10",plan_version:plan.created_at,plan_item_id:"99"}]};
     assert.fail(`unexpected query: ${sql}`);
   });
   const result=await execute(db,identity,authorization,input);
-  assert.deepEqual(selectedQuery,["99","10"]); assert.equal(result.body.action.itemId,"99"); assert.equal(result.body.action.name,"Original choice");
+  assert.deepEqual(selectedQuery,["99","10",new Date("2026-01-01T00:30:00.000Z")]); assert.equal(result.body.action.itemId,"99"); assert.equal(result.body.action.name,"Original choice");
 });
 test("continuation keeps the original choice when every active item was retired",async()=>{
   const attemptId="00000000-0000-4000-8000-000000000014",input={clientRequestId:"00000000-0000-4000-8000-000000000015",continuation:{attemptId,optionId:"option-1"}};
