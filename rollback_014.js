@@ -37,4 +37,12 @@ async function runRollback(options = {}) {
     throw new Migration014Error("rollback_failed", error);
   } finally { if (ownsPool) await pool.end(); }
 }
+if (require.main === module) {
+  runRollback()
+    .then(() => console.log("[UGF] Member Today rollback completed."))
+    .catch(() => {
+      console.error("[UGF] Member Today rollback failed.");
+      process.exitCode = 1;
+    });
+}
 module.exports = { runRollback };
