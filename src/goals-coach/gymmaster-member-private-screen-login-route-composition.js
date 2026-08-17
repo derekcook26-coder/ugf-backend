@@ -5,6 +5,7 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
 
 const MEMBER_PRIVATE_SCREEN_LOGIN_PATH =
   "/goalscoach/member/private-screen/login";
+const MEMBER_SESSION_LOGOUT_PATH = "/goalscoach/member/session/logout";
 
 function privacySafeLoginHeaders(_req, res, next) {
   res.setHeader("Cache-Control", "no-store");
@@ -42,11 +43,16 @@ function composeGymMasterMemberPrivateScreenLoginRoute(app, startup) {
     routeCors,
     startup.handler
   );
+  if (typeof startup.logoutHandler === "function") {
+    app.options(MEMBER_SESSION_LOGOUT_PATH, privacySafeLoginHeaders, routeCors);
+    app.post(MEMBER_SESSION_LOGOUT_PATH, privacySafeLoginHeaders, routeCors, startup.logoutHandler);
+  }
   return Object.freeze({ mounted: true, path: MEMBER_PRIVATE_SCREEN_LOGIN_PATH });
 }
 
 module.exports = {
   MEMBER_PRIVATE_SCREEN_LOGIN_PATH,
+  MEMBER_SESSION_LOGOUT_PATH,
   composeGymMasterMemberPrivateScreenLoginRoute,
   privacySafeLoginHeaders,
 };

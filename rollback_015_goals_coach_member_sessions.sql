@@ -1,0 +1,1 @@
+DROP TABLE goals_coach_member_sessions;
