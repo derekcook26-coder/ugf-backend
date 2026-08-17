@@ -53,6 +53,8 @@ function createGymMasterMemberLoginHandler(options = {}) {
   const diagnosticSink = typeof options.diagnosticSink === "function"
     ? options.diagnosticSink
     : console.log;
+  const buildSessionCookie = typeof options.buildSessionCookie === "function" ? options.buildSessionCookie : buildGymMasterSessionCookie;
+  const createSessionOperationContext = typeof options.createSessionOperationContext === "function" ? options.createSessionOperationContext : null;
 
   function reportFailureStage(stage) {
     if (diagnosticEnabled && OWNER_LOGIN_STAGES.has(stage)) {
@@ -91,10 +93,14 @@ function createGymMasterMemberLoginHandler(options = {}) {
     }
 
     let failureStage = "member_portal_request_failure";
+    const sessionOperation = createSessionOperationContext ? createSessionOperationContext(req, res) : null;
     try {
+      if (sessionOperation && sessionOperation.terminalState.isTerminal()) return undefined;
       const identity = await loginService.authenticate(req.body);
+      if (sessionOperation && sessionOperation.terminalState.isTerminal()) return undefined;
       failureStage = "local_mapping";
       let activeMember = await authorizeIdentity(identity);
+      if (sessionOperation && sessionOperation.terminalState.isTerminal()) return undefined;
       const accessFailureStage = memberAccessFailureStage(activeMember);
       if (
         (!activeMember || activeMember.active !== true)
@@ -102,6 +108,7 @@ function createGymMasterMemberLoginHandler(options = {}) {
         && accessFailureStage === "local_mapping"
       ) {
         activeMember = await completePendingEnrollment(identity);
+        if (sessionOperation && sessionOperation.terminalState.isTerminal()) return undefined;
       }
       if (!activeMember || activeMember.active !== true) {
         reportFailureStage(
@@ -112,21 +119,25 @@ function createGymMasterMemberLoginHandler(options = {}) {
         return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
       }
       failureStage = "owner_authorization";
-      if (authorizeOwner !== null && await authorizeOwner(identity) !== true) {
+      const ownerAuthorized = authorizeOwner === null ? true : await authorizeOwner(identity);
+      if (sessionOperation && sessionOperation.terminalState.isTerminal()) return undefined;
+      if (ownerAuthorized !== true) {
         reportFailureStage("owner_authorization");
         return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
       }
-      const session = sessionService.issue(identity);
-      res.setHeader("Set-Cookie", buildGymMasterSessionCookie(session));
+      const session = await sessionService.issue(identity, activeMember, sessionOperation);
+      if (sessionOperation && sessionOperation.terminalState.isTerminal()) { if (!sessionOperation.responseAllowed()) return undefined; throw new Error("Member session issuance crossed its terminal deadline"); }
+      res.setHeader("Set-Cookie", buildSessionCookie(session));
       return res.status(204).send();
     } catch (error) {
+      if (sessionOperation && !sessionOperation.responseAllowed()) return undefined;
       reportFailureStage(
         OWNER_LOGIN_STAGES.has(error && error.memberPortalFailureStage)
           ? error.memberPortalFailureStage
           : failureStage
       );
       return res.status(401).json({ error: "MEMBER_LOGIN_FAILED" });
-    }
+    } finally { if (sessionOperation) sessionOperation.cleanup(); }
   };
 }
 

@@ -30,6 +30,8 @@
     "rollback:member-coaching-consent": "node rollback_013.js",
     "migrate:member-today": "node migrate_014.js",
     "rollback:member-today": "node rollback_014.js",
+    "migrate:member-two-hour-session": "node migrate_015.js",
+    "rollback:member-two-hour-session": "node rollback_015.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },

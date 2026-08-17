@@ -10,7 +10,7 @@ const {
 const { createGymMasterMemberLoginRateLimiter } = require("./gymmaster-member-login-rate-limit");
 const { createGymMasterMemberLoginService } = require("./gymmaster-member-login");
 const { createGymMasterMemberPortalClient, validatedLoginEndpoint } = require("./gymmaster-member-portal-client");
-const { createGymMasterMemberSessionService } = require("./gymmaster-member-session");
+const { TWO_HOUR_SESSION_FLAG, buildGymMasterTwoHourSessionCookie, clearGymMasterTwoHourSessionCookie, createGymMasterMemberSessionService, createGymMasterTwoHourSessionService, createTwoHourSessionRequestContext, extractCookie, twoHourSessionEnabled } = require("./gymmaster-member-session");
 const { exactGatekeeperMembersEndpoint } = require("./gymmaster-gatekeeper-membership");
 
 const MEMBER_LOGIN_ENABLE_FLAG = "GOALS_COACH_MEMBER_LOGIN_ENABLED";
@@ -70,10 +70,14 @@ function createGymMasterMemberLoginStartup(options = {}) {
     configuration,
     handler: null,
     sessionService: null,
+    logoutHandler: null,
     activationPermitted: false,
     externalCallsPermitted: false,
   };
-  if (!configuration.valid || !options.db || typeof options.db.query !== "function" || typeof options.fetchImpl !== "function") {
+  const useTwoHourSession = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+  if (!configuration.valid || !options.db || typeof options.db.query !== "function"
+    || (useTwoHourSession && typeof options.db.connect !== "function")
+    || typeof options.fetchImpl !== "function") {
     return Object.freeze(common);
   }
 
@@ -103,11 +107,9 @@ function createGymMasterMemberLoginStartup(options = {}) {
       : { timeoutMs: options.gatekeeperTimeoutMs }),
   });
   const accessAuthorizer = createGymMasterMemberAccessAuthorizer({ mappingAuthorizer, membershipVerifier });
-  const sessionService = createGymMasterMemberSessionService({
-    secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET,
-    ...(options.now ? { now: options.now } : {}),
-    ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}),
-  });
+  const sessionService = useTwoHourSession
+    ? createGymMasterTwoHourSessionService({ db: options.db, ...(options.now ? { now: options.now } : {}), ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}), ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}), ...(options.sessionDatabaseMilliseconds ? { databaseMilliseconds: options.sessionDatabaseMilliseconds } : {}) })
+    : createGymMasterMemberSessionService({ secret: environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET, ...(options.now ? { now: options.now } : {}), ...(options.randomBytes ? { randomBytes: options.randomBytes } : {}) });
   const handler = createGymMasterMemberLoginHandler({
     enabled: true,
     origin: configuration.origin,
@@ -120,13 +122,30 @@ function createGymMasterMemberLoginStartup(options = {}) {
     ...(typeof options.authorizeOwner === "function" ? { authorizeOwner: options.authorizeOwner } : {}),
     attemptLimiter: options.attemptLimiter || createGymMasterMemberLoginRateLimiter(),
     ownerLoginStageDiagnostic: environment[OWNER_LOGIN_STAGE_DIAGNOSTIC_FLAG],
+    ...(useTwoHourSession ? { buildSessionCookie: buildGymMasterTwoHourSessionCookie } : {}),
+    ...(useTwoHourSession ? { createSessionOperationContext: (req, res) => createTwoHourSessionRequestContext(req, res, { ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}), ...(options.sessionDatabaseMilliseconds ? { overallMilliseconds: options.sessionDatabaseMilliseconds } : {}) }) } : {}),
     ...(typeof options.diagnosticSink === "function" ? { diagnosticSink: options.diagnosticSink } : {}),
   });
+  const logoutHandler = useTwoHourSession ? async function logout(req, res) {
+    if (!req || typeof req.get !== "function" || req.get("Origin") !== configuration.origin) {
+      return res.status(403).json({ error: "MEMBER_LOGIN_ORIGIN_NOT_ALLOWED" });
+    }
+    const route = createTwoHourSessionRequestContext(req, res, { ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}), ...(options.sessionDatabaseMilliseconds ? { overallMilliseconds: options.sessionDatabaseMilliseconds } : {}) });
+    try {
+      const token = extractCookie(req.headers && req.headers.cookie);
+      if (token) await sessionService.revoke(token, route);
+      if (route.terminalState.isTerminal()) { if (!route.responseAllowed()) return undefined; throw new Error("Member session revocation crossed its terminal deadline"); }
+      res.setHeader("Set-Cookie", clearGymMasterTwoHourSessionCookie());
+      return res.status(204).send();
+    } catch (_) { return route.responseAllowed() ? res.status(401).json({ error: "MEMBER_AUTHENTICATION_REQUIRED" }) : undefined; }
+    finally { route.cleanup(); }
+  } : null;
   return Object.freeze({
     ...common,
     status: "ready_for_separate_route_composition",
     handler,
     sessionService,
+    logoutHandler,
   });
 }
 

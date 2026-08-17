@@ -24,6 +24,7 @@ function createGymMasterMemberPrivateScreenLoginStartup(options = {}) {
   const common = {
     status: enabled ? "not_ready" : "disabled",
     handler: null,
+    logoutHandler: null,
     origin: null,
     activationPermitted: false,
     externalCallsPermitted: false,
@@ -57,6 +58,7 @@ function createGymMasterMemberPrivateScreenLoginStartup(options = {}) {
     ...common,
     status: "ready_for_separate_route_composition",
     handler: memberLoginStartup.handler,
+    logoutHandler: memberLoginStartup.logoutHandler,
     origin: memberLoginStartup.configuration.origin,
   });
 }

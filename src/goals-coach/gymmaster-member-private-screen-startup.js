@@ -10,6 +10,10 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
 const {
   createGymMasterMemberSessionAuthenticator,
   createGymMasterMemberSessionService,
+  createGymMasterTwoHourSessionAuthenticator,
+  createGymMasterTwoHourSessionService,
+  TWO_HOUR_SESSION_FLAG,
+  twoHourSessionEnabled,
 } = require("./gymmaster-member-session");
 const {
   createGymMasterMemberPrivateScreenHandler,
@@ -38,6 +42,7 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
   const site = environment.GYMMASTER_SITE;
   const apiKey = environment.GYMMASTER_API_KEY;
   const secret = environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET;
+  const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
   const common = Object.freeze({
     status: enabled ? "not_ready" : "disabled",
     handlers: null,
@@ -48,24 +53,24 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
   if (
     !enabled
     || !origin
-    || !validEndpoint(endpoint)
-    || typeof site !== "string"
-    || !/^[a-z0-9_-]{1,40}$/i.test(site)
-    || typeof apiKey !== "string"
-    || !apiKey
-    || typeof secret !== "string"
-    || secret.length < 32
+    || (!twoHour && !validEndpoint(endpoint))
+    || (!twoHour && (typeof site !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(site)))
+    || (!twoHour && (typeof apiKey !== "string" || !apiKey))
+    || (!twoHour && (typeof secret !== "string" || secret.length < 32))
     || !options.db
     || typeof options.db.query !== "function"
-    || typeof options.fetchImpl !== "function"
+    || (twoHour && typeof options.db.connect !== "function")
+    || (!twoHour && typeof options.fetchImpl !== "function")
   ) return common;
 
-  const sessionService = createGymMasterMemberSessionService({
+  const sessionService = twoHour ? createGymMasterTwoHourSessionService({ db: options.db,
+    ...(options.now ? { now: options.now } : {}),
+  }) : createGymMasterMemberSessionService({
     secret,
     ...(options.now ? { now: options.now } : {}),
   });
   const mappingAuthorizer = createGymMasterMemberAuthorization({ db: options.db });
-  const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({
+  const membershipVerifier = twoHour ? null : createGymMasterGatekeeperMembershipVerifier({
     endpoint,
     site,
     apiKey,
@@ -74,17 +79,21 @@ function createGymMasterMemberPrivateScreenStartup(options = {}) {
       ? {}
       : { timeoutMs: options.gatekeeperTimeoutMs }),
   });
-  const accessAuthorizer = createGymMasterMemberAccessAuthorizer({
+  const accessAuthorizer = twoHour ? null : createGymMasterMemberAccessAuthorizer({
     mappingAuthorizer,
     membershipVerifier,
   });
-  const authenticateSession = createGymMasterMemberSessionAuthenticator({ sessionService });
+  const authenticateSession = twoHour
+    ? createGymMasterTwoHourSessionAuthenticator({ sessionService })
+    : createGymMasterMemberSessionAuthenticator({ sessionService });
   return Object.freeze({
     ...common,
     status: "ready_for_separate_route_composition",
     handlers: Object.freeze(createGymMasterMemberPrivateScreenHandler({
       authenticateSession,
-      authorizeIdentity: accessAuthorizer.authorizeIdentity,
+      authorizeIdentity: twoHour
+        ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId })
+        : accessAuthorizer.authorizeIdentity,
       ...(options.rateLimiter ? { rateLimiter: options.rateLimiter } : {}),
     })),
     origin,
