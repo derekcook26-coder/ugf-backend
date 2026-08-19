@@ -16,6 +16,7 @@ const {
 const {
   MEMBER_SAFETY_INTAKE_FLAG,
   MEMBER_SAFETY_NOTICE_VERSION,
+  parseSafetyHashConfiguration,
   createGymMasterMemberSafetyIntakeRouter,
   memberSafetyIntakeEnabled,
 } = require("./gymmaster-member-safety-intake");
@@ -33,6 +34,7 @@ function createGymMasterMemberSafetyIntakeStartup(options = {}) {
   const apiKey = environment.GYMMASTER_API_KEY;
   const secret = environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET;
   const twoHour = twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG]);
+  const hashConfiguration = parseSafetyHashConfiguration(environment);
   const common = Object.freeze({
     status: enabled ? "not_ready" : "disabled",
     router: null,
@@ -40,7 +42,7 @@ function createGymMasterMemberSafetyIntakeStartup(options = {}) {
     activationPermitted: false,
     externalCallsPermitted: false,
   });
-  if (!enabled || !origin || (!twoHour && !validEndpoint(endpoint))
+  if (!enabled || !origin || !hashConfiguration || (!twoHour && !validEndpoint(endpoint))
     || (!twoHour && (typeof site !== "string" || !/^[a-z0-9_-]{1,40}$/i.test(site)))
     || (!twoHour && (typeof apiKey !== "string" || !apiKey))
     || (!twoHour && (typeof secret !== "string" || secret.length < 32))
@@ -69,6 +71,7 @@ function createGymMasterMemberSafetyIntakeStartup(options = {}) {
     authorizeIdentity: twoHour ? async (identity) => Object.freeze({ active: true, mappingId: identity.mappingId, memberId: identity.memberId }) : accessAuthorizer.authorizeIdentity,
     origin,
     noticeVersion: MEMBER_SAFETY_NOTICE_VERSION,
+    hashConfiguration,
     ...(options.rateLimits ? { rateLimits: options.rateLimits } : {}),
   });
   return Object.freeze({

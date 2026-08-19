@@ -17,18 +17,39 @@ const { runMigration: migrate009 } = require("../migrate_009");
 const { runMigration: migrate010 } = require("../migrate_010");
 const { runMigration: migrate011 } = require("../migrate_011");
 const { runMigration: migrate012 } = require("../migrate_012");
+const { runMigration: migrate013 } = require("../migrate_013");
+const { runMigration: migrate014 } = require("../migrate_014");
+const { runMigration: migrate015 } = require("../migrate_015");
+const { runMigration: migrate016 } = require("../migrate_016");
 const { jsonRequest, startApp } = require("./helpers/http-app");
 
 const origin = "https://ultimategoalsfitness.com";
 const secret = "s".repeat(32);
+const hashKey = "h".repeat(32);
 const forbidden = /email|name|gymmaster.?id|member.?id|mapping.?id|auth.?subject|client.?request|request.?hash|urgentwarningsigns|painorstiffness|recentsurgery|neurological|notified|diagnos|clearance/i;
 const noLimits = { read: (_q, _s, n) => n(), mutation: (_q, _s, n) => n() };
 
 function answers(overrides = {}) {
-  return Object.assign(Object.fromEntries(ANSWER_FIELDS.map((field) => [field, false])), overrides);
+  return Object.assign({
+    urgentWarningSigns: false,
+    painOrStiffness: false,
+    painSeverity: null,
+    injuryOrInstability: false,
+    recentSurgery: false,
+    surgeryCleared: null,
+    medicalOrExerciseRestriction: false,
+    restrictionAllowsSafeExercise: null,
+    neurologicalSymptoms: false,
+    otherUnsafeConcern: false,
+  }, overrides);
 }
 function body(number, overrides = {}, envelope = {}) {
   return { clientRequestId: `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`, noticeVersion: MEMBER_SAFETY_NOTICE_VERSION, answers: answers(overrides), ...envelope };
+}
+function urgentAnswers() {
+  const value = Object.fromEntries(ANSWER_FIELDS.map((field) => [field, null]));
+  value.urgentWarningSigns = true;
+  return value;
 }
 function environment(overrides = {}) {
   return {
@@ -36,7 +57,9 @@ function environment(overrides = {}) {
     GOALS_COACH_GYMMASTER_MEMBER_LOGIN_URL: "https://ugf.gymmasteronline.com/portal/api/v1/login",
     GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL: "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
     GOALS_COACH_GYMMASTER_MEMBER_API_KEY: "unused", GYMMASTER_API_KEY: "test", GYMMASTER_SITE: "ugf",
-    GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: secret, [MEMBER_SAFETY_INTAKE_FLAG]: "true", ...overrides,
+    GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: secret, [MEMBER_SAFETY_INTAKE_FLAG]: "true",
+    GOALS_COACH_MEMBER_SAFETY_HASH_CURRENT_VERSION: "key-1",
+    GOALS_COACH_MEMBER_SAFETY_HASH_KEYS_JSON: JSON.stringify({ "key-1": hashKey }), ...overrides,
   };
 }
 function cookie(subject) {
@@ -50,6 +73,10 @@ async function fixture(t, options = {}) {
   await migrate010({ pool: disposable.pool });
   await migrate011({ pool: disposable.pool, environment: { GOALS_COACH_MEMBER_PENDING_ENROLLMENT_ENABLED: "false" } });
   await migrate012({ pool: disposable.pool });
+  await migrate013({ pool: disposable.pool });
+  await migrate014({ pool: disposable.pool });
+  await migrate015({ pool: disposable.pool });
+  await migrate016({ pool: disposable.pool });
   const members = [];
   for (const [suffix, subject] of [["one", "gymmaster:30001"], ["two", "gymmaster:30002"]]) {
     const seeded = await seedMemberAndPlan(disposable.pool, `safety-v2-${suffix}`);
@@ -100,12 +127,49 @@ test("safety intake remains exact-disabled without startup database or provider 
   assert.equal(calls, 0);
 });
 
+test("enabled safety intake fails closed when keyed provenance configuration is missing or invalid", () => {
+  const db = { async query() { throw new Error("database must not be used during startup validation"); }, async connect() { throw new Error("database must not be used during startup validation"); } };
+  const fetchImpl = async () => { throw new Error("provider must not be used during startup validation"); };
+  for (const overrides of [
+    { GOALS_COACH_MEMBER_SAFETY_HASH_CURRENT_VERSION: undefined, GOALS_COACH_MEMBER_SAFETY_HASH_KEYS_JSON: undefined },
+    { GOALS_COACH_MEMBER_SAFETY_HASH_CURRENT_VERSION: "key-1", GOALS_COACH_MEMBER_SAFETY_HASH_KEYS_JSON: "{}" },
+    { GOALS_COACH_MEMBER_SAFETY_HASH_CURRENT_VERSION: "key-1", GOALS_COACH_MEMBER_SAFETY_HASH_KEYS_JSON: JSON.stringify({ "key-1": "short" }) },
+  ]) {
+    const startup = createGymMasterMemberSafetyIntakeStartup({ environment: environment(overrides), db, fetchImpl });
+    assert.equal(startup.status, "not_ready");
+    assert.equal(startup.router, null);
+    assert.equal(startup.activationPermitted, false);
+    assert.equal(startup.externalCallsPermitted, false);
+  }
+});
+
 test("v2 request is strict, complete, canonical, and rejects contradictions", () => {
   const parsed = parseSafetyIntake(body(1), MEMBER_SAFETY_NOTICE_VERSION);
-  const hash = safetyIntakeRequestHash(parsed); assert.match(hash, /^[a-f0-9]{64}$/);
-  assert.equal(safetyIntakeRequestHash(parseSafetyIntake(body(2), MEMBER_SAFETY_NOTICE_VERSION)), hash);
-  for (const field of ANSWER_FIELDS) assert.notEqual(safetyIntakeRequestHash(parseSafetyIntake(body(3, { [field]: true }), MEMBER_SAFETY_NOTICE_VERSION)), hash);
-  const incomplete = body(4); delete incomplete.answers.mild;
+  const hash = safetyIntakeRequestHash(parsed, hashKey); assert.match(hash, /^[a-f0-9]{64}$/);
+  assert.equal(safetyIntakeRequestHash(parseSafetyIntake(body(2), MEMBER_SAFETY_NOTICE_VERSION), hashKey), hash);
+  const validChanges = {
+    urgentWarningSigns: true,
+    painOrStiffness: true,
+    painSeverity: 3,
+    injuryOrInstability: true,
+    recentSurgery: true,
+    surgeryCleared: false,
+    medicalOrExerciseRestriction: true,
+    restrictionAllowsSafeExercise: false,
+    neurologicalSymptoms: true,
+    otherUnsafeConcern: true,
+  };
+  for (const field of ANSWER_FIELDS) {
+    const changed = body(3, { [field]: validChanges[field] });
+    if (field === "painSeverity") {
+      Object.assign(changed.answers, { painOrStiffness: true, painSeverity: 3 });
+      changed.answers[field] = validChanges[field];
+    }
+    if (field === "surgeryCleared") changed.answers.recentSurgery = true;
+    if (field === "restrictionAllowsSafeExercise") changed.answers.medicalOrExerciseRestriction = true;
+    assert.notEqual(safetyIntakeRequestHash(parseSafetyIntake(changed, MEMBER_SAFETY_NOTICE_VERSION), hashKey), hash);
+  }
+  const incomplete = body(4); delete incomplete.answers.painSeverity;
   assert.throws(() => parseSafetyIntake(incomplete, MEMBER_SAFETY_NOTICE_VERSION), /Invalid safety intake answers/);
   assert.throws(() => parseSafetyIntake(body(5, {}, { extra: true }), MEMBER_SAFETY_NOTICE_VERSION), /Invalid safety intake request/);
 });
@@ -138,17 +202,22 @@ test("route returns all four outcomes, rejects incomplete and contradictory inpu
   const before = await protectedCounts(disposable.pool);
   const cases = [
     [10, {}, "SCREEN_COMPLETE"],
-    [11, { painOrStiffness: true, familiar: true, mild: true }, "MODIFICATION_REQUIRED"],
-    [12, { painOrStiffness: true, sharp: true }, "MEDICAL_REVIEW_REQUIRED"],
-    [13, { urgentWarningSigns: true }, "URGENT_STOP"],
+    [11, { painOrStiffness: true, painSeverity: 3 }, "MODIFICATION_REQUIRED"],
+    [12, { painOrStiffness: true, painSeverity: 8 }, "MEDICAL_REVIEW_REQUIRED"],
+    [13, urgentAnswers(), "URGENT_STOP"],
+    [16, { recentSurgery: true, surgeryCleared: true }, "MODIFICATION_REQUIRED"],
+    [17, { medicalOrExerciseRestriction: true, restrictionAllowsSafeExercise: true }, "MODIFICATION_REQUIRED"],
   ];
   for (const [number, overrides, outcome] of cases) {
-    const result = await request(running, subject, { method: "POST", body: body(number, overrides) });
+    const requestBody = number === 13
+      ? { clientRequestId: `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`, noticeVersion: MEMBER_SAFETY_NOTICE_VERSION, answers: overrides }
+      : body(number, overrides);
+    const result = await request(running, subject, { method: "POST", body: requestBody });
     assert.equal(result.response.status, 201); assertPublic(result.body.safetyIntake, outcome); assert.equal(result.body.idempotentReplay, false);
   }
-  const incomplete = body(14); delete incomplete.answers.sharp;
+  const incomplete = body(14); delete incomplete.answers.painSeverity;
   assert.equal((await request(running, subject, { method: "POST", body: incomplete })).response.status, 400);
-  assert.equal((await request(running, subject, { method: "POST", body: body(15, { painOrStiffness: false, familiar: true }) })).response.status, 400);
+  assert.equal((await request(running, subject, { method: "POST", body: body(15, { painOrStiffness: false, painSeverity: 3 }) })).response.status, 400);
   assert.deepEqual(await protectedCounts(disposable.pool), before);
 });
 
@@ -160,10 +229,10 @@ test("latest unexpired v2 governs, v1 stop is retained, rows are append-only, an
      medical_or_exercise_restriction, other_training_safety_concern, outcome, safety_stop, rule_version)
     VALUES ($1,$2,'00000000-0000-4000-8000-000000000100',$3,'GC-MEMBER-SAFETY-NOTICE-1',TRUE,FALSE,FALSE,FALSE,FALSE,'handoff_required',TRUE,'GC-MEMBER-SAFETY-INTAKE-1')`, [mapping.id, mapping.member_id, "a".repeat(64)]);
   assertPublic((await request(running, subject)).body.safetyIntake, "not_submitted");
-  const original = body(101, { painOrStiffness: true, familiar: true, mild: true });
+  const original = body(101, { painOrStiffness: true, painSeverity: 3 });
   const first = await request(running, subject, { method: "POST", body: original }); assertPublic(first.body.safetyIntake, "MODIFICATION_REQUIRED");
   const replay = await request(running, subject, { method: "POST", body: original }); assert.equal(replay.response.status, 200); assert.equal(replay.body.idempotentReplay, true);
-  assert.equal((await request(running, subject, { method: "POST", body: body(999, { sharp: true }, { clientRequestId: original.clientRequestId }) })).response.status, 409);
+  assert.equal((await request(running, subject, { method: "POST", body: body(999, { painOrStiffness: true, painSeverity: 4 }, { clientRequestId: original.clientRequestId }) })).response.status, 409);
   const safe = await request(running, subject, { method: "POST", body: body(102) }); assertPublic(safe.body.safetyIntake, "SCREEN_COMPLETE");
   const rows = (await disposable.pool.query("SELECT id FROM goals_coach_member_safety_intake_v2_assessments WHERE member_id=$1 ORDER BY id", [mapping.member_id])).rows;
   assert.equal(rows.length, 2);

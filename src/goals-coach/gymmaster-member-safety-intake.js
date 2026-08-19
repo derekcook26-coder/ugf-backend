@@ -10,20 +10,28 @@ const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-me
 
 const MEMBER_SAFETY_INTAKE_FLAG =
   "GOALS_COACH_MEMBER_SAFETY_INTAKE_ALPHA_ENABLED";
-const MEMBER_SAFETY_NOTICE_VERSION = "GC-MEMBER-SAFETY-NOTICE-2";
+const MEMBER_SAFETY_NOTICE_VERSION = "GC-MEMBER-SAFETY-NOTICE-3";
 const MEMBER_SAFETY_NOTICE = "Goals Coach uses the information you choose to provide, including fitness goals, workout feedback, and safety-related responses, to personalize your coaching experience. It does not replace medical advice. Your information is kept private and used only to provide and safely operate Goals Coach. You may stop using Goals Coach at any time.";
-const MEMBER_SAFETY_INTAKE_RULE_VERSION = "GC-MEMBER-SAFETY-INTAKE-2";
+const MEMBER_SAFETY_INTAKE_RULE_VERSION = "GC-MEMBER-SAFETY-INTAKE-3";
+const MEMBER_SAFETY_HASH_KEYS_CONFIGURATION = "GOALS_COACH_MEMBER_SAFETY_HASH_KEYS_JSON";
+const MEMBER_SAFETY_HASH_CURRENT_VERSION_CONFIGURATION = "GOALS_COACH_MEMBER_SAFETY_HASH_CURRENT_VERSION";
+const HASH_KEY_VERSION = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const ASSESSMENT_VALID_MILLISECONDS = (12 * 60 * 60 - 60) * 1000;
 const MAXIMUM_SAFETY_INTAKE_JSON_BYTES = 4096;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DATABASE_ID = /^[1-9]\d{0,18}$/;
 const ANSWER_FIELDS = Object.freeze([
-  "urgentWarningSigns", "painOrStiffness", "familiar", "mild", "severe",
-  "sharp", "newOrWorsening", "movementLimited", "injuryOrInstability",
+  "urgentWarningSigns", "painOrStiffness", "painSeverity", "injuryOrInstability",
   "recentSurgery", "surgeryCleared", "medicalOrExerciseRestriction",
-  "restrictionCanBeHonored", "neurologicalSymptoms", "otherUnsafeConcern",
+  "restrictionAllowsSafeExercise", "neurologicalSymptoms", "otherUnsafeConcern",
 ]);
+
+const CONDITIONAL_FIELDS = Object.freeze({
+  painOrStiffness: ["painSeverity"],
+  recentSurgery: ["surgeryCleared"],
+  medicalOrExerciseRestriction: ["restrictionAllowsSafeExercise"],
+});
 
 function memberSafetyIntakeEnabled(value) {
   return value === "true";
@@ -108,7 +116,11 @@ function parseSafetyIntake(body, expectedNoticeVersion) {
   rejectUnknownKeys(body.answers, ANSWER_FIELDS, "safety intake answers");
   const answers = {};
   for (const field of ANSWER_FIELDS) {
-    if (typeof body.answers[field] !== "boolean") {
+    const value = body.answers[field];
+    const valid = field === "painSeverity"
+      ? value === null || (Number.isInteger(value) && value >= 1 && value <= 10)
+      : value === null || typeof value === "boolean";
+    if (!valid) {
       throw intakeError(
         400,
         "SAFETY_INTAKE_INVALID",
@@ -139,30 +151,60 @@ function canonicalSafetyIntakeRequest(input) {
   };
 }
 
-function safetyIntakeRequestHash(input) {
+function safetyIntakeRequestHash(input, key) {
+  if (typeof key !== "string" || Buffer.byteLength(key, "utf8") < 32) throw new Error("Safety intake hash key is unavailable");
   return crypto
-    .createHash("sha256")
+    .createHmac("sha256", key)
     .update(JSON.stringify(canonicalSafetyIntakeRequest(input)), "utf8")
     .digest("hex");
 }
 
+function parseSafetyHashConfiguration(environment = {}) {
+  const currentVersion = environment[MEMBER_SAFETY_HASH_CURRENT_VERSION_CONFIGURATION];
+  let keys;
+  try { keys = JSON.parse(environment[MEMBER_SAFETY_HASH_KEYS_CONFIGURATION]); } catch (_) { return null; }
+  if (!HASH_KEY_VERSION.test(String(currentVersion)) || !keys || Array.isArray(keys) || typeof keys !== "object") return null;
+  const entries = Object.entries(keys);
+  if (entries.length < 1 || entries.length > 4 || !entries.every(([version, key]) => HASH_KEY_VERSION.test(version) && typeof key === "string" && Buffer.byteLength(key, "utf8") >= 32)) return null;
+  if (!Object.prototype.hasOwnProperty.call(keys, currentVersion)) return null;
+  return Object.freeze({ currentVersion, keys: Object.freeze({ ...keys }) });
+}
+
 function classifySafetyIntake(answers) {
-  if (answers.urgentWarningSigns === true) return "URGENT_STOP";
-  const painDetails = ["familiar", "mild", "severe", "sharp", "newOrWorsening"];
-  if ((!answers.painOrStiffness && painDetails.some((field) => answers[field]))
-      || (answers.mild && answers.severe)
-      || (answers.recentSurgery === false && answers.surgeryCleared)
-      || (!answers.medicalOrExerciseRestriction && answers.restrictionCanBeHonored)) {
+  function requireBoolean(field) {
+    if (typeof answers[field] !== "boolean") {
+      throw intakeError(400, "SAFETY_INTAKE_INVALID", "Invalid safety intake answers.");
+    }
+  }
+  requireBoolean("urgentWarningSigns");
+  if (answers.urgentWarningSigns === true) {
+    if (ANSWER_FIELDS.slice(1).some((field) => answers[field] !== null)) {
+      throw intakeError(400, "SAFETY_INTAKE_INVALID", "Invalid safety intake answers.");
+    }
+    return "URGENT_STOP";
+  }
+  ["painOrStiffness", "injuryOrInstability", "recentSurgery",
+    "medicalOrExerciseRestriction", "neurologicalSymptoms",
+    "otherUnsafeConcern"].forEach(requireBoolean);
+  for (const [parent, children] of Object.entries(CONDITIONAL_FIELDS)) {
+    const expectedNull = answers[parent] === false;
+    if (expectedNull !== children.every((field) => answers[field] === null)) {
+      throw intakeError(400, "SAFETY_INTAKE_INVALID", "Invalid safety intake answers.");
+    }
+  }
+  if (answers.painOrStiffness === true && answers.painSeverity === null) {
     throw intakeError(400, "SAFETY_INTAKE_INVALID", "Invalid safety intake answers.");
   }
-  if (answers.neurologicalSymptoms || answers.movementLimited
-      || answers.injuryOrInstability || (answers.recentSurgery && !answers.surgeryCleared)
-      || (answers.medicalOrExerciseRestriction && !answers.restrictionCanBeHonored)
-      || answers.otherUnsafeConcern || answers.severe || answers.sharp
-      || answers.newOrWorsening || (answers.painOrStiffness && (!answers.familiar || !answers.mild))) {
+  if (answers.neurologicalSymptoms || answers.injuryOrInstability
+      || (answers.recentSurgery && !answers.surgeryCleared)
+      || (answers.medicalOrExerciseRestriction && !answers.restrictionAllowsSafeExercise)
+      || answers.otherUnsafeConcern
+      || (answers.painOrStiffness && answers.painSeverity >= 7)) {
     return "MEDICAL_REVIEW_REQUIRED";
   }
-  if (answers.painOrStiffness) return "MODIFICATION_REQUIRED";
+  if (answers.painOrStiffness || answers.recentSurgery || answers.medicalOrExerciseRestriction) {
+    return "MODIFICATION_REQUIRED";
+  }
   return "SCREEN_COMPLETE";
 }
 
@@ -224,11 +266,12 @@ async function readEffectiveSafetyIntake(db, memberId, noticeVersion) {
   return publicAssessment(effective);
 }
 
-async function submitSafetyIntake(db, authorization, input) {
+async function submitSafetyIntake(db, authorization, input, hashConfiguration) {
   if (!validAuthorization(authorization)) throw memberAuthenticationError();
+  if (!hashConfiguration || !hashConfiguration.keys || !hashConfiguration.keys[hashConfiguration.currentVersion]) throw intakeError(503, "SAFETY_INTAKE_TEMPORARILY_UNAVAILABLE", "Safety intake is temporarily unavailable.");
   const memberId = String(authorization.memberId);
   const mappingId = String(authorization.mappingId);
-  const hash = safetyIntakeRequestHash(input);
+  const hash = safetyIntakeRequestHash(input, hashConfiguration.keys[hashConfiguration.currentVersion]);
   return withTransaction(db, async (client) => {
     const member = await client.query(
       `SELECT id
@@ -249,14 +292,15 @@ async function submitSafetyIntake(db, authorization, input) {
     if (!currentMapping.rows.length) throw memberAuthenticationError();
 
     const existing = await client.query(
-      `SELECT client_request_hash
+      `SELECT client_request_hash, client_request_hash_key_version
        FROM goals_coach_member_safety_intake_v2_assessments
        WHERE member_id = $1 AND client_request_id = $2`,
       [memberId, input.clientRequestId]
     );
     let created = false;
     if (existing.rows.length) {
-      if (existing.rows[0].client_request_hash !== hash) {
+      const existingKey = hashConfiguration.keys[existing.rows[0].client_request_hash_key_version];
+      if (!existingKey || existing.rows[0].client_request_hash !== safetyIntakeRequestHash(input, existingKey)) {
         throw intakeError(
           409,
           "SAFETY_INTAKE_IDEMPOTENCY_CONFLICT",
@@ -268,16 +312,17 @@ async function submitSafetyIntake(db, authorization, input) {
       const validUntil = new Date(Date.now() + ASSESSMENT_VALID_MILLISECONDS);
       await client.query(
         `INSERT INTO goals_coach_member_safety_intake_v2_assessments
-          (auth_mapping_id, member_id, client_request_id, client_request_hash,
+          (auth_mapping_id, member_id, client_request_id, client_request_hash, client_request_hash_key_version,
            notice_version, outcome, rule_version, valid_until)
          VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8
+           $1, $2, $3, $4, $5, $6, $7, $8, $9
          )`,
         [
           mappingId,
           memberId,
           input.clientRequestId,
           hash,
+          hashConfiguration.currentVersion,
           input.noticeVersion,
           outcome,
           MEMBER_SAFETY_INTAKE_RULE_VERSION,
@@ -313,6 +358,7 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
   const authenticateSession = options.authenticateSession;
   const expectedOrigin = options.origin;
   const noticeVersion = approvedNoticeVersion(options.noticeVersion);
+  const hashConfiguration = options.hashConfiguration;
   if (!db || typeof db.query !== "function" || typeof db.connect !== "function") {
     throw new Error("Member safety intake requires a transactional database");
   }
@@ -325,6 +371,7 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
   if (!noticeVersion) {
     throw new Error("Member safety intake requires an approved notice version");
   }
+  if (!hashConfiguration || !hashConfiguration.keys || !hashConfiguration.keys[hashConfiguration.currentVersion]) throw new Error("Member safety intake requires keyed hash configuration");
   const authorizeIdentity = options.authorizeIdentity;
   if (typeof authorizeIdentity !== "function") {
     throw new Error("Member safety intake requires current member access authorization");
@@ -403,7 +450,8 @@ function createGymMasterMemberSafetyIntakeRouter(options = {}) {
         const result = await submitSafetyIntake(
           db,
           req.memberSafetyIntakeAuthorization,
-          input
+          input,
+          hashConfiguration
         );
         return res.status(result.created ? 201 : 200).json({
           safetyIntake: result.safetyIntake,
@@ -425,11 +473,14 @@ module.exports = {
   MEMBER_SAFETY_NOTICE,
   MEMBER_SAFETY_NOTICE_VERSION,
   MEMBER_SAFETY_INTAKE_RULE_VERSION,
+  MEMBER_SAFETY_HASH_KEYS_CONFIGURATION,
+  MEMBER_SAFETY_HASH_CURRENT_VERSION_CONFIGURATION,
   approvedNoticeVersion,
   canonicalSafetyIntakeRequest,
   createGymMasterMemberSafetyIntakeRouter,
   memberSafetyIntakeEnabled,
   parseSafetyIntake,
+  parseSafetyHashConfiguration,
   readEffectiveSafetyIntake,
   safetyIntakeRequestHash,
   classifySafetyIntake,
