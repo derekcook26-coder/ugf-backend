@@ -31,6 +31,27 @@ test("fixed safety wording and provider isolation", () => {
   const source = fs.readFileSync("src/goals-coach/gymmaster-member-today.js", "utf8") + fs.readFileSync("src/goals-coach/gymmaster-member-today-startup.js", "utf8");
   assert.doesNotMatch(source, /require\(["'](?:openai|\.\/transcription-adapter|\.\/coaching-engine)["']\)/i);
 });
+
+test("modification-required safety state remains attached to a ready Today action", async () => {
+  const input = { clientRequestId: "00000000-0000-4000-8000-000000000018" };
+  const planVersion = new Date("2026-01-01T00:00:00.000Z");
+  const item = { id: "20", exercise_name: "Supported squat", prescription_json: { reps: 6 } };
+  const db = database(async (sql) => {
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+    if (sql.includes("auth_mappings")) return { rows: [{ id: "2" }] };
+    if (sql.includes("safety_intake_v2")) return { rows: [{ outcome: "MODIFICATION_REQUIRED" }] };
+    if (sql.includes("member_today_attempts WHERE")) return { rows: [] };
+    if (sql.includes("coaching_consents")) return { rows: [{}] };
+    if (sql.includes("FROM coach_plans")) return { rows: [{ id: "10", created_at: planVersion }] };
+    if (sql.includes("FROM coach_plan_exercises")) return { rows: [item] };
+    if (sql.includes("INSERT INTO goals_coach_member_today_attempts")) return { rows: [{ state_code: "READY", client_request_id: input.clientRequestId, safety_outcome: "MODIFICATION_REQUIRED", plan_id: "10", plan_version: planVersion, plan_item_id: "20" }] };
+    assert.fail(`unexpected query: ${sql}`);
+  });
+  const result = await execute(db, identity, authorization, input);
+  assert.equal(result.body.state, "READY");
+  assert.equal(result.body.safetyConstraint, GUIDANCE.MODIFICATION_REQUIRED);
+  assert.equal(result.body.action.name, "Supported squat");
+});
 test("application parser and concealed errors accept canonical case and slash variants", () => {
   const parser = createApplicationJsonParser();
   for (const path of ["/goalscoach/member/today", "/goalscoach/member/today/", "/GOALSCOACH/MEMBER/TODAY"]) { let continued = false; parser({ method: "POST", originalUrl: path, headers: {} }, {}, () => { continued = true; }); assert.equal(continued, true); let result; const res = { setHeader() {}, status(status) { result = { status }; return this; }, json(body) { result.body = body; return this; } }; goalsCoachErrorHandler(Object.assign(new Error("secret"), { type: "entity.parse.failed" }), { path }, res, () => assert.fail()); assert.deepEqual(result, { status: 400, body: { error: "MEMBER_TODAY_INVALID" } }); }

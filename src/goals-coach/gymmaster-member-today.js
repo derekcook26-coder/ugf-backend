@@ -5,7 +5,7 @@ const rateLimit = require("express-rate-limit");
 const { validGymMasterIdentity } = require("./gymmaster-member-authorization");
 const { memberAccessDependencyUnavailable } = require("./gymmaster-gatekeeper-membership");
 const { createTerminalState, deadlineAfter, monotonicNow, runBoundedPostgresTransaction } = require("./bounded-postgres-transaction");
-const MEMBER_TODAY_FLAG = "GOALS_COACH_MEMBER_TODAY_ENABLED", CONSENT_VERSION = "GC-MEMBER-COACHING-CONSENT-1", SAFETY_VERSION = "GC-MEMBER-SAFETY-NOTICE-2", MAX_BYTES = 512;
+const MEMBER_TODAY_FLAG = "GOALS_COACH_MEMBER_TODAY_ENABLED", CONSENT_VERSION = "GC-MEMBER-COACHING-CONSENT-1", SAFETY_VERSION = "GC-MEMBER-SAFETY-NOTICE-3", MAX_BYTES = 512;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ID = /^[1-9]\d{0,18}$/;
 const GUIDANCE = Object.freeze({ URGENT_STOP: "Stop now and seek immediate emergency help.", MEDICAL_REVIEW_REQUIRED: "Stop this session and contact an appropriate qualified healthcare professional.", MODIFICATION_REQUIRED: "Use comfortable, pain-free movement; reduce intensity or range, and stop if symptoms increase." });
 function enabled(value) { return value === "true"; }
