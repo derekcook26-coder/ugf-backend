@@ -90,6 +90,7 @@ Implementation approval does not authorize any item above.
 - A reviewer must inspect the diff, relevant source, tests, documentation, and execution evidence independently.
 - A reviewer must not rely only on the implementing agent’s summary or claims.
 - Do not represent work as reviewed, approved, accepted, production-ready, deployed, or safe to activate unless the authorized reviewer or Derek Cook actually made that determination.
+- When an independent review is complete and ready to hand back to the implementation thread, put `GOALS_COACH_REVIEW_COMPLETE` on its own line in the final reviewer message. Use that marker only for a completed review, never for interim progress, questions, or an unfinished review.
 
 ## Windows
 
