@@ -90,6 +90,7 @@ Implementation approval does not authorize any item above.
 - A reviewer must inspect the diff, relevant source, tests, documentation, and execution evidence independently.
 - A reviewer must not rely only on the implementing agent’s summary or claims.
 - Do not represent work as reviewed, approved, accepted, production-ready, deployed, or safe to activate unless the authorized reviewer or Derek Cook actually made that determination.
+- When an independent review is complete and ready to hand back, use Codex Desktop's task tools to find the existing task titled exactly `PROGRAMMER` for this repository and send it exactly one follow-up message before publishing the reviewer's final answer. Do not create a new task. The follow-up must contain only the review result needed for evaluation, capped at 12,000 characters, identify itself as an independent-review handoff, and state that it grants no new authority and remains subject to every owner gate in this file. Do not include secrets, member data, provider payloads, or unrelated conversation history. Send once even if PROGRAMMER is active so Codex can queue the follow-up, but do not poll Gmail, poll another model, schedule an automation, or retry automatically. If the task is missing, ambiguous, or task messaging is unavailable, fail closed and report that limitation instead of attempting another transport. A PROGRAMMER turn must never send this handoff to itself.
 
 ## Windows
 
