@@ -45,8 +45,10 @@ var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach
 var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
 var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
 var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
-var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
-var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
+  var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
+  var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
+  var { createGymMasterMemberConversationTurnStartup } = require("./src/goals-coach/gymmaster-member-conversation-turn-startup");
+  var { composeGymMasterMemberConversationTurnRoute } = require("./src/goals-coach/gymmaster-member-conversation-turn-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -160,7 +162,22 @@ composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
 var memberTodayStartup = createGymMasterMemberTodayStartup({ db: db, fetchImpl: fetch });
 composeGymMasterMemberTodayRoute(app, memberTodayStartup);
 
-// The member bootstrap is a read-only, privacy-minimized capability contract.
+  // Production has no provider or durable idempotency dependency yet. Even if
+  // the independent flag is set, startup remains unavailable and no route is
+  // mounted. Private-alpha engines are never accepted as these dependencies.
+  var memberConversationTurnStartup = createGymMasterMemberConversationTurnStartup({
+    db: db,
+    conversationOwnership: null,
+    currentMembership: null,
+    currentConsent: null,
+    currentSafetyEligibility: null,
+    idempotency: null,
+    provider: null,
+    safetyClassifier: null,
+  });
+  composeGymMasterMemberConversationTurnRoute(app, memberConversationTurnStartup);
+
+  // The member bootstrap is a read-only, privacy-minimized capability contract.
 // It is independently disabled by default, performs no startup work, and never
 // activates or calls a coaching, voice, plan, or membership provider.
 var memberBootstrapStartup = createGymMasterMemberBootstrapStartup({
@@ -168,9 +185,7 @@ var memberBootstrapStartup = createGymMasterMemberBootstrapStartup({
   consentStartup: memberCoachingConsentStartup,
   safetyStartup: memberSafetyIntakeStartup,
   workoutStartup: memberTodayStartup,
-  // No authenticated production-member conversation route exists yet. The
-  // private-alpha engine must never be advertised as a member capability.
-  conversationStartup: null,
+    conversationStartup: memberConversationTurnStartup,
 });
 composeGymMasterMemberBootstrapRoute(app, memberBootstrapStartup);
 

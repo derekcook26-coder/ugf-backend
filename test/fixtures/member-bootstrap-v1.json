@@ -17,7 +17,7 @@
           "safetyNotice": "GC-MEMBER-SAFETY-NOTICE-3",
           "safetyRule": "GC-MEMBER-SAFETY-INTAKE-3",
           "workoutContract": "GC-MEMBER-TODAY-1",
-          "conversationContract": "GC-PHASE1B-CONTRACT-1"
+          "conversationContract": "GC-MEMBER-CONVERSATION-TURN-1"
         }
       }
     },
@@ -37,7 +37,7 @@
           "safetyNotice": "GC-MEMBER-SAFETY-NOTICE-3",
           "safetyRule": "GC-MEMBER-SAFETY-INTAKE-3",
           "workoutContract": "GC-MEMBER-TODAY-1",
-          "conversationContract": "GC-PHASE1B-CONTRACT-1"
+          "conversationContract": "GC-MEMBER-CONVERSATION-TURN-1"
         }
       }
     }

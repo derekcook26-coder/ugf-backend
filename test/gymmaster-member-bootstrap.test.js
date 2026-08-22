@@ -169,7 +169,13 @@ test("bootstrap exposes no mutation route and production startup imports no comp
     serverSource.indexOf("composeGymMasterMemberBootstrapRoute(app, memberBootstrapStartup)")
   );
   assert.equal(bootstrapComposition.includes("phase1bStartup"), false);
-  assert.match(bootstrapComposition, /conversationStartup:\s*null/);
+  assert.match(bootstrapComposition, /conversationStartup:\s*memberConversationTurnStartup/);
+  const conversationComposition = serverSource.slice(
+    serverSource.indexOf("createGymMasterMemberConversationTurnStartup({"),
+    serverSource.indexOf("composeGymMasterMemberConversationTurnRoute(app, memberConversationTurnStartup)")
+  );
+  assert.match(conversationComposition, /provider:\s*null/);
+  assert.equal(conversationComposition.includes("phase1bStartup"), false);
 });
 
 test("wrong origin and invalid or cross-member-concealed sessions never reach authorization", async (t) => {

@@ -19,6 +19,7 @@ const encodedPathSeparator = /%(?:2f|5c)/i;
 const memberSafetyIntakePath = "/goalscoach/member/safety-intake";
 const memberCoachingConsentPath = "/goalscoach/member/coaching-consent";
 const memberTodayPathPattern = /^\/goalscoach\/member\/today\/?$/i;
+const memberConversationTurnPathPattern = /^\/goalscoach\/member\/conversation\/turn\/?$/i;
 const serviceResultFields = Object.freeze([
   "transcriptionId",
   "requestId",
@@ -117,9 +118,10 @@ function createApplicationJsonParser() {
     const originalUrl = typeof req.originalUrl === "string" ? req.originalUrl : "";
     const queryOffset = originalUrl.indexOf("?");
     const rawPath = queryOffset === -1 ? originalUrl : originalUrl.slice(0, queryOffset);
-    // Coaching consent owns a post-authentication, post-rate-limit raw parser.
-    // Do not consume or inspect that body at the application-wide boundary.
-    if (req.method === "POST" && (rawPath === memberCoachingConsentPath || memberTodayPathPattern.test(rawPath))) return next();
+    // These member routes own post-authentication, post-rate-limit bounded parsers.
+    // Do not consume or inspect their bodies at the application-wide boundary.
+    if (req.method === "POST" && (rawPath === memberCoachingConsentPath
+      || memberTodayPathPattern.test(rawPath) || memberConversationTurnPathPattern.test(rawPath))) return next();
     if (req.method === "POST" && rawPath === memberSafetyIntakePath) {
       return memberSafetyIntakeJsonParser(req, res, next);
     }
