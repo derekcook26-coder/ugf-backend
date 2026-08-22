@@ -25,6 +25,7 @@ const {
   validCurrentSafetyEligibility,
 } = require("../src/goals-coach/member-conversation-turn-prerequisites");
 const { validMemberConversationTurnOwnership } = require("../src/goals-coach/member-conversation-turn-ownership");
+const { createMemberConversationTurnSafetyClassifier } = require("../src/goals-coach/member-conversation-turn-safety");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 
@@ -418,7 +419,7 @@ test("production composition creates no startup work and remains unavailable wit
     ...adapters,
     idempotency: null,
     provider: null,
-    safetyClassifier: null,
+    safetyClassifier: createMemberConversationTurnSafetyClassifier(),
   });
   assert.equal(startup.status, "not_ready");
   assert.equal(startup.router, null);
@@ -466,5 +467,6 @@ test("server passes the fail-closed production authorization bundle into dormant
   assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentMembership:\s*memberConversationAuthorization\.currentMembership[\s\S]*?\}\)/);
   assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentConsent:\s*memberConversationAuthorization\.currentConsent[\s\S]*?\}\)/);
   assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentSafetyEligibility:\s*memberConversationAuthorization\.currentSafetyEligibility[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?idempotency:\s*null[\s\S]*?provider:\s*null[\s\S]*?safetyClassifier:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /createMemberConversationTurnSafetyClassifier\(\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?idempotency:\s*null[\s\S]*?provider:\s*null[\s\S]*?safetyClassifier:\s*memberConversationTurnSafetyClassifier[\s\S]*?\}\)/);
 });
