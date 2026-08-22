@@ -582,7 +582,7 @@ test("late prerequisite settlement cannot advance after abort or deadline", asyn
   }
 });
 
-test("production imports no fixture or deterministic provider and bootstrap receives only null-provider startup", () => {
+test("production imports no fixture or deterministic provider and bootstrap receives only dormant startup", () => {
   const paths = [path.join(__dirname, "../server.js"), ...fs.readdirSync(path.join(__dirname, "../src/goals-coach"))
     .filter((name) => name.includes("conversation-turn") && name.endsWith(".js"))
     .map((name) => path.join(__dirname, "../src/goals-coach", name))];
@@ -599,7 +599,32 @@ test("production imports no fixture or deterministic provider and bootstrap rece
   assert.match(server, /currentConsent:\s*memberConversationAuthorization\.currentConsent/);
   assert.match(server, /currentSafetyEligibility:\s*memberConversationAuthorization\.currentSafetyEligibility/);
   assert.match(server, /idempotency:\s*null/);
-  assert.match(server, /safetyClassifier:\s*null/);
+  assert.match(server, /createMemberConversationTurnSafetyClassifier/);
+  assert.match(server, /safetyClassifier:\s*memberConversationTurnSafetyClassifier/);
   assert.match(server, /conversationStartup:\s*memberConversationTurnStartup/);
   assert.equal(server.slice(server.indexOf("var memberConversationTurnStartup ="), server.indexOf("composeGymMasterMemberConversationTurnRoute(app")).includes("phase1bStartup"), false);
+});
+
+test("production safety composition is deterministic, immutable, conservative, and provider-free", async () => {
+  const classifier = createMemberConversationTurnSafetyClassifier();
+  assert.ok(Object.isFrozen(classifier));
+  assert.equal(classifier.deterministic, true);
+  assert.equal(classifier.providerFree, true);
+
+  const stopped = await classifier.classify({ request: { memberText: "I feel dizzy and unstable." } });
+  const clear = await classifier.classify({ request: { memberText: "I completed the easy walk comfortably." } });
+
+  assert.deepEqual(stopped, {
+    ruleVersion: "GC-MEMBER-CONVERSATION-SAFETY-1",
+    sourceRuleVersion: "GC-MEMBER-CONVERSATION-SAFETY-RULES-1",
+    classification: "pain_or_instability",
+    action: "stop",
+  });
+  assert.deepEqual(clear, {
+    ruleVersion: "GC-MEMBER-CONVERSATION-SAFETY-1",
+    sourceRuleVersion: "GC-MEMBER-CONVERSATION-SAFETY-RULES-1",
+    classification: "clear",
+    action: "allow_provider_processing",
+  });
+  for (const result of [stopped, clear]) assert.ok(Object.isFrozen(result));
 });
