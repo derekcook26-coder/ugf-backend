@@ -139,6 +139,47 @@ function ownershipInput(value, conversation, overrides = {}) {
   };
 }
 
+function trackedAbortController() {
+  const controller = new AbortController();
+  let added = 0;
+  let removed = 0;
+  return Object.freeze({
+    abort() { controller.abort(); },
+    counts() { return Object.freeze({ added, removed }); },
+    signal: Object.freeze({
+      get aborted() { return controller.signal.aborted; },
+      addEventListener(type, listener, options) {
+        added += 1;
+        controller.signal.addEventListener(type, listener, options);
+      },
+      removeEventListener(type, listener) {
+        removed += 1;
+        controller.signal.removeEventListener(type, listener);
+      },
+    }),
+  });
+}
+
+async function withCapturedDeadlineTimer(work) {
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const scheduled = [];
+  const cleared = [];
+  global.setTimeout = (callback, milliseconds) => {
+    const handle = Object.freeze({ unref() {} });
+    scheduled.push(Object.freeze({ handle, milliseconds }));
+    queueMicrotask(callback);
+    return handle;
+  };
+  global.clearTimeout = (handle) => { cleared.push(handle); };
+  try {
+    await work(Object.freeze({ scheduled, cleared }));
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+}
+
 test("authorization bundle composes exact current prerequisites and binding ownership", { skip }, async (t) => {
   const database = await databaseAt017(t);
   const first = await owner(database.pool, "bundle");
@@ -249,7 +290,7 @@ test("operational failures propagate while abort and deadlines suppress late mem
     membershipVerifier: { verifyActiveMember() { return new Promise((resolve) => { settle = resolve; }); } },
     timeoutMilliseconds: 20,
   });
-  const controller = new AbortController();
+  const controller = trackedAbortController();
   const terminalState = createTerminalState();
   const input = {
     memberId: "1",
@@ -264,6 +305,7 @@ test("operational failures propagate while abort and deadlines suppress late mem
   settle({ active: true });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(terminalState.isTerminal(), true);
+  assert.deepEqual(controller.counts(), { added: 1, removed: 1 });
 
   const deadline = waiting.currentMembership.verify({
     ...input,
@@ -274,6 +316,63 @@ test("operational failures propagate while abort and deadlines suppress late mem
   const keepAlive = setTimeout(() => {}, 30);
   await assert.rejects(deadline, (error) => error instanceof MemberConversationAuthorizationError);
   clearTimeout(keepAlive);
+});
+
+test("authorization deadlines clamp to the earlier local or outer bound and suppress late results", async () => {
+  async function verifyDeadline(localMilliseconds, outerMilliseconds) {
+    await withCapturedDeadlineTimer(async ({ scheduled, cleared }) => {
+      let settle;
+      let outcome = "pending";
+      const controller = trackedAbortController();
+      const terminalState = createTerminalState();
+      const adapters = createMemberConversationAuthorizationAdapters({
+        pool: { async connect() { throw new Error("unused"); } },
+        membershipVerifier: {
+          verifyActiveMember() {
+            return new Promise((resolve) => { settle = resolve; });
+          },
+        },
+        monotonicNow: () => 0n,
+        timeoutMilliseconds: localMilliseconds,
+      });
+      const pending = adapters.currentMembership.verify({
+        memberId: "1",
+        identity: {
+          authProvider: "gymmaster",
+          authSubject: "gymmaster:1",
+          mappingId: "1",
+          memberId: "1",
+          memberSessionId: "1",
+        },
+        signal: controller.signal,
+        terminalState,
+        outerDeadlineNs: deadlineAfter(0n, outerMilliseconds),
+      });
+      pending.then(() => { outcome = "fulfilled"; }, () => { outcome = "rejected"; });
+
+      await assert.rejects(
+        pending,
+        (error) => error instanceof MemberConversationAuthorizationError
+          && error.code === "operation_terminal"
+      );
+      assert.deepEqual(scheduled.map(({ milliseconds }) => milliseconds), [
+        Math.min(localMilliseconds, outerMilliseconds),
+      ]);
+      assert.equal(cleared.length, 1);
+      assert.equal(cleared[0], scheduled[0].handle);
+      assert.equal(terminalState.reason(), "member_conversation_authorization_deadline");
+      assert.deepEqual(controller.counts(), { added: 1, removed: 1 });
+      assert.equal(outcome, "rejected");
+
+      settle({ active: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(outcome, "rejected");
+      assert.equal(terminalState.isTerminal(), true);
+    });
+  }
+
+  await verifyDeadline(20, 200);
+  await verifyDeadline(200, 5);
 });
 
 test("the adapter bundle is absent from production composition", () => {

@@ -3,6 +3,7 @@
 const {
   createTerminalState,
   deadlineAfter,
+  minimumDeadline,
   monotonicNow,
   positiveRemainingMilliseconds,
   runBoundedPostgresTransaction,
@@ -42,9 +43,8 @@ function requireActive(context) {
 function operationContext(options, input = {}) {
   const now = options.monotonicNow;
   const terminalState = input.terminalState || createTerminalState();
-  const outerDeadlineNs = typeof input.outerDeadlineNs === "bigint"
-    ? input.outerDeadlineNs
-    : deadlineAfter(now(), options.timeoutMilliseconds);
+  const localDeadlineNs = deadlineAfter(now(), options.timeoutMilliseconds);
+  const outerDeadlineNs = minimumDeadline(localDeadlineNs, input.outerDeadlineNs);
   const signal = input.signal;
   const onAbort = () => terminalState.terminate("member_conversation_authorization_aborted", {
     responseAllowed: false,
