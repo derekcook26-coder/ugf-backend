@@ -296,7 +296,7 @@ async function runBoundedPostgresTransaction(options = {}) {
       }
       throw new BoundedTransactionError("terminal_before_begin");
     }
-    await issue("BEGIN", [], { serverBounded: false });
+    await issue(options.readOnly === true ? "BEGIN READ ONLY" : "BEGIN", [], { serverBounded: false });
     began = true;
     if (discarded) throw new BoundedTransactionError("begin_unknown", { discarded: true });
     await configureTimeouts();
