@@ -16,6 +16,11 @@ const {
 const MIGRATION_VERSION = "018_goals_coach_member_conversation_turn_idempotency";
 const REQUIRED_MIGRATION_VERSION = "017_goals_coach_member_conversation_bindings";
 const REQUIRED_MIGRATION_CHECKSUM = "aaf54bc2f122c6add253e52cfd3529861701b32132eb703efeb45589a572a68e";
+const REQUIRED_MIGRATION_CHECKSUM_CRLF = "f3bbed20f4475cd9a82c0cc2ebff02f9cf47d10db469581d23dbe03480482212";
+const REQUIRED_MIGRATION_CHECKSUMS = Object.freeze([
+  REQUIRED_MIGRATION_CHECKSUM,
+  REQUIRED_MIGRATION_CHECKSUM_CRLF,
+]);
 const MIGRATION_FILE = path.join(__dirname, "migration_018_goals_coach_member_conversation_turn_idempotency.sql");
 const MIGRATION_LOCK_KEY = "82720517";
 const CONNECTION_MILLISECONDS = 5000;
@@ -31,7 +36,8 @@ class Migration018Error extends Error {
 }
 
 function checksum(sql) {
-  return crypto.createHash("sha256").update(sql).digest("hex");
+  const canonicalSql = typeof sql === "string" ? sql.replace(/\r\n/g, "\n") : sql;
+  return crypto.createHash("sha256").update(canonicalSql).digest("hex");
 }
 
 function createPool(connectionString, environment = process.env) {
@@ -73,7 +79,7 @@ async function runMigration(options = {}) {
           "SELECT checksum FROM app_schema_migrations WHERE version=$1",
           [REQUIRED_MIGRATION_VERSION]
         );
-        if (!required.rows.length || required.rows[0].checksum !== REQUIRED_MIGRATION_CHECKSUM) {
+        if (!required.rows.length || !REQUIRED_MIGRATION_CHECKSUMS.includes(required.rows[0].checksum)) {
           throw new Migration018Error("required_migration_mismatch");
         }
         const existing = await query(
@@ -120,6 +126,8 @@ module.exports = {
   Migration018Error,
   OVERALL_MILLISECONDS,
   REQUIRED_MIGRATION_CHECKSUM,
+  REQUIRED_MIGRATION_CHECKSUM_CRLF,
+  REQUIRED_MIGRATION_CHECKSUMS,
   REQUIRED_MIGRATION_VERSION,
   checksum,
   runMigration,

@@ -18,9 +18,12 @@ const migrations = [
   "012", "013", "014", "015", "016", "017",
 ].map((number) => require(`../migrate_${number}`).runMigration);
 const {
+  checksum,
+  MIGRATION_FILE,
   MIGRATION_VERSION,
   Migration018Error,
   REQUIRED_MIGRATION_CHECKSUM,
+  REQUIRED_MIGRATION_CHECKSUM_CRLF,
   runMigration,
 } = require("../migrate_018");
 const { runRollback } = require("../rollback_018");
@@ -41,6 +44,21 @@ async function withTrackedMigrationBytes(work) {
       return options === "utf8" || options?.encoding === "utf8"
         ? bytes.toString("utf8")
         : bytes;
+    }
+    return originalReadFileSync.apply(fs, arguments);
+  };
+  try {
+    return await work();
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+}
+
+async function withMigration018Sql(sql, work) {
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function readMigration018WithSelectedLineEndings(file, options) {
+    if (path.resolve(String(file)) === path.resolve(MIGRATION_FILE)) {
+      return options === "utf8" || options?.encoding === "utf8" ? sql : Buffer.from(sql, "utf8");
     }
     return originalReadFileSync.apply(fs, arguments);
   };
@@ -171,6 +189,10 @@ test("Migration 018 is ordered, checksummed, replayable, and non-backfilled", { 
     crypto.createHash("sha256").update(predecessor).digest("hex"),
     REQUIRED_MIGRATION_CHECKSUM
   );
+  assert.equal(
+    crypto.createHash("sha256").update(predecessor.toString("utf8").replace(/\n/g, "\r\n")).digest("hex"),
+    REQUIRED_MIGRATION_CHECKSUM_CRLF
+  );
   const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
   assert.equal(packageJson.scripts["migrate:member-conversation-turn-idempotency"], "node migrate_018.js");
   assert.equal(packageJson.scripts["rollback:member-conversation-turn-idempotency"], "node rollback_018.js");
@@ -183,6 +205,33 @@ test("Migration 018 is ordered, checksummed, replayable, and non-backfilled", { 
   assert.equal((await database.pool.query(
     "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
   )).rows[0].count, 0);
+});
+
+test("Migration 018 accepts the exact CRLF predecessor and keeps replay and rollback checkout-independent", { skip }, async (t) => {
+  const database = await at017(t);
+  await database.pool.query(
+    "UPDATE app_schema_migrations SET checksum=$1 WHERE version='017_goals_coach_member_conversation_bindings'",
+    [REQUIRED_MIGRATION_CHECKSUM_CRLF]
+  );
+  const workingSql = fs.readFileSync(MIGRATION_FILE, "utf8");
+  const lfSql = workingSql.replace(/\r\n/g, "\n");
+  const crlfSql = lfSql.replace(/\n/g, "\r\n");
+
+  const applied = await withMigration018Sql(crlfSql, () => runMigration({ pool: database.pool }));
+  assert.equal(applied.status, "applied");
+  assert.equal(applied.checksum, checksum(lfSql));
+  assert.equal((await database.pool.query(
+    "SELECT checksum FROM app_schema_migrations WHERE version=$1",
+    [MIGRATION_VERSION]
+  )).rows[0].checksum, checksum(lfSql));
+
+  const replay = await withMigration018Sql(lfSql, () => runMigration({ pool: database.pool }));
+  assert.equal(replay.status, "already_applied");
+  assert.equal(replay.checksum, checksum(lfSql));
+  assert.equal((await withMigration018Sql(crlfSql, () => runRollback({
+    pool: database.pool,
+    skipConfirmation: true,
+  }))).status, "rolled_back");
 });
 
 test("Migration 018 stores only a strict bounded replay response and immutable provenance", { skip }, async (t) => {
@@ -274,8 +323,19 @@ test("Migration 018 refuses predecessor and ledger checksum mismatches", { skip 
     (error) => error instanceof Migration018Error && error.code === "required_migration_mismatch"
   );
   await database.pool.query(
-    "INSERT INTO app_schema_migrations(version,checksum) VALUES('017_goals_coach_member_conversation_bindings',$1),($2,'bad')",
-    [REQUIRED_MIGRATION_CHECKSUM, MIGRATION_VERSION]
+    "INSERT INTO app_schema_migrations(version,checksum) VALUES('017_goals_coach_member_conversation_bindings','tampered')"
+  );
+  await assert.rejects(
+    runMigration({ pool: database.pool }),
+    (error) => error instanceof Migration018Error && error.code === "required_migration_mismatch"
+  );
+  await database.pool.query(
+    "UPDATE app_schema_migrations SET checksum=$1 WHERE version='017_goals_coach_member_conversation_bindings'",
+    [REQUIRED_MIGRATION_CHECKSUM]
+  );
+  await database.pool.query(
+    "INSERT INTO app_schema_migrations(version,checksum) VALUES($1,'bad')",
+    [MIGRATION_VERSION]
   );
   await assert.rejects(runMigration({ pool: database.pool }), (error) => error.code === "checksum_mismatch");
 });
