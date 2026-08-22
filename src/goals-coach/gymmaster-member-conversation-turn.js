@@ -10,6 +10,7 @@ const {
   createMemberConversationTurnResponse,
   memberConversationTurnRequestHash,
   parseMemberConversationTurnRequest,
+  parseMemberConversationTurnResponse,
   responseMatchesRequest,
 } = require("./member-conversation-turn-contract");
 const { validMemberConversationTurnIdempotency } = require("./member-conversation-turn-idempotency");
@@ -18,6 +19,14 @@ const {
   validMemberConversationTurnOwnership,
 } = require("./member-conversation-turn-ownership");
 const { validMemberConversationTurnSafetyClassifier } = require("./member-conversation-turn-safety");
+const {
+  validCurrentConsent,
+  validCurrentConsentResult,
+  validCurrentMembership,
+  validCurrentMembershipResult,
+  validCurrentSafetyEligibility,
+  validCurrentSafetyEligibilityResult,
+} = require("./member-conversation-turn-prerequisites");
 
 const MEMBER_CONVERSATION_TURN_FLAG = "GOALS_COACH_MEMBER_CONVERSATION_TURN_ENABLED";
 const MEMBER_CONVERSATION_TURN_TIMEOUT_MILLISECONDS = 5000;
@@ -105,7 +114,10 @@ function createTurnRateLimit() {
 }
 
 function createConversationTurnRequestHandler(options = {}) {
-  const { authorizeIdentity, conversationOwnership, idempotency, provider, safetyClassifier, timeoutMilliseconds } = options;
+  const {
+    authorizeIdentity, conversationOwnership, currentConsent, currentMembership,
+    currentSafetyEligibility, idempotency, provider, safetyClassifier, timeoutMilliseconds,
+  } = options;
   return async (req, res) => {
     if (Object.keys(req.query).length || !validGymMasterIdentity(req.alphaMemberIdentity)) {
       return send(res, 401, "MEMBER_AUTHENTICATION_REQUIRED");
@@ -118,6 +130,15 @@ function createConversationTurnRequestHandler(options = {}) {
         const authorization = await authorizeIdentity(req.alphaMemberIdentity, context);
         requireActive(context);
         if (!validAuthorization(authorization)) return { concealed: true };
+        const membership = await currentMembership.verify(Object.freeze({
+          memberId: String(authorization.memberId),
+          identity: req.alphaMemberIdentity,
+          signal: context.signal,
+          terminalState: context.terminalState,
+          outerDeadlineNs: context.outerDeadlineNs,
+        }));
+        requireActive(context);
+        if (!validCurrentMembershipResult(membership)) return { concealed: true };
         const providerContext = Object.freeze({
           memberId: String(authorization.memberId), request, signal: context.signal,
           terminalState: context.terminalState, outerDeadlineNs: context.outerDeadlineNs,
@@ -131,8 +152,21 @@ function createConversationTurnRequestHandler(options = {}) {
         }));
         requireActive(context);
         if (!validConversationOwnershipResult(ownership)) return { concealed: true };
+        const prerequisiteContext = Object.freeze({
+          memberId: providerContext.memberId,
+          mappingId: String(authorization.mappingId),
+          signal: context.signal,
+          terminalState: context.terminalState,
+          outerDeadlineNs: context.outerDeadlineNs,
+        });
+        const consent = await currentConsent.verify(prerequisiteContext);
+        requireActive(context);
+        if (!validCurrentConsentResult(consent)) return { concealed: true };
+        const safetyEligibility = await currentSafetyEligibility.verify(prerequisiteContext);
+        requireActive(context);
+        if (!validCurrentSafetyEligibilityResult(safetyEligibility)) return { concealed: true };
         const signature = memberConversationTurnRequestHash(request);
-        return idempotency.execute({
+        const execution = await idempotency.execute({
           key: request.idempotencyKey,
           signature,
           signal: context.signal,
@@ -150,6 +184,14 @@ function createConversationTurnRequestHandler(options = {}) {
             return { response: parsed };
           },
         });
+        requireActive(context);
+        if (!execution || typeof execution !== "object" || Array.isArray(execution)
+          || Object.keys(execution).length !== 1 || !("response" in execution)) {
+          throw new Error("Conversation turn idempotency result is invalid");
+        }
+        const parsed = parseMemberConversationTurnResponse(execution.response);
+        if (!responseMatchesRequest(request, parsed)) throw new Error("Conversation turn response provenance mismatch");
+        return { response: parsed };
       }, req, res, timeoutMilliseconds);
       if (response.concealed) return send(res, 404, "MEMBER_CONVERSATION_NOT_FOUND");
       if (responseAuthorityRevoked(req, res)) return undefined;
@@ -162,12 +204,17 @@ function createConversationTurnRequestHandler(options = {}) {
 }
 
 function createGymMasterMemberConversationTurnRouter(options = {}) {
-  const { authenticateSession, authorizeIdentity, conversationOwnership, idempotency, origin, provider, safetyClassifier } = options;
+  const {
+    authenticateSession, authorizeIdentity, conversationOwnership, currentConsent, currentMembership,
+    currentSafetyEligibility, idempotency, origin, provider, safetyClassifier,
+  } = options;
   const timeoutMilliseconds = Number.isInteger(options.timeoutMilliseconds)
     && options.timeoutMilliseconds > 0 && options.timeoutMilliseconds <= MEMBER_CONVERSATION_TURN_TIMEOUT_MILLISECONDS
     ? options.timeoutMilliseconds : MEMBER_CONVERSATION_TURN_TIMEOUT_MILLISECONDS;
   if (typeof authenticateSession !== "function" || typeof authorizeIdentity !== "function"
     || !origin || !validProvider(provider) || !validMemberConversationTurnOwnership(conversationOwnership)
+    || !validCurrentMembership(currentMembership) || !validCurrentConsent(currentConsent)
+    || !validCurrentSafetyEligibility(currentSafetyEligibility)
     || !validMemberConversationTurnIdempotency(idempotency)
     || !validMemberConversationTurnSafetyClassifier(safetyClassifier)) {
     throw new Error("Member conversation turn dependencies are incomplete");
@@ -181,8 +228,11 @@ function createGymMasterMemberConversationTurnRouter(options = {}) {
       return authenticateSession(req, res, next);
     },
     options.rateLimit || createTurnRateLimit(),
-    express.json({ limit: MEMBER_CONVERSATION_TURN_MAXIMUM_BYTES, strict: true }),
-    createConversationTurnRequestHandler({ authorizeIdentity, conversationOwnership, idempotency, provider, safetyClassifier, timeoutMilliseconds })
+    express.json({ inflate: false, limit: MEMBER_CONVERSATION_TURN_MAXIMUM_BYTES, strict: true }),
+    createConversationTurnRequestHandler({
+      authorizeIdentity, conversationOwnership, currentConsent, currentMembership,
+      currentSafetyEligibility, idempotency, provider, safetyClassifier, timeoutMilliseconds,
+    })
   );
   router.use((error, _req, res, _next) => {
     if (error && (error.type === "entity.too.large" || error instanceof SyntaxError)) {

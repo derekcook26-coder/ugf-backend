@@ -19,6 +19,11 @@ const {
 const { validMemberConversationTurnIdempotency } = require("./member-conversation-turn-idempotency");
 const { validMemberConversationTurnOwnership } = require("./member-conversation-turn-ownership");
 const { validMemberConversationTurnSafetyClassifier } = require("./member-conversation-turn-safety");
+const {
+  validCurrentConsent,
+  validCurrentMembership,
+  validCurrentSafetyEligibility,
+} = require("./member-conversation-turn-prerequisites");
 
 function createBoundedTurnAuthorization(options = {}) {
   if (!options.pool || typeof options.pool.connect !== "function") {
@@ -53,6 +58,9 @@ function createGymMasterMemberConversationTurnStartup(options = {}) {
     || typeof secret !== "string" || secret.length < 32
     || !options.db || typeof options.db.connect !== "function" || !validProvider(options.provider)
     || !validMemberConversationTurnOwnership(options.conversationOwnership)
+    || !validCurrentMembership(options.currentMembership)
+    || !validCurrentConsent(options.currentConsent)
+    || !validCurrentSafetyEligibility(options.currentSafetyEligibility)
     || !validMemberConversationTurnIdempotency(options.idempotency)
     || !validMemberConversationTurnSafetyClassifier(options.safetyClassifier)) return common;
   const timeoutMilliseconds = Number.isInteger(options.timeoutMilliseconds)
@@ -63,6 +71,8 @@ function createGymMasterMemberConversationTurnStartup(options = {}) {
   const router = createGymMasterMemberConversationTurnRouter({
     authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService }),
     authorizeIdentity: authorization.authorizeIdentity, conversationOwnership: options.conversationOwnership,
+    currentMembership: options.currentMembership, currentConsent: options.currentConsent,
+    currentSafetyEligibility: options.currentSafetyEligibility,
     idempotency: options.idempotency,
     origin, provider: options.provider, safetyClassifier: options.safetyClassifier,
     ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}), timeoutMilliseconds,

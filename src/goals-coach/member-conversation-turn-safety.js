@@ -10,7 +10,7 @@ const {
 // It adds the member-turn contract's conservative current pain, instability,
 // neurological-symptom, restriction, and ambiguous-discomfort stop boundary
 // without changing the shared safety behavior used by existing consumers.
-const MEMBER_TURN_CONCERN = /\b(pain|hurts?|sharp|sore(?:ness)?|discomfort|unstable|instability|numb(?:ness)?|tingl(?:e|ing)|weak(?:ness)?|restricted|restriction)\b/;
+const MEMBER_TURN_CONCERN = /\b(pain|hurts?|sharp|sore(?:ness)?|discomfort|aches?|aching|dizz(?:y|iness)|breathless|shortness\s+of\s+breath|swell(?:ing)?|swollen|unstable|instability|numb(?:ness)?|tingl(?:e|ing)|pins|needles|weak(?:ness)?|restricted|restriction)\b/;
 
 function unavailableSafety() {
   return Object.freeze({

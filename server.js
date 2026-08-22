@@ -168,6 +168,9 @@ composeGymMasterMemberTodayRoute(app, memberTodayStartup);
   var memberConversationTurnStartup = createGymMasterMemberConversationTurnStartup({
     db: db,
     conversationOwnership: null,
+    currentMembership: null,
+    currentConsent: null,
+    currentSafetyEligibility: null,
     idempotency: null,
     provider: null,
     safetyClassifier: null,
