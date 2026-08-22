@@ -14,7 +14,11 @@ const {
 const {
   MemberConversationAuthorizationError,
   createMemberConversationAuthorizationAdapters,
+  createProductionMemberConversationAuthorizationAdapters,
 } = require("../src/goals-coach/member-conversation-authorization-adapters");
+const {
+  createGymMasterMemberConversationTurnStartup,
+} = require("../src/goals-coach/gymmaster-member-conversation-turn-startup");
 const {
   validCurrentConsent,
   validCurrentMembership,
@@ -375,9 +379,92 @@ test("authorization deadlines clamp to the earlier local or outer bound and supp
   await verifyDeadline(200, 5);
 });
 
-test("the adapter bundle is absent from production composition", () => {
+test("production composition creates no startup work and remains unavailable without downstream authority", () => {
+  let connectionCalls = 0;
+  let gatekeeperCalls = 0;
+  const pool = {
+    async connect() {
+      connectionCalls += 1;
+      throw new Error("must not connect during composition");
+    },
+  };
+  const adapters = createProductionMemberConversationAuthorizationAdapters({
+    pool,
+    fetchImpl: async () => {
+      gatekeeperCalls += 1;
+      throw new Error("must not call Gatekeeper during composition");
+    },
+    environment: {
+      GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL:
+        "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
+      GYMMASTER_API_KEY: "synthetic-server-side-key",
+      GYMMASTER_SITE: "synthetic-site",
+    },
+  });
+  assert.equal(validCurrentMembership(adapters.currentMembership), true);
+  assert.equal(validCurrentConsent(adapters.currentConsent), true);
+  assert.equal(validCurrentSafetyEligibility(adapters.currentSafetyEligibility), true);
+  assert.equal(validMemberConversationTurnOwnership(adapters.conversationOwnership), true);
+  assert.equal(connectionCalls, 0);
+  assert.equal(gatekeeperCalls, 0);
+
+  const startup = createGymMasterMemberConversationTurnStartup({
+    db: pool,
+    environment: {
+      GOALS_COACH_MEMBER_CONVERSATION_TURN_ENABLED: "true",
+      GOALS_COACH_MEMBER_LOGIN_ORIGIN: "https://coach.example",
+      GOALS_COACH_MEMBER_TWO_HOUR_SESSION_ENABLED: "true",
+    },
+    ...adapters,
+    idempotency: null,
+    provider: null,
+    safetyClassifier: null,
+  });
+  assert.equal(startup.status, "not_ready");
+  assert.equal(startup.router, null);
+  assert.equal(startup.activationPermitted, false);
+  assert.equal(startup.externalCallsPermitted, false);
+  assert.equal(connectionCalls, 0);
+  assert.equal(gatekeeperCalls, 0);
+});
+
+test("production authorization composition fails closed for incomplete existing boundaries", () => {
+  const valid = {
+    pool: { async connect() { throw new Error("must not connect"); } },
+    fetchImpl: async () => { throw new Error("must not fetch"); },
+    environment: {
+      GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL:
+        "https://ugf.gymmasteronline.com/gatekeeper_api/v2/members",
+      GYMMASTER_API_KEY: "synthetic-server-side-key",
+      GYMMASTER_SITE: "synthetic-site",
+    },
+  };
+  for (const options of [
+    {},
+    { ...valid, pool: null },
+    { ...valid, fetchImpl: null },
+    { ...valid, environment: { ...valid.environment, GYMMASTER_API_KEY: "" } },
+    { ...valid, environment: { ...valid.environment, GYMMASTER_SITE: "" } },
+    { ...valid, environment: {
+      ...valid.environment,
+      GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL: "http://example.test/members",
+    } },
+  ]) {
+    assert.deepEqual(createProductionMemberConversationAuthorizationAdapters(options), {
+      conversationOwnership: null,
+      currentConsent: null,
+      currentMembership: null,
+      currentSafetyEligibility: null,
+    });
+  }
+});
+
+test("server passes the fail-closed production authorization bundle into dormant turn startup", () => {
   const server = fs.readFileSync(path.resolve(__dirname, "../server.js"), "utf8");
-  assert.doesNotMatch(server, /member-conversation-authorization-adapters|createMemberConversationAuthorizationAdapters/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?conversationOwnership:\s*null[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentMembership:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /createProductionMemberConversationAuthorizationAdapters\(\{[\s\S]*?pool:\s*db[\s\S]*?fetchImpl:\s*fetch[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?conversationOwnership:\s*memberConversationAuthorization\.conversationOwnership[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentMembership:\s*memberConversationAuthorization\.currentMembership[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentConsent:\s*memberConversationAuthorization\.currentConsent[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentSafetyEligibility:\s*memberConversationAuthorization\.currentSafetyEligibility[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?idempotency:\s*null[\s\S]*?provider:\s*null[\s\S]*?safetyClassifier:\s*null[\s\S]*?\}\)/);
 });

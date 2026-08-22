@@ -593,10 +593,13 @@ test("production imports no fixture or deterministic provider and bootstrap rece
   }
   const server = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
   assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?provider:\s*null[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?conversationOwnership:\s*null[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentMembership:\s*null[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentConsent:\s*null[\s\S]*?\}\)/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?currentSafetyEligibility:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /createProductionMemberConversationAuthorizationAdapters/);
+  assert.match(server, /conversationOwnership:\s*memberConversationAuthorization\.conversationOwnership/);
+  assert.match(server, /currentMembership:\s*memberConversationAuthorization\.currentMembership/);
+  assert.match(server, /currentConsent:\s*memberConversationAuthorization\.currentConsent/);
+  assert.match(server, /currentSafetyEligibility:\s*memberConversationAuthorization\.currentSafetyEligibility/);
+  assert.match(server, /idempotency:\s*null/);
+  assert.match(server, /safetyClassifier:\s*null/);
   assert.match(server, /conversationStartup:\s*memberConversationTurnStartup/);
   assert.equal(server.slice(server.indexOf("var memberConversationTurnStartup ="), server.indexOf("composeGymMasterMemberConversationTurnRoute(app")).includes("phase1bStartup"), false);
 });

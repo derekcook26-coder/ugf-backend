@@ -9,12 +9,21 @@ const {
   runBoundedPostgresTransaction,
 } = require("./bounded-postgres-transaction");
 const { MEMBER_COACHING_CONSENT_NOTICE_VERSION } = require("./gymmaster-member-coaching-consent");
+const {
+  createGymMasterGatekeeperMembershipVerifier,
+} = require("./gymmaster-gatekeeper-membership");
 const { MEMBER_SAFETY_NOTICE_VERSION } = require("./gymmaster-member-safety-intake");
 const { createMemberConversationBindingService } = require("./member-conversation-binding-service");
 const { MEMBER_CONVERSATION_TURN_CONTRACT_VERSION } = require("./member-conversation-turn-contract");
 
 const MEMBER_CONVERSATION_AUTHORIZATION_TIMEOUT_MILLISECONDS = 5000;
 const DATABASE_ID = /^[1-9]\d{0,18}$/;
+const unavailableAdapters = Object.freeze({
+  conversationOwnership: null,
+  currentConsent: null,
+  currentMembership: null,
+  currentSafetyEligibility: null,
+});
 
 class MemberConversationAuthorizationError extends Error {
   constructor(code, cause) {
@@ -254,8 +263,35 @@ function createMemberConversationAuthorizationAdapters(options = {}) {
   });
 }
 
+function createProductionMemberConversationAuthorizationAdapters(options = {}) {
+  const environment = options.environment || process.env;
+  if (!options.pool || typeof options.pool.connect !== "function"
+    || typeof options.fetchImpl !== "function") return unavailableAdapters;
+  try {
+    const membershipVerifier = createGymMasterGatekeeperMembershipVerifier({
+      endpoint: environment.GOALS_COACH_GYMMASTER_GATEKEEPER_MEMBERS_URL,
+      site: environment.GYMMASTER_SITE,
+      apiKey: environment.GYMMASTER_API_KEY,
+      fetchImpl: options.fetchImpl,
+      ...(options.gatekeeperTimeoutMilliseconds === undefined
+        ? {} : { timeoutMs: options.gatekeeperTimeoutMilliseconds }),
+    });
+    return createMemberConversationAuthorizationAdapters({
+      pool: options.pool,
+      membershipVerifier,
+      ...(options.timeoutMilliseconds === undefined
+        ? {} : { timeoutMilliseconds: options.timeoutMilliseconds }),
+      ...(typeof options.monotonicNow === "function"
+        ? { monotonicNow: options.monotonicNow } : {}),
+    });
+  } catch (_) {
+    return unavailableAdapters;
+  }
+}
+
 module.exports = {
   MEMBER_CONVERSATION_AUTHORIZATION_TIMEOUT_MILLISECONDS,
   MemberConversationAuthorizationError,
   createMemberConversationAuthorizationAdapters,
+  createProductionMemberConversationAuthorizationAdapters,
 };

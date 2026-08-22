@@ -49,6 +49,7 @@ var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-
   var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
   var { createGymMasterMemberConversationTurnStartup } = require("./src/goals-coach/gymmaster-member-conversation-turn-startup");
   var { composeGymMasterMemberConversationTurnRoute } = require("./src/goals-coach/gymmaster-member-conversation-turn-route-composition");
+  var { createProductionMemberConversationAuthorizationAdapters } = require("./src/goals-coach/member-conversation-authorization-adapters");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -162,15 +163,21 @@ composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
 var memberTodayStartup = createGymMasterMemberTodayStartup({ db: db, fetchImpl: fetch });
 composeGymMasterMemberTodayRoute(app, memberTodayStartup);
 
-  // Production has no provider or durable idempotency dependency yet. Even if
-  // the independent flag is set, startup remains unavailable and no route is
-  // mounted. Private-alpha engines are never accepted as these dependencies.
+  // Provider-free authorization prerequisites are constructed only from the
+  // existing PostgreSQL and Gatekeeper boundaries and perform no startup work.
+  // Production still has no provider, safety classifier, or durable idempotency
+  // dependency, so startup remains unavailable and no route is mounted.
+  var memberConversationAuthorization =
+    createProductionMemberConversationAuthorizationAdapters({
+      pool: db,
+      fetchImpl: fetch,
+    });
   var memberConversationTurnStartup = createGymMasterMemberConversationTurnStartup({
     db: db,
-    conversationOwnership: null,
-    currentMembership: null,
-    currentConsent: null,
-    currentSafetyEligibility: null,
+    conversationOwnership: memberConversationAuthorization.conversationOwnership,
+    currentMembership: memberConversationAuthorization.currentMembership,
+    currentConsent: memberConversationAuthorization.currentConsent,
+    currentSafetyEligibility: memberConversationAuthorization.currentSafetyEligibility,
     idempotency: null,
     provider: null,
     safetyClassifier: null,
