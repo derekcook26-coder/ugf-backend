@@ -32,6 +32,8 @@
     "rollback:member-today": "node rollback_014.js",
     "migrate:member-two-hour-session": "node migrate_015.js",
     "rollback:member-two-hour-session": "node rollback_015.js",
+    "migrate:member-conversation-bindings": "node migrate_017.js",
+    "rollback:member-conversation-bindings": "node rollback_017.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },

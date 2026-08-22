@@ -1,0 +1,4 @@
+DROP TABLE goals_coach_member_conversation_bindings;
+DROP FUNCTION prevent_goals_coach_member_conversation_binding_mutation();
+ALTER TABLE goals_coach_member_sessions
+  DROP CONSTRAINT uq_goals_coach_member_sessions_id_member_mapping;
