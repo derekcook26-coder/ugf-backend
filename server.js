@@ -45,6 +45,8 @@ var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach
 var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
 var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
 var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
+var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
+var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -157,6 +159,20 @@ composeGymMasterMemberCoachingConsentRoutes(app, memberCoachingConsentStartup);
 // Construction performs no database, Gatekeeper, or provider calls.
 var memberTodayStartup = createGymMasterMemberTodayStartup({ db: db, fetchImpl: fetch });
 composeGymMasterMemberTodayRoute(app, memberTodayStartup);
+
+// The member bootstrap is a read-only, privacy-minimized capability contract.
+// It is independently disabled by default, performs no startup work, and never
+// activates or calls a coaching, voice, plan, or membership provider.
+var memberBootstrapStartup = createGymMasterMemberBootstrapStartup({
+  db: db,
+  consentStartup: memberCoachingConsentStartup,
+  safetyStartup: memberSafetyIntakeStartup,
+  workoutStartup: memberTodayStartup,
+  // No authenticated production-member conversation route exists yet. The
+  // private-alpha engine must never be advertised as a member capability.
+  conversationStartup: null,
+});
+composeGymMasterMemberBootstrapRoute(app, memberBootstrapStartup);
 
 // Pending enrollment is disabled unless its exact flag is "true". Startup only
 // composes injected database and Gatekeeper boundaries; it performs no provider

@@ -1,0 +1,54 @@
+{
+  "corpusVersion": "GC-MEMBER-BOOTSTRAP-CORPUS-1",
+  "valid": [
+    {
+      "name": "all-disabled",
+      "value": {
+        "contractVersion": "GC-MEMBER-BOOTSTRAP-1",
+        "accessClass": "authenticated_member",
+        "capabilities": {
+          "consent": { "status": "disabled", "reason": "consent_disabled" },
+          "safety": { "status": "disabled", "reason": "safety_disabled" },
+          "workout": { "status": "disabled", "reason": "workout_disabled" },
+          "conversation": { "status": "disabled", "reason": "conversation_disabled" }
+        },
+        "requiredVersions": {
+          "consentNotice": "GC-MEMBER-COACHING-CONSENT-1",
+          "safetyNotice": "GC-MEMBER-SAFETY-NOTICE-3",
+          "safetyRule": "GC-MEMBER-SAFETY-INTAKE-3",
+          "workoutContract": "GC-MEMBER-TODAY-1",
+          "conversationContract": "GC-PHASE1B-CONTRACT-1"
+        }
+      }
+    },
+    {
+      "name": "all-ready",
+      "value": {
+        "contractVersion": "GC-MEMBER-BOOTSTRAP-1",
+        "accessClass": "authenticated_member",
+        "capabilities": {
+          "consent": { "status": "ready", "reason": null },
+          "safety": { "status": "ready", "reason": null },
+          "workout": { "status": "ready", "reason": null },
+          "conversation": { "status": "ready", "reason": null }
+        },
+        "requiredVersions": {
+          "consentNotice": "GC-MEMBER-COACHING-CONSENT-1",
+          "safetyNotice": "GC-MEMBER-SAFETY-NOTICE-3",
+          "safetyRule": "GC-MEMBER-SAFETY-INTAKE-3",
+          "workoutContract": "GC-MEMBER-TODAY-1",
+          "conversationContract": "GC-PHASE1B-CONTRACT-1"
+        }
+      }
+    }
+  ],
+  "invalid": [
+    { "name": "wrong-version", "patch": { "path": "contractVersion", "value": "GC-MEMBER-BOOTSTRAP-2" } },
+    { "name": "protected-identifier", "patch": { "path": "memberId", "value": "10482" } },
+    { "name": "unknown-capability-status", "patch": { "path": "capabilities.safety.status", "value": "pending" } },
+    { "name": "mismatched-unavailable-reason", "patch": { "path": "capabilities.safety", "value": { "status": "unavailable", "reason": "safety_disabled" } } },
+    { "name": "extra-capability-key", "patch": { "path": "capabilities.workout.plan", "value": "synthetic" } },
+    { "name": "inconsistent-workout-readiness", "patch": { "path": "capabilities.consent", "value": { "status": "disabled", "reason": "consent_disabled" } } },
+    { "name": "inconsistent-conversation-readiness", "patch": { "path": "capabilities.workout", "value": { "status": "unavailable", "reason": "workout_unavailable" } } }
+  ]
+}
