@@ -371,5 +371,7 @@ test("abort and deadline during the prerequisite read prevent every late insert"
 test("the service remains absent from production startup and Migration 017 is test-only here", () => {
   const server = fs.readFileSync(path.resolve(__dirname, "../server.js"), "utf8");
   assert.doesNotMatch(server, /member-conversation-binding-service|createMemberConversationBindingService/);
-  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?conversationOwnership:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /conversationOwnership:\s*memberConversationAuthorization\.conversationOwnership/);
+  assert.match(server, /idempotency:\s*null/);
+  assert.match(server, /provider:\s*null/);
 });
