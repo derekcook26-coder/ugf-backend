@@ -1,0 +1,4 @@
+DROP TABLE goals_coach_member_conversation_turn_idempotency;
+DROP FUNCTION prevent_member_conversation_turn_idempotency_mutation();
+ALTER TABLE goals_coach_member_conversation_bindings
+  DROP CONSTRAINT uq_goals_coach_member_conversation_bindings_exact_identity;
