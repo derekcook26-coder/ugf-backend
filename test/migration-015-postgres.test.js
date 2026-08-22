@@ -45,6 +45,11 @@ test("Migration 015 rollback uses canonical version ordering, never applied_at c
 });
 test("PostgreSQL serializes logout ahead of protected use and rejects replay", { skip }, async (t) => {
   const db = await at014(t); await runMigration({ pool: db.pool }); const owner = await member(db.pool); const service = createGymMasterTwoHourSessionService({ db: db.pool }); const token = await service.issue({ authProvider: "gymmaster", authSubject: "gymmaster:911" }, owner);
+  const durable = (await db.pool.query("SELECT id FROM goals_coach_member_sessions WHERE token_hash=$1", [crypto.createHash("sha256").update(token).digest("hex")])).rows[0];
+  const authenticated = await service.verify(token);
+  assert.equal(authenticated.memberSessionId, String(durable.id));
+  assert.equal(authenticated.mappingId, owner.mappingId);
+  assert.equal(authenticated.memberId, owner.memberId);
   const lock = await db.pool.connect(); await lock.query("BEGIN"); await lock.query("SELECT id FROM goals_coach_member_sessions WHERE token_hash=$1 FOR UPDATE", [crypto.createHash("sha256").update(token).digest("hex")]);
   const revoke = service.revoke(token); const use = service.verify(token); await lock.query("COMMIT"); lock.release(); assert.equal(await revoke, true); await assert.rejects(use); await assert.rejects(service.verify(token));
 });

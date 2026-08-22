@@ -110,6 +110,21 @@ function deferred() {
   return { promise, resolve };
 }
 
+function observeInsert(pool, started) {
+  return {
+    async connect() {
+      const client = await pool.connect();
+      return {
+        query(sql, parameters) {
+          if (String(sql).includes("INSERT INTO goals_coach_member_conversation_bindings")) started.resolve();
+          return client.query(sql, parameters);
+        },
+        release(error) { client.release(error); },
+      };
+    },
+  };
+}
+
 test("binding creation generates a server UUID and never accepts a client reference", { skip }, async (t) => {
   const database = await databaseAt017(t);
   const first = await owner(database.pool, "create");
@@ -207,6 +222,85 @@ test("ownership is exact, read-only, concealed, and revoked synchronously with c
     "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_bindings"
   )).rows[0].count;
   assert.equal(count, 1);
+});
+
+test("binding creation locks every mutable prerequisite through insert and commit", { skip }, async (t) => {
+  const database = await databaseAt017(t);
+  const cases = [
+    {
+      name: "conversation archive",
+      value: await owner(database.pool, "lock-conversation"),
+      update: (value) => database.pool.query(
+        "UPDATE coaching_conversations SET status='archived', archived_at=NOW() WHERE id=$1",
+        [value.conversation.id]
+      ),
+    },
+    {
+      name: "mapping deactivation",
+      value: await owner(database.pool, "lock-mapping"),
+      update: (value) => database.pool.query(
+        "UPDATE goals_coach_member_auth_mappings SET active=FALSE WHERE id=$1",
+        [value.mapping.id]
+      ),
+    },
+    {
+      name: "session revocation",
+      value: await owner(database.pool, "lock-session"),
+      update: (value) => database.pool.query(
+        "UPDATE goals_coach_member_sessions SET revoked_at=NOW() WHERE id=$1",
+        [value.session.id]
+      ),
+    },
+  ];
+  for (const item of cases) {
+    const blocker = await database.pool.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("LOCK TABLE goals_coach_member_conversation_bindings IN ACCESS EXCLUSIVE MODE");
+    const insertStarted = deferred();
+    const service = createMemberConversationBindingService({
+      pool: observeInsert(database.pool, insertStarted), timeoutMilliseconds: 1000,
+    });
+    const pendingBinding = service.createBinding(createInput(item.value));
+    await insertStarted.promise;
+    let invalidationSettled = false;
+    const invalidation = item.update(item.value).then(() => { invalidationSettled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(invalidationSettled, false, item.name);
+    await blocker.query("COMMIT");
+    blocker.release();
+    const binding = await pendingBinding;
+    await invalidation;
+    assert.equal(
+      await service.ownership.authorize(ownershipInput(item.value, binding.conversation)),
+      null,
+      item.name
+    );
+  }
+});
+
+test("ownership conceals absence but propagates database and deadline failures", async () => {
+  const conversation = {
+    provenance: "member_session", reference: "00000000-0000-4000-8000-000000000299", version: 1,
+  };
+  const input = { authMappingId: "1", conversation, memberId: "1", memberSessionId: "1" };
+  const failed = createMemberConversationBindingService({
+    pool: { async connect() { throw new Error("synthetic database detail"); } },
+  });
+  await assert.rejects(
+    failed.ownership.authorize(input),
+    (error) => error instanceof MemberConversationBindingError && error.code === "database_unavailable"
+  );
+
+  const waiting = createMemberConversationBindingService({
+    pool: { connect() { return new Promise(() => {}); } }, timeoutMilliseconds: 5,
+  });
+  const keepAlive = setTimeout(() => {}, 50);
+  await assert.rejects(
+    waiting.ownership.authorize(input),
+    (error) => error instanceof MemberConversationBindingError
+  );
+  clearTimeout(keepAlive);
+  assert.equal(await failed.ownership.authorize({ ...input, extra: true }), null);
 });
 
 test("abort and deadline during checkout revoke authority and drain late clients", async () => {

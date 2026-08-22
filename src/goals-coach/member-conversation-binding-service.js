@@ -207,7 +207,7 @@ function createMemberConversationBindingService(options = {}) {
             AND mapping.active = TRUE
             AND session.revoked_at IS NULL
             AND session.expires_at > CURRENT_TIMESTAMP
-          FOR KEY SHARE OF conversation, mapping, session`,
+          FOR SHARE OF conversation, mapping, session`,
         [input.coachingConversationId, input.memberId, input.authMappingId, input.memberSessionId]
       );
       if (!current.rows || current.rows.length !== 1) {
@@ -246,8 +246,7 @@ function createMemberConversationBindingService(options = {}) {
   async function authorize(inputValue, operation = {}) {
     const input = parseOwnershipInput(inputValue);
     if (!input) return null;
-    try {
-      return await transact(operation, true, async ({ query }) => {
+    return transact(operation, true, async ({ query }) => {
         const result = await query(
           `SELECT 1
              FROM goals_coach_member_conversation_bindings binding
@@ -281,10 +280,7 @@ function createMemberConversationBindingService(options = {}) {
           ]
         );
         return result.rows && result.rows.length === 1 ? Object.freeze({ owned: true }) : null;
-      });
-    } catch (_) {
-      return null;
-    }
+    });
   }
 
   const ownership = Object.freeze({

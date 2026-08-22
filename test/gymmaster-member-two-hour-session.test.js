@@ -43,7 +43,7 @@ test("opaque token is hashed, scoped, and accepted just before but not at expiry
   const db = pool(async (sql, values) => {
     if (sql.includes("INSERT INTO")) { stored = { hash: values[0], issued: values[3] }; return { rows: [] }; }
     const expires = new Date(stored.issued.getTime() + 7200000);
-    if (values[0] === stored.hash && values[1] < expires) return { rows: [{ auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] };
+    if (values[0] === stored.hash && values[1] < expires) return { rows: [{ member_session_id: "17", auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] };
     return { rows: [] };
   });
   const service = createGymMasterTwoHourSessionService({ db, now: () => clock, randomBytes: () => Buffer.alloc(32, 7) });
@@ -51,7 +51,8 @@ test("opaque token is hashed, scoped, and accepted just before but not at expiry
   assert.match(token, /^[A-Za-z0-9_-]{43}$/); assert.equal(stored.hash, tokenHash(token)); assert.notEqual(stored.hash, token);
   assert.equal(buildGymMasterTwoHourSessionCookie(token), `gc_member_session=${token}; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=7200`);
   assert.equal(clearGymMasterTwoHourSessionCookie(), "gc_member_session=; Path=/goalscoach; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
-  clock = new Date("2026-01-01T01:59:59.999Z"); assert.equal((await service.verify(token)).memberId, "9");
+  clock = new Date("2026-01-01T01:59:59.999Z");
+  assert.deepEqual(await service.verify(token), { authProvider: "gymmaster", authSubject: "gymmaster:7", mappingId: "5", memberId: "9", memberSessionId: "17" });
   clock = new Date("2026-01-01T02:00:00.000Z"); await assert.rejects(service.verify(token), /invalid or expired/);
   await assert.rejects(service.verify("malformed"), /invalid or expired/);
 });
@@ -77,13 +78,13 @@ test("issuance cancellation during an unresolved BEGIN discards the unsafe clien
 
 test("verification cancellation drains its server-bounded query, rolls back, and never authenticates", async () => {
   const active = deferred(); const queries = []; const releases = []; const route = operation(); const service = createGymMasterTwoHourSessionService({ db: { async connect() { return { query(sql) { queries.push(sql); if (sql.includes("UPDATE goals_coach_member_sessions session")) return active.promise; return Promise.resolve({ rows: [] }); }, release(error) { releases.push(error); } }; } } });
-  const pending = service.verify(Buffer.alloc(32, 3).toString("base64url"), route); while (!queries.some((sql) => sql.includes("UPDATE goals_coach_member_sessions session"))) await new Promise((resolve) => setImmediate(resolve)); route.terminalState.terminate("request_aborted", { responseAllowed: false }); active.resolve({ rows: [{ auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] }); await assert.rejects(pending);
+  const pending = service.verify(Buffer.alloc(32, 3).toString("base64url"), route); while (!queries.some((sql) => sql.includes("UPDATE goals_coach_member_sessions session"))) await new Promise((resolve) => setImmediate(resolve)); route.terminalState.terminate("request_aborted", { responseAllowed: false }); active.resolve({ rows: [{ member_session_id: "17", auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] }); await assert.rejects(pending);
   assert.equal(queries.includes("COMMIT"), false); assert.equal(queries.filter((sql) => sql === "ROLLBACK").length, 1); assert.deepEqual(releases, [undefined]);
 });
 
 test("successful verification derives PostgreSQL timeouts from one deadline and safely releases", async () => {
-  const queries = []; const releases = []; const service = createGymMasterTwoHourSessionService({ db: { async connect() { return { async query(sql, values) { queries.push({ sql, values }); if (sql.includes("UPDATE goals_coach_member_sessions session")) return { rows: [{ auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] }; return { rows: [] }; }, release(error) { releases.push(error); } }; } } });
-  assert.equal((await service.verify(Buffer.alloc(32, 4).toString("base64url"))).memberId, "9"); const timeoutQueries = queries.filter(({ sql }) => sql.includes("set_config")); assert.ok(timeoutQueries.length >= 3); assert.ok(timeoutQueries.every(({ values }) => /^[1-9]\d*ms$/.test(values[0]))); assert.deepEqual(releases, [undefined]);
+  const queries = []; const releases = []; const service = createGymMasterTwoHourSessionService({ db: { async connect() { return { async query(sql, values) { queries.push({ sql, values }); if (sql.includes("UPDATE goals_coach_member_sessions session")) return { rows: [{ member_session_id: "17", auth_mapping_id: "5", member_id: "9", auth_provider: "gymmaster", auth_subject: "gymmaster:7" }] }; return { rows: [] }; }, release(error) { releases.push(error); } }; } } });
+  assert.equal((await service.verify(Buffer.alloc(32, 4).toString("base64url"))).memberSessionId, "17"); const timeoutQueries = queries.filter(({ sql }) => sql.includes("set_config")); assert.ok(timeoutQueries.length >= 3); assert.ok(timeoutQueries.every(({ values }) => /^[1-9]\d*ms$/.test(values[0]))); assert.deepEqual(releases, [undefined]);
 });
 
 test("revocation failure rolls back before safely releasing a reusable client", async () => {
