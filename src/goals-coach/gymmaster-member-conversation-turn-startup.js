@@ -4,8 +4,8 @@ const { exactHttpsOrigin } = require("./gymmaster-member-login-route");
 const { createGymMasterMemberAuthorization } = require("./gymmaster-member-authorization");
 const { runBoundedPostgresTransaction } = require("./bounded-postgres-transaction");
 const {
-  createGymMasterMemberSessionAuthenticator,
-  createGymMasterMemberSessionService,
+  createGymMasterTwoHourSessionAuthenticator,
+  createGymMasterTwoHourSessionService,
   TWO_HOUR_SESSION_FLAG,
   twoHourSessionEnabled,
 } = require("./gymmaster-member-session");
@@ -53,9 +53,7 @@ function createGymMasterMemberConversationTurnStartup(options = {}) {
     activationPermitted: false, readOnly: true, externalCallsPermitted: false,
   });
   const origin = exactHttpsOrigin(environment.GOALS_COACH_MEMBER_LOGIN_ORIGIN);
-  const secret = environment.GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET;
-  if (!enabled || !origin || twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG])
-    || typeof secret !== "string" || secret.length < 32
+  if (!enabled || !origin || !twoHourSessionEnabled(environment[TWO_HOUR_SESSION_FLAG])
     || !options.db || typeof options.db.connect !== "function" || !validProvider(options.provider)
     || !validMemberConversationTurnOwnership(options.conversationOwnership)
     || !validCurrentMembership(options.currentMembership)
@@ -66,10 +64,19 @@ function createGymMasterMemberConversationTurnStartup(options = {}) {
   const timeoutMilliseconds = Number.isInteger(options.timeoutMilliseconds)
     && options.timeoutMilliseconds > 0 && options.timeoutMilliseconds <= MEMBER_CONVERSATION_TURN_TIMEOUT_MILLISECONDS
     ? options.timeoutMilliseconds : MEMBER_CONVERSATION_TURN_TIMEOUT_MILLISECONDS;
-  const sessionService = createGymMasterMemberSessionService({ secret, ...(options.now ? { now: options.now } : {}) });
+  const sessionService = createGymMasterTwoHourSessionService({
+    db: options.db,
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}),
+    databaseMilliseconds: timeoutMilliseconds,
+  });
   const authorization = createBoundedTurnAuthorization({ pool: options.db, timeoutMilliseconds });
   const router = createGymMasterMemberConversationTurnRouter({
-    authenticateSession: createGymMasterMemberSessionAuthenticator({ sessionService }),
+    authenticateSession: createGymMasterTwoHourSessionAuthenticator({
+      sessionService,
+      ...(options.monotonicNow ? { monotonicNow: options.monotonicNow } : {}),
+      overallMilliseconds: timeoutMilliseconds,
+    }),
     authorizeIdentity: authorization.authorizeIdentity, conversationOwnership: options.conversationOwnership,
     currentMembership: options.currentMembership, currentConsent: options.currentConsent,
     currentSafetyEligibility: options.currentSafetyEligibility,

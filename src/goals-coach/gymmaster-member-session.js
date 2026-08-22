@@ -229,14 +229,17 @@ function createGymMasterTwoHourSessionService(options = {}) {
           AND mapping.active = TRUE
           AND session.revoked_at IS NULL
           AND session.expires_at > $2
-      RETURNING session.auth_mapping_id, session.member_id,
+      RETURNING session.id AS member_session_id,
+                session.auth_mapping_id, session.member_id,
                 mapping.auth_provider, mapping.auth_subject`,
       [tokenHash(token), now()]
     ), operation);
     const row = result && result.rows && result.rows[0];
     if (!row || row.auth_provider !== "gymmaster") throw sessionError();
+    if (!/^[1-9]\d*$/.test(String(row.member_session_id))) throw sessionError();
     return Object.freeze({ authProvider: row.auth_provider, authSubject: row.auth_subject,
-      mappingId: String(row.auth_mapping_id), memberId: String(row.member_id) });
+      mappingId: String(row.auth_mapping_id), memberId: String(row.member_id),
+      memberSessionId: String(row.member_session_id) });
   }
 
   async function revoke(token, operation) {

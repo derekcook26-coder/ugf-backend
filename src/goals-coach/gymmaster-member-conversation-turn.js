@@ -83,6 +83,15 @@ function validAuthorization(value) {
     && DATABASE_ID.test(String(value.mappingId)) && DATABASE_ID.test(String(value.memberId)));
 }
 
+function validDurableSessionIdentity(identity, authorization) {
+  return Boolean(identity
+    && DATABASE_ID.test(String(identity.memberSessionId))
+    && DATABASE_ID.test(String(identity.mappingId))
+    && DATABASE_ID.test(String(identity.memberId))
+    && String(identity.mappingId) === String(authorization.mappingId)
+    && String(identity.memberId) === String(authorization.memberId));
+}
+
 function validProvider(provider) {
   return Boolean(provider
     && provider.contractVersion === MEMBER_CONVERSATION_TURN_CONTRACT_VERSION
@@ -130,6 +139,7 @@ function createConversationTurnRequestHandler(options = {}) {
         const authorization = await authorizeIdentity(req.alphaMemberIdentity, context);
         requireActive(context);
         if (!validAuthorization(authorization)) return { concealed: true };
+        if (!validDurableSessionIdentity(req.alphaMemberIdentity, authorization)) return { concealed: true };
         const membership = await currentMembership.verify(Object.freeze({
           memberId: String(authorization.memberId),
           identity: req.alphaMemberIdentity,
@@ -144,8 +154,11 @@ function createConversationTurnRequestHandler(options = {}) {
           terminalState: context.terminalState, outerDeadlineNs: context.outerDeadlineNs,
         });
         const ownership = await conversationOwnership.authorize(Object.freeze({
+          authMappingId: String(authorization.mappingId),
           memberId: providerContext.memberId,
+          memberSessionId: String(req.alphaMemberIdentity.memberSessionId),
           conversation: request.conversation,
+        }), Object.freeze({
           signal: context.signal,
           terminalState: context.terminalState,
           outerDeadlineNs: context.outerDeadlineNs,
@@ -254,4 +267,5 @@ module.exports = {
   requireActive,
   validProvider,
   validProviderAcceptance,
+  validDurableSessionIdentity,
 };
