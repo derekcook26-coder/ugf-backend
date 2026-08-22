@@ -1,0 +1,50 @@
+{
+  "corpusVersion": "GC-MEMBER-CONVERSATION-TURN-CORPUS-1",
+  "valid": {
+    "unsafeRequest": {
+      "contractVersion": "GC-MEMBER-CONVERSATION-TURN-1",
+      "requestId": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+      "idempotencyKey": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+      "conversation": {
+        "reference": "123e4567-e89b-42d3-a456-426614174000",
+        "version": 1,
+        "provenance": "member_session"
+      },
+      "memberText": "My knee feels sharp and unstable."
+    },
+    "safeRequest": {
+      "contractVersion": "GC-MEMBER-CONVERSATION-TURN-1",
+      "requestId": "018f47f2-a3b4-4c5d-8e6f-0123456789ac",
+      "idempotencyKey": "018f47f2-a3b4-4c5d-8e6f-0123456789ac",
+      "conversation": {
+        "reference": "123e4567-e89b-42d3-a456-426614174000",
+        "version": 1,
+        "provenance": "member_session"
+      },
+      "memberText": "I completed ten comfortable minutes."
+    },
+    "responses": {
+      "blocked": {
+        "contractVersion": "GC-MEMBER-CONVERSATION-TURN-1",
+        "requestId": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+        "idempotencyKey": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+        "conversation": { "reference": "123e4567-e89b-42d3-a456-426614174000", "version": 1, "provenance": "member_session" },
+        "result": { "state": "blocked", "reason": "safety_stop", "safety": { "ruleVersion": "GC-MEMBER-CONVERSATION-SAFETY-1", "sourceRuleVersion": "GC-MEMBER-CONVERSATION-SAFETY-RULES-1", "requestHash": "695cb92f8808bd849d68f6fe47ae553c15bcf11742bc1dd0f314d8cd186085a1", "classification": "pain_or_instability", "action": "stop" } }
+      },
+      "safe": {
+        "contractVersion": "GC-MEMBER-CONVERSATION-TURN-1",
+        "requestId": "018f47f2-a3b4-4c5d-8e6f-0123456789ac",
+        "idempotencyKey": "018f47f2-a3b4-4c5d-8e6f-0123456789ac",
+        "conversation": { "reference": "123e4567-e89b-42d3-a456-426614174000", "version": 1, "provenance": "member_session" },
+        "result": { "state": "safe_to_process", "reason": null, "safety": { "ruleVersion": "GC-MEMBER-CONVERSATION-SAFETY-1", "sourceRuleVersion": "GC-MEMBER-CONVERSATION-SAFETY-RULES-1", "requestHash": "27ce74d2db2ac9d36eeb044cf20a3f075ebb32912ecde9fa0faca46bf03cf7a0", "classification": "clear", "action": "allow_provider_processing" } }
+      },
+      "unavailable": {
+        "contractVersion": "GC-MEMBER-CONVERSATION-TURN-1",
+        "requestId": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+        "idempotencyKey": "018f47f2-a3b4-4c5d-8e6f-0123456789ab",
+        "conversation": { "reference": "123e4567-e89b-42d3-a456-426614174000", "version": 1, "provenance": "member_session" },
+        "result": { "state": "unavailable", "reason": "provider_unavailable", "safety": { "ruleVersion": "GC-MEMBER-CONVERSATION-SAFETY-1", "sourceRuleVersion": "GC-MEMBER-CONVERSATION-SAFETY-RULES-1", "requestHash": "695cb92f8808bd849d68f6fe47ae553c15bcf11742bc1dd0f314d8cd186085a1", "classification": "unavailable", "action": "unavailable" } }
+      }
+    }
+  }
+}

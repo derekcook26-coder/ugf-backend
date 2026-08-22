@@ -7,10 +7,13 @@ const {
 const {
   MEMBER_COACHING_CONSENT_NOTICE_VERSION,
 } = require("./gymmaster-member-coaching-consent");
+const {
+  MEMBER_CONVERSATION_TURN_CONTRACT_VERSION,
+} = require("./member-conversation-turn-contract");
 
 const MEMBER_BOOTSTRAP_CONTRACT_VERSION = "GC-MEMBER-BOOTSTRAP-1";
 const MEMBER_TODAY_CONTRACT_VERSION = "GC-MEMBER-TODAY-1";
-const MEMBER_CONVERSATION_CONTRACT_VERSION = "GC-PHASE1B-CONTRACT-1";
+const MEMBER_CONVERSATION_CONTRACT_VERSION = MEMBER_CONVERSATION_TURN_CONTRACT_VERSION;
 const MEMBER_BOOTSTRAP_MAXIMUM_BYTES = 2048;
 const ACCESS_CLASS = "authenticated_member";
 const CAPABILITY_NAMES = Object.freeze(["consent", "safety", "workout", "conversation"]);

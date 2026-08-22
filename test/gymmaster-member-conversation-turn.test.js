@@ -1,0 +1,367 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const test = require("node:test");
+const { EventEmitter } = require("node:events");
+const express = require("express");
+const corpus = require("./fixtures/member-conversation-turn-v1.json");
+const {
+  MEMBER_CONVERSATION_TURN_FLAG,
+  createConversationTurnRequestHandler,
+  memberConversationTurnEnabled,
+} = require("../src/goals-coach/gymmaster-member-conversation-turn");
+const { createGymMasterMemberConversationTurnStartup } = require("../src/goals-coach/gymmaster-member-conversation-turn-startup");
+const { createMemberConversationTurnSafetyClassifier } = require("../src/goals-coach/member-conversation-turn-safety");
+const { composeGymMasterMemberConversationTurnRoute } = require("../src/goals-coach/gymmaster-member-conversation-turn-route-composition");
+const { createGymMasterMemberSessionService, SESSION_COOKIE_NAME } = require("../src/goals-coach/gymmaster-member-session");
+const { jsonRequest, startApp } = require("./helpers/http-app");
+
+const origin = "https://coach.example";
+const secret = "synthetic-conversation-session-secret-123456";
+const now = new Date("2026-08-21T12:00:00Z");
+const passRateLimit = (_req, _res, next) => next();
+function deferred() { let resolve; const promise = new Promise((next) => { resolve = next; }); return { promise, resolve }; }
+function mockExchange(body = corpus.valid.safeRequest) {
+  let writes = 0; const statuses = []; const bodies = [];
+  const req = Object.assign(new EventEmitter(), {
+    query: {}, body: structuredClone(body), complete: true,
+    aborted: false, destroyed: false,
+    alphaMemberIdentity: { authProvider: "gymmaster", authSubject: "gymmaster:10482" },
+  });
+  const res = Object.assign(new EventEmitter(), {
+    headersSent: false, writableEnded: false, destroyed: false, closed: false,
+    status(value) { writes += 1; statuses.push(value); return this; },
+    json(value) { writes += 1; bodies.push(value); return this; },
+  });
+  return { req, res, statuses, bodies, writes: () => writes };
+}
+function environment(value = "true") {
+  return { [MEMBER_CONVERSATION_TURN_FLAG]: value, GOALS_COACH_MEMBER_LOGIN_ORIGIN: origin, GOALS_COACH_MEMBER_LOGIN_SESSION_SECRET: secret };
+}
+function cookie(subject = "gymmaster:10482") {
+  const token = createGymMasterMemberSessionService({ secret, now: () => now }).issue({ authProvider: "gymmaster", authSubject: subject, expiresInSeconds: 900 });
+  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`;
+}
+function database(rows = [{ mapping_id: 9, member_id: 10482 }], events = {}) {
+  return { async connect() { return { async query(sql) {
+    events.queries?.push(String(sql));
+    if (/^(?:BEGIN|COMMIT|ROLLBACK)|set_config\('/.test(String(sql))) return { rows: [] };
+    return { rows };
+  }, release(error) { events.releases?.push(error); } }; } };
+}
+function provider(overrides = {}) {
+  return {
+    contractVersion: "GC-MEMBER-CONVERSATION-TURN-1",
+    cancellationMode: "abort_signal_required",
+    persistencePermitted: false,
+    externalCallsPermitted: false,
+    async processTurn() { return { accepted: true }; },
+    ...overrides,
+  };
+}
+function conversationOwnership(overrides = {}) {
+  return Object.freeze({
+    contractVersion: "GC-MEMBER-CONVERSATION-TURN-1",
+    providerFree: true,
+    readOnly: true,
+    concealUnknown: true,
+    exactConversationBinding: true,
+    async authorize({ memberId, conversation }) {
+      return memberId === "10482" && conversation.reference === corpus.valid.safeRequest.conversation.reference
+        && conversation.version === 1 && conversation.provenance === "member_session" ? { owned: true } : null;
+    },
+    ...overrides,
+  });
+}
+function idempotency() {
+  const entries = new Map();
+  return Object.freeze({
+    contractVersion: "GC-MEMBER-CONVERSATION-TURN-1",
+    conflictMode: "reject_exact_key_signature_mismatch",
+    replayMode: "replay_exact_result",
+    persistenceMode: "required_external_dependency",
+    async execute({ key, signature, operation }) {
+      const existing = entries.get(key);
+      if (existing && existing.signature !== signature) throw new Error("idempotency conflict");
+      if (existing) return existing.promise;
+      const promise = Promise.resolve().then(operation);
+      entries.set(key, { signature, promise });
+      try { return await promise; }
+      catch (error) { entries.delete(key); throw error; }
+    },
+  });
+}
+function startup(overrides = {}) {
+  return createGymMasterMemberConversationTurnStartup({
+    environment: environment(), now: () => now, db: database(), conversationOwnership: conversationOwnership(), idempotency: idempotency(),
+    provider: provider(), safetyClassifier: createMemberConversationTurnSafetyClassifier(),
+    rateLimit: passRateLimit, ...overrides,
+  });
+}
+async function application(value) {
+  const app = express(); const created = value || startup();
+  const composition = composeGymMasterMemberConversationTurnRoute(app, created);
+  return { app, startup: created, composition };
+}
+
+test("turn flag is exact and default or provider-null production startup mounts no route", async (t) => {
+  for (const value of [undefined, "", "TRUE", " true", "true ", true]) assert.equal(memberConversationTurnEnabled(value), false);
+  assert.equal(memberConversationTurnEnabled("true"), true);
+  const disabled = createGymMasterMemberConversationTurnStartup({ environment: {}, db: database(), provider: provider() });
+  const notReady = createGymMasterMemberConversationTurnStartup({ environment: environment(), db: database(), provider: null });
+  assert.equal(disabled.status, "disabled"); assert.equal(notReady.status, "not_ready");
+  const { app, composition } = await application(notReady); assert.deepEqual(composition, { mounted: false, path: null });
+  const running = await startApp(app); t.after(() => running.close());
+  assert.equal((await jsonRequest(running.url, "/goalscoach/member/conversation/turn", { method: "POST", body: corpus.valid.safeRequest })).response.status, 404);
+});
+
+test("authenticated exact-origin turn is read-only, minimized, and idempotent", async (t) => {
+  const queries = []; const releases = [];
+  let processCalls = 0;
+  const deterministic = provider({ async processTurn() { processCalls += 1; return { accepted: true }; } });
+  const { app } = await application(startup({ db: database(undefined, { queries, releases }), provider: deterministic }));
+  const running = await startApp(app); t.after(() => running.close());
+  for (let index = 0; index < 2; index += 1) {
+    const result = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", {
+      method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: corpus.valid.safeRequest,
+    });
+    assert.equal(result.response.status, 200); assert.deepEqual(result.body, corpus.valid.responses.safe);
+    assert.equal(result.response.headers.get("cache-control"), "no-store");
+    assert.equal(JSON.stringify(result.body).includes("10482"), false);
+  }
+  assert.equal(queries.filter((value) => value === "BEGIN READ ONLY").length, 2);
+  assert.deepEqual(releases, [undefined, undefined]);
+  assert.equal(processCalls, 1);
+  const conflict = structuredClone(corpus.valid.safeRequest); conflict.memberText = "A different payload under the same key.";
+  const rejected = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", {
+    method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: conflict,
+  });
+  assert.equal(rejected.response.status, 503);
+});
+
+test("deterministic safety stops unsafe and ambiguous text before any provider method", async (t) => {
+  let ownershipCalls = 0; let processCalls = 0;
+  const turnProvider = provider({
+    async processTurn() { processCalls += 1; return { accepted: true }; },
+  });
+  const { app } = await application(startup({
+    conversationOwnership: conversationOwnership({ async authorize() { ownershipCalls += 1; return { owned: true }; } }),
+    provider: turnProvider,
+  }));
+  const running = await startApp(app); t.after(() => running.close());
+  for (const [index, memberText] of [
+    corpus.valid.unsafeRequest.memberText,
+    "My knee has concerning discomfort.",
+    "I cannot tell whether this is pain.",
+  ].entries()) {
+    const request = structuredClone(corpus.valid.unsafeRequest);
+    request.memberText = memberText;
+    if (index) request.requestId = request.idempotencyKey = `018f47f2-a3b4-4c5d-8e6f-0123456789a${index}`;
+    const result = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", {
+      method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: request,
+    });
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.result.state, "blocked");
+    assert.equal(result.body.result.safety.action, "stop");
+  }
+  assert.equal(ownershipCalls, 3);
+  assert.equal(processCalls, 0);
+});
+
+test("origin, session, mapping, and conversation ownership fail closed", async (t) => {
+  let ownershipCalls = 0;
+  const { app } = await application(startup({
+    conversationOwnership: conversationOwnership({ async authorize() { ownershipCalls += 1; return null; } }),
+  }));
+  const running = await startApp(app); t.after(() => running.close());
+  const cases = [
+    { headers: { Origin: "https://wrong.example", Cookie: cookie() }, expected: 403 },
+    { headers: { Origin: origin }, expected: 401 },
+    { headers: { Origin: origin, Cookie: `${SESSION_COOKIE_NAME}=forged` }, expected: 401 },
+    { headers: { Origin: origin, Cookie: cookie() }, expected: 404 },
+  ];
+  for (const item of cases) {
+    const result = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", { method: "POST", headers: item.headers, body: corpus.valid.safeRequest });
+    assert.equal(result.response.status, item.expected);
+  }
+  assert.equal(ownershipCalls, 1);
+});
+
+test("unknown, cross-member, and stale conversations are concealed before every safety outcome", async (t) => {
+  const cases = [
+    { name: "unsafe unknown", text: corpus.valid.unsafeRequest.memberText, reference: "123e4567-e89b-42d3-a456-426614174011", version: 1 },
+    { name: "ambiguous cross-member", text: "My knee has concerning discomfort.", reference: "123e4567-e89b-42d3-a456-426614174012", version: 1 },
+    { name: "unavailable stale", text: "I cannot tell whether this is pain.", reference: corpus.valid.safeRequest.conversation.reference, version: 2 },
+    { name: "safe unknown", text: corpus.valid.safeRequest.memberText, reference: "123e4567-e89b-42d3-a456-426614174013", version: 1 },
+  ];
+  let classifyCalls = 0; let processCalls = 0;
+  const classifier = {
+    ...createMemberConversationTurnSafetyClassifier(),
+    async classify() { classifyCalls += 1; throw new Error("Safety must not attest an unowned conversation"); },
+  };
+  const { app } = await application(startup({
+    conversationOwnership: conversationOwnership({ async authorize() { return null; } }),
+    provider: provider({ async processTurn() { processCalls += 1; return { accepted: true }; } }),
+    safetyClassifier: classifier,
+  }));
+  const running = await startApp(app); t.after(() => running.close());
+  for (const [index, item] of cases.entries()) {
+    const request = structuredClone(corpus.valid.safeRequest);
+    request.requestId = request.idempotencyKey = `018f47f2-a3b4-4c5d-8e6f-0123456789b${index}`;
+    request.memberText = item.text;
+    request.conversation = { reference: item.reference, version: item.version, provenance: "member_session" };
+    const result = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", {
+      method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: request,
+    });
+    assert.equal(result.response.status, 404, item.name);
+    assert.deepEqual(result.body, { error: "MEMBER_CONVERSATION_NOT_FOUND" }, item.name);
+    assert.equal(JSON.stringify(result.body).includes("safety"), false, item.name);
+  }
+  assert.equal(classifyCalls, 0);
+  assert.equal(processCalls, 0);
+});
+
+test("malformed, provider failure, and live deadline are generic and late settlement is silent", async (t) => {
+  for (const [turnProvider, expected] of [
+    [provider({ async processTurn() { throw new Error("synthetic provider detail"); } }), 503],
+    [provider({ async processTurn() { return new Promise(() => {}); } }), 503],
+  ]) {
+    const { app } = await application(startup({ provider: turnProvider, timeoutMilliseconds: 5 }));
+    const running = await startApp(app); t.after(() => running.close());
+    const result = await jsonRequest(running.url, "/goalscoach/member/conversation/turn", { method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: corpus.valid.safeRequest });
+    assert.equal(result.response.status, expected); assert.deepEqual(result.body, { error: "MEMBER_CONVERSATION_TURN_UNAVAILABLE" });
+  }
+  const { app } = await application(); const running = await startApp(app); t.after(() => running.close());
+  const expanded = structuredClone(corpus.valid.safeRequest); expanded.memberId = "10482";
+  assert.equal((await jsonRequest(running.url, "/goalscoach/member/conversation/turn", { method: "POST", headers: { Origin: origin, Cookie: cookie() }, body: expanded })).response.status, 400);
+});
+
+test("credentialed preflight exposes only POST and Content-Type from the exact origin", async (t) => {
+  const { app } = await application(); const running = await startApp(app); t.after(() => running.close());
+  const preflight = await fetch(`${running.url}/goalscoach/member/conversation/turn`, {
+    method: "OPTIONS",
+    headers: { Origin: origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "Content-Type" },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+  assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
+  assert.equal(preflight.headers.get("access-control-allow-methods"), "POST,OPTIONS");
+  assert.equal(preflight.headers.get("access-control-allow-headers"), "Content-Type");
+  assert.equal((await fetch(`${running.url}/goalscoach/member/conversation/turn`, { headers: { Origin: origin } })).status, 404);
+});
+
+test("request abort revokes response authority and aborts provider work before late settlement", async () => {
+  const late = deferred(); let providerSignal; let writes = 0;
+  const handler = createConversationTurnRequestHandler({
+    authorizeIdentity: async () => ({ active: true, mappingId: 9, memberId: 10482 }),
+    conversationOwnership: conversationOwnership(),
+    idempotency: idempotency(),
+    provider: provider({
+      async processTurn({ signal }) { providerSignal = signal; return late.promise; },
+    }),
+    safetyClassifier: createMemberConversationTurnSafetyClassifier(),
+    timeoutMilliseconds: 100,
+  });
+  const req = Object.assign(new EventEmitter(), {
+    query: {}, body: structuredClone(corpus.valid.safeRequest), complete: false,
+    aborted: false, destroyed: false,
+    alphaMemberIdentity: { authProvider: "gymmaster", authSubject: "gymmaster:10482" },
+  });
+  const res = Object.assign(new EventEmitter(), {
+    headersSent: false, writableEnded: false, destroyed: false, closed: false,
+    status() { writes += 1; return this; }, json() { writes += 1; return this; },
+  });
+  const pending = handler(req, res);
+  await new Promise((resolve) => setImmediate(resolve));
+  req.aborted = true; req.emit("aborted");
+  assert.equal(await pending, undefined);
+  assert.equal(providerSignal.aborted, true);
+  late.resolve({ accepted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writes, 0);
+  assert.equal(req.listenerCount("aborted"), 0);
+  assert.equal(res.listenerCount("close"), 0);
+});
+
+test("late authorization cannot advance into ownership after abort or deadline", async () => {
+  for (const mode of ["abort", "deadline"]) {
+    const authorization = deferred(); let ownershipCalls = 0;
+    const exchange = mockExchange();
+    const handler = createConversationTurnRequestHandler({
+      authorizeIdentity: async () => authorization.promise,
+      conversationOwnership: conversationOwnership({ async authorize() { ownershipCalls += 1; return { owned: true }; } }),
+      idempotency: idempotency(),
+      provider: provider(),
+      safetyClassifier: createMemberConversationTurnSafetyClassifier(),
+      timeoutMilliseconds: 5,
+    });
+    const pending = handler(exchange.req, exchange.res);
+    if (mode === "abort") {
+      exchange.req.complete = false; exchange.req.aborted = true; exchange.req.emit("aborted");
+      assert.equal(await pending, undefined);
+    } else {
+      const keepAlive = setTimeout(() => {}, 50);
+      await pending;
+      clearTimeout(keepAlive);
+      assert.deepEqual(exchange.statuses, [503]);
+      assert.deepEqual(exchange.bodies, [{ error: "MEMBER_CONVERSATION_TURN_UNAVAILABLE" }]);
+    }
+    authorization.resolve({ active: true, mappingId: 9, memberId: 10482 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ownershipCalls, 0);
+    assert.equal(exchange.req.listenerCount("aborted"), 0);
+    assert.equal(exchange.res.listenerCount("close"), 0);
+  }
+});
+
+test("late ownership cannot advance into safety or processing after abort, deadline, or an unowned result", async () => {
+  for (const mode of ["abort-true", "abort-false", "deadline-true", "deadline-false"]) {
+    const ownership = deferred(); const ownershipStarted = deferred(); let processCalls = 0;
+    const exchange = mockExchange();
+    const handler = createConversationTurnRequestHandler({
+      authorizeIdentity: async () => ({ active: true, mappingId: 9, memberId: 10482 }),
+      conversationOwnership: conversationOwnership({
+        async authorize() { ownershipStarted.resolve(); return ownership.promise; },
+      }),
+      idempotency: idempotency(),
+      provider: provider({ async processTurn() { processCalls += 1; return { accepted: true }; } }),
+      safetyClassifier: createMemberConversationTurnSafetyClassifier(),
+      timeoutMilliseconds: 5,
+    });
+    const pending = handler(exchange.req, exchange.res);
+    await ownershipStarted.promise;
+    if (mode.startsWith("abort")) {
+      exchange.req.complete = false; exchange.req.aborted = true; exchange.req.emit("aborted");
+      assert.equal(await pending, undefined);
+    } else {
+      const keepAlive = setTimeout(() => {}, 50);
+      await pending;
+      clearTimeout(keepAlive);
+      assert.deepEqual(exchange.statuses, [503]);
+      assert.deepEqual(exchange.bodies, [{ error: "MEMBER_CONVERSATION_TURN_UNAVAILABLE" }]);
+    }
+    ownership.resolve(mode.endsWith("false") ? null : { owned: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(processCalls, 0);
+    assert.equal(exchange.req.listenerCount("aborted"), 0);
+    assert.equal(exchange.res.listenerCount("close"), 0);
+  }
+});
+
+test("production imports no fixture or deterministic provider and bootstrap receives only null-provider startup", () => {
+  const paths = [path.join(__dirname, "../server.js"), ...fs.readdirSync(path.join(__dirname, "../src/goals-coach"))
+    .filter((name) => name.includes("conversation-turn") && name.endsWith(".js"))
+    .map((name) => path.join(__dirname, "../src/goals-coach", name))];
+  for (const file of paths) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.equal(source.includes("test/fixtures"), false);
+    assert.equal(source.includes("member-conversation-turn-v1.json"), false);
+  }
+  const server = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?provider:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /createGymMasterMemberConversationTurnStartup\(\{[\s\S]*?conversationOwnership:\s*null[\s\S]*?\}\)/);
+  assert.match(server, /conversationStartup:\s*memberConversationTurnStartup/);
+  assert.equal(server.slice(server.indexOf("var memberConversationTurnStartup ="), server.indexOf("composeGymMasterMemberConversationTurnRoute(app")).includes("phase1bStartup"), false);
+});
