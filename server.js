@@ -45,6 +45,8 @@ var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach
 var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
 var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
 var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
+var { createPublicHelpChatStartup } = require("./src/goals-coach/ugf-public-help-chat-startup");
+var { composePublicHelpChatRoute } = require("./src/goals-coach/ugf-public-help-chat-route-composition");
   var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
   var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
   var { createGymMasterMemberConversationTurnStartup } = require("./src/goals-coach/gymmaster-member-conversation-turn-startup");
@@ -126,6 +128,11 @@ var db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// Public help is separately gated and deterministic. It has no database,
+// member-session, payment, GymMaster API, Goals Coach, or AI-provider access.
+var publicHelpChatStartup = createPublicHelpChatStartup();
+composePublicHelpChatRoute(app, publicHelpChatStartup);
 
 // The member private shell is separately gated and performs no work at startup.
 // It revalidates the signed session, local mapping, and Gatekeeper membership
