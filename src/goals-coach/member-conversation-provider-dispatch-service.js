@@ -7,9 +7,23 @@ const {
   monotonicNow,
   runBoundedPostgresTransaction,
 } = require("./bounded-postgres-transaction");
+const {
+  validCurrentConsent,
+  validCurrentConsentResult,
+  validCurrentMembership,
+  validCurrentMembershipResult,
+  validCurrentSafetyEligibility,
+  validCurrentSafetyEligibilityResult,
+} = require("./member-conversation-turn-prerequisites");
+const {
+  validConversationOwnershipResult,
+  validMemberConversationTurnOwnership,
+} = require("./member-conversation-turn-ownership");
 
 const MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION =
   "GC-MEMBER-CONVERSATION-PROVIDER-DISPATCH-1";
+const MEMBER_CONVERSATION_PROVIDER_DISPATCH_AUTHORIZATION_VERSION =
+  "GC-MEMBER-CONVERSATION-PROVIDER-DISPATCH-AUTHORIZATION-1";
 const MEMBER_CONVERSATION_PROVIDER_CONTRACT_VERSION =
   "GC-MEMBER-CONVERSATION-PROVIDER-1";
 const MEMBER_CONVERSATION_TURN_CONTRACT_VERSION =
@@ -21,6 +35,7 @@ const MEMBER_CONVERSATION_SAFETY_SOURCE_RULE_VERSION =
 const MEMBER_CONVERSATION_PROVIDER_DISPATCH_TIMEOUT_MILLISECONDS = 5000;
 const MEMBER_CONVERSATION_PROVIDER_DISPATCH_LEASE_MILLISECONDS = 30000;
 const MEMBER_CONVERSATION_PROVIDER_RECONCILIATION_MILLISECONDS = 30000;
+const PRE_DISPATCH_AUTHORIZATION_BRAND = Symbol("preDispatchAuthorization");
 const DATABASE_ID = /^[1-9]\d{0,18}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -45,6 +60,9 @@ const REJECTION_CATEGORIES = Object.freeze([
   "authentication_rejected",
   "rate_limited",
   "request_rejected",
+]);
+const AUTHORIZATION_KEYS = Object.freeze([
+  "authMappingId", "conversation", "memberId", "memberSessionId",
 ]);
 
 class MemberConversationProviderDispatchError extends Error {
@@ -107,6 +125,24 @@ function parseAttemptInput(value) {
   return reservation && attemptId ? Object.freeze({ reservation, attemptId }) : null;
 }
 
+function parseAuthorizationInput(value) {
+  if (!exactKeys(value, AUTHORIZATION_KEYS)
+    || !exactKeys(value.conversation, CONVERSATION_KEYS)) return null;
+  const parsed = Object.freeze({
+    authMappingId: databaseId(value.authMappingId),
+    conversation: Object.freeze({
+      provenance: value.conversation.provenance,
+      reference: exactString(value.conversation.reference, UUID),
+      version: value.conversation.version,
+    }),
+    memberId: databaseId(value.memberId),
+    memberSessionId: databaseId(value.memberSessionId),
+  });
+  return parsed.authMappingId && parsed.memberId && parsed.memberSessionId
+    && parsed.conversation.reference && parsed.conversation.version === 1
+    && parsed.conversation.provenance === "member_session" ? parsed : null;
+}
+
 function parseRejectionInput(value) {
   if (!exactKeys(value, REJECTION_KEYS)) return null;
   const attempt = parseAttemptInput(Object.fromEntries(
@@ -151,6 +187,75 @@ function requireActive(context) {
   if (!context.terminalState.isTerminal()
     && !(context.signal && context.signal.aborted === true)) return;
   throw new MemberConversationProviderDispatchError("operation_terminal");
+}
+
+function requireAuthorizationActive(operation) {
+  if (!(operation.terminalState && operation.terminalState.isTerminal())
+    && !(operation.signal && operation.signal.aborted === true)) return;
+  throw new MemberConversationProviderDispatchError("operation_terminal");
+}
+
+function validPreDispatchAuthorization(value) {
+  return Boolean(value
+    && value[PRE_DISPATCH_AUTHORIZATION_BRAND] === true
+    && value.contractVersion === MEMBER_CONVERSATION_PROVIDER_DISPATCH_AUTHORIZATION_VERSION
+    && value.providerFree === true
+    && value.readOnly === true
+    && value.currentAuthorizationRequired === true
+    && typeof value.authorize === "function");
+}
+
+function createMemberConversationProviderDispatchAuthorization(options = {}) {
+  if (!validCurrentMembership(options.currentMembership)
+    || !validCurrentConsent(options.currentConsent)
+    || !validCurrentSafetyEligibility(options.currentSafetyEligibility)
+    || !validMemberConversationTurnOwnership(options.conversationOwnership)) {
+    throw new Error("Provider dispatch authorization requires exact current prerequisites");
+  }
+  async function authorize(inputValue, operation = {}) {
+    const input = parseAuthorizationInput(inputValue);
+    if (!input) return null;
+    requireAuthorizationActive(operation);
+    const identity = Object.freeze({
+      authProvider: "gymmaster",
+      authSubject: `gymmaster:${input.memberId}`,
+      mappingId: input.authMappingId,
+      memberId: input.memberId,
+      memberSessionId: input.memberSessionId,
+    });
+    const shared = Object.freeze({
+      signal: operation.signal,
+      terminalState: operation.terminalState,
+      outerDeadlineNs: operation.outerDeadlineNs,
+    });
+    const membership = await options.currentMembership.verify(Object.freeze({
+      ...shared, identity, memberId: input.memberId,
+    }));
+    requireAuthorizationActive(operation);
+    if (!validCurrentMembershipResult(membership)) return null;
+    const ownership = await options.conversationOwnership.authorize(Object.freeze(input), shared);
+    requireAuthorizationActive(operation);
+    if (!validConversationOwnershipResult(ownership)) return null;
+    const prerequisite = Object.freeze({
+      ...shared, mappingId: input.authMappingId, memberId: input.memberId,
+    });
+    const consent = await options.currentConsent.verify(prerequisite);
+    requireAuthorizationActive(operation);
+    if (!validCurrentConsentResult(consent)) return null;
+    const safety = await options.currentSafetyEligibility.verify(prerequisite);
+    requireAuthorizationActive(operation);
+    return validCurrentSafetyEligibilityResult(safety)
+      ? Object.freeze({ authorized: true }) : null;
+  }
+  const result = {
+    authorize,
+    contractVersion: MEMBER_CONVERSATION_PROVIDER_DISPATCH_AUTHORIZATION_VERSION,
+    currentAuthorizationRequired: true,
+    providerFree: true,
+    readOnly: true,
+  };
+  Object.defineProperty(result, PRE_DISPATCH_AUTHORIZATION_BRAND, { value: true });
+  return Object.freeze(result);
 }
 
 function acceptedCause(error) {
@@ -222,6 +327,8 @@ function createMemberConversationProviderDispatchService(options = {}) {
     monotonicNow: typeof options.monotonicNow === "function" ? options.monotonicNow : monotonicNow,
     timeoutMilliseconds,
   });
+  const preDispatchAuthorization = validPreDispatchAuthorization(options.preDispatchAuthorization)
+    ? options.preDispatchAuthorization : null;
 
   async function transact(operation, readOnly, work) {
     const context = createOperationContext(runtime, operation);
@@ -377,16 +484,63 @@ function createMemberConversationProviderDispatchService(options = {}) {
   async function startDispatch(inputValue, operation = {}) {
     const input = parseAttemptInput(inputValue);
     if (!input) throw new MemberConversationProviderDispatchError("invalid_attempt_input");
-    return transact(operation, false, async ({ query }) => {
-      const reservation = await exactReservation(query, input.reservation, true);
-      return appendEvent(query, reservation.id, {
-        attemptId: input.attemptId,
-        clientRequestId: input.attemptId,
-        eventType: "dispatch_started",
-        providerContractVersion: MEMBER_CONVERSATION_PROVIDER_CONTRACT_VERSION,
-        reconciliationMilliseconds,
-      });
+    if (!preDispatchAuthorization) {
+      throw new MemberConversationProviderDispatchError("authorization_unavailable");
+    }
+    const context = createOperationContext(runtime, operation);
+    const sharedOperation = Object.freeze({
+      signal: context.signal,
+      terminalState: context.terminalState,
+      outerDeadlineNs: context.outerDeadlineNs,
     });
+    try {
+      const authorizationInput = await transact(sharedOperation, true, async ({ query }) => {
+        const reservation = await exactReservation(query, input.reservation, false);
+        const result = await query(
+          `SELECT binding.member_id,binding.auth_mapping_id,binding.member_session_id
+             FROM goals_coach_member_conversation_bindings binding
+            WHERE binding.id=$1
+              AND binding.conversation_reference=$2::uuid
+              AND binding.conversation_version=$3
+              AND binding.provenance=$4`,
+          [
+            reservation.conversation_binding_id,
+            input.reservation.conversation.reference,
+            input.reservation.conversation.version,
+            input.reservation.conversation.provenance,
+          ]
+        );
+        const row = result.rows && result.rows[0];
+        if (!row) throw new MemberConversationProviderDispatchError("authorization_unavailable");
+        return Object.freeze({
+          authMappingId: String(row.auth_mapping_id),
+          conversation: input.reservation.conversation,
+          memberId: String(row.member_id),
+          memberSessionId: String(row.member_session_id),
+        });
+      });
+      const authorized = await preDispatchAuthorization.authorize(
+        authorizationInput,
+        sharedOperation
+      );
+      requireAuthorizationActive(sharedOperation);
+      if (!authorized || typeof authorized !== "object" || Array.isArray(authorized)
+        || Object.keys(authorized).length !== 1 || authorized.authorized !== true) {
+        throw new MemberConversationProviderDispatchError("authorization_unavailable");
+      }
+      return await transact(sharedOperation, false, async ({ query }) => {
+        const reservation = await exactReservation(query, input.reservation, true);
+        return appendEvent(query, reservation.id, {
+          attemptId: input.attemptId,
+          clientRequestId: input.attemptId,
+          eventType: "dispatch_started",
+          providerContractVersion: MEMBER_CONVERSATION_PROVIDER_CONTRACT_VERSION,
+          reconciliationMilliseconds,
+        });
+      });
+    } finally {
+      context.cleanup();
+    }
   }
 
   async function recordRejection(inputValue, operation = {}) {
@@ -434,11 +588,13 @@ function createMemberConversationProviderDispatchService(options = {}) {
 }
 
 module.exports = {
+  MEMBER_CONVERSATION_PROVIDER_DISPATCH_AUTHORIZATION_VERSION,
   MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION,
   MEMBER_CONVERSATION_PROVIDER_DISPATCH_LEASE_MILLISECONDS,
   MEMBER_CONVERSATION_PROVIDER_DISPATCH_TIMEOUT_MILLISECONDS,
   MEMBER_CONVERSATION_PROVIDER_RECONCILIATION_MILLISECONDS,
   MEMBER_CONVERSATION_PROVIDER_CONTRACT_VERSION,
   MemberConversationProviderDispatchError,
+  createMemberConversationProviderDispatchAuthorization,
   createMemberConversationProviderDispatchService,
 };

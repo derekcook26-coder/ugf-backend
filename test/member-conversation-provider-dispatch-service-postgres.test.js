@@ -12,9 +12,13 @@ const {
   monotonicNow,
 } = require("../src/goals-coach/bounded-postgres-transaction");
 const {
+  createMemberConversationProviderDispatchAuthorization,
   MemberConversationProviderDispatchError,
   createMemberConversationProviderDispatchService,
 } = require("../src/goals-coach/member-conversation-provider-dispatch-service");
+const {
+  createMemberConversationAuthorizationAdapters,
+} = require("../src/goals-coach/member-conversation-authorization-adapters");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 
@@ -56,7 +60,7 @@ async function databaseAt019(t) {
   return database;
 }
 
-async function owner(pool, suffix, reference) {
+async function owner(pool, suffix, reference, options = {}) {
   const seeded = await seedMemberAndPlan(pool, suffix);
   const mapping = (await pool.query(
     `INSERT INTO goals_coach_member_auth_mappings
@@ -84,7 +88,39 @@ async function owner(pool, suffix, reference) {
      VALUES($1,1,'member_session',$2,$3,$4,$5) RETURNING *`,
     [reference, conversation.id, seeded.member.id, mapping.id, session.id]
   )).rows[0];
+  await pool.query(
+    `INSERT INTO goals_coach_member_coaching_consents
+       (member_id,auth_mapping_id,notice_version,status,accepted_at,updated_at)
+     VALUES($1,$2,'GC-MEMBER-COACHING-CONSENT-1','accepted',NOW(),NOW())`,
+    [seeded.member.id, mapping.id]
+  );
+  await pool.query(
+    `INSERT INTO goals_coach_member_safety_intake_v2_assessments
+       (auth_mapping_id,member_id,client_request_id,client_request_hash,
+        client_request_hash_key_version,notice_version,outcome,rule_version,
+        submitted_at,valid_until)
+     VALUES($1,$2,$3,$4,'test-key','GC-MEMBER-SAFETY-NOTICE-3',
+            'SCREEN_COMPLETE','GC-MEMBER-SAFETY-INTAKE-3',NOW(),NOW()+$5::interval)`,
+    [mapping.id, seeded.member.id, crypto.randomUUID(), "f".repeat(64),
+      options.safetyValidOffset || "1 hour"]
+  );
   return { ...seeded, binding, conversation, mapping, session };
+}
+
+function dispatchAuthorization(pool, membershipVerifier = {
+  async verifyActiveMember() { return { active: true }; },
+}) {
+  const adapters = createMemberConversationAuthorizationAdapters({ pool, membershipVerifier });
+  return createMemberConversationProviderDispatchAuthorization(adapters);
+}
+
+function dispatchService(pool, options = {}) {
+  return createMemberConversationProviderDispatchService({
+    ...options,
+    pool,
+    preDispatchAuthorization: options.preDispatchAuthorization
+      || dispatchAuthorization(pool, options.membershipVerifier),
+  });
 }
 
 function reservationInput(value, key, signature = "a".repeat(64)) {
@@ -112,7 +148,7 @@ test("reservation binds exact key, signature, and conversation and replays one s
   const first = await owner(database.pool, "dispatch-reserve", "10000000-0000-4000-8000-000000000301");
   const second = await owner(database.pool, "dispatch-other", "10000000-0000-4000-8000-000000000302");
   const input = reservationInput(first, "20000000-0000-4000-8000-000000000301");
-  const service = createMemberConversationProviderDispatchService({ pool: database.pool });
+  const service = dispatchService(database.pool);
 
   assert.equal(service.providerFree, true);
   assert.equal(service.externalEffectsPermitted, false);
@@ -144,8 +180,7 @@ test("concurrent lease acquisition grants one bounded attempt and dispatch start
   const owned = await owner(database.pool, "dispatch-concurrent", "10000000-0000-4000-8000-000000000303");
   const input = reservationInput(owned, "20000000-0000-4000-8000-000000000303");
   let next = 303;
-  const service = createMemberConversationProviderDispatchService({
-    pool: database.pool,
+  const service = dispatchService(database.pool, {
     randomUUID() { return `30000000-0000-4000-8000-000000000${next++}`; },
   });
   await service.reserve(input);
@@ -172,6 +207,85 @@ test("concurrent lease acquisition grants one bounded attempt and dispatch start
   )).rows[0].count, 1);
 });
 
+test("post-lease authorization drift cannot commit dispatch authority", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const membership = new Map();
+  const membershipVerifier = {
+    async verifyActiveMember(memberId) {
+      const result = membership.get(String(memberId));
+      if (result instanceof Error) throw result;
+      return result || { active: true };
+    },
+  };
+  const preDispatchAuthorization = dispatchAuthorization(database.pool, membershipVerifier);
+  const scenarios = [
+    ["revoked-session", async (value) => database.pool.query(
+      "UPDATE goals_coach_member_sessions SET revoked_at=NOW() WHERE id=$1", [value.session.id]
+    )],
+    ["expired-session", async (value) => database.pool.query(
+      `UPDATE goals_coach_member_sessions
+          SET issued_at=NOW()-INTERVAL '7201 seconds',expires_at=NOW()-INTERVAL '1 second'
+        WHERE id=$1`,
+      [value.session.id]
+    )],
+    ["inactive-mapping", async (value) => database.pool.query(
+      "UPDATE goals_coach_member_auth_mappings SET active=FALSE WHERE id=$1", [value.mapping.id]
+    )],
+    ["withdrawn-consent", async (value) => database.pool.query(
+      `UPDATE goals_coach_member_coaching_consents
+          SET status='withdrawn',withdrawn_at=NOW(),updated_at=NOW()
+        WHERE auth_mapping_id=$1`,
+      [value.mapping.id]
+    )],
+    ["inactive-conversation", async (value) => database.pool.query(
+      "UPDATE coaching_conversations SET status='archived',archived_at=NOW() WHERE id=$1",
+      [value.conversation.id]
+    )],
+    ["inactive-membership", async (value) => {
+      membership.set(String(value.member.id), { active: false });
+    }],
+    ["unavailable-membership", async (value) => {
+      membership.set(String(value.member.id), new Error("synthetic Gatekeeper unavailable"));
+    }],
+    ["expired-safety", async () => new Promise((resolve) => setTimeout(resolve, 80))],
+  ];
+  let sequence = 401;
+  for (const [name, invalidate] of scenarios) {
+    const suffix = `dispatch-${name}`;
+    const digits = String(sequence++).padStart(3, "0");
+    const owned = await owner(
+      database.pool, suffix, `10000000-0000-4000-8000-000000000${digits}`,
+      name === "expired-safety" ? { safetyValidOffset: "50 milliseconds" } : {}
+    );
+    const input = reservationInput(owned, `20000000-0000-4000-8000-000000000${digits}`);
+    const attemptId = `30000000-0000-4000-8000-000000000${digits}`;
+    const service = dispatchService(database.pool, {
+      preDispatchAuthorization,
+      randomUUID() { return attemptId; },
+    });
+    await service.reserve(input);
+    assert.equal((await service.acquireLease(input)).state, "lease_acquired");
+    await invalidate(owned);
+    await assert.rejects(
+      service.startDispatch(attemptInput(input, attemptId)),
+      (error) => name === "unavailable-membership"
+        ? error instanceof Error
+        : error instanceof MemberConversationProviderDispatchError
+          && error.code === "authorization_unavailable",
+      name
+    );
+    assert.equal((await database.pool.query(
+      `SELECT COUNT(*)::int count
+         FROM goals_coach_member_conversation_turn_dispatch_events event
+         JOIN goals_coach_member_conversation_turn_reservations reservation
+           ON reservation.id=event.reservation_id
+        WHERE reservation.idempotency_key=$1::uuid AND event.event_type='dispatch_started'`,
+      [input.idempotencyKey]
+    )).rows[0].count, 0, name);
+    assert.equal((await service.read(input)).state, "lease_acquired", name);
+  }
+});
+
 test("definite rejection is terminal and no standalone success or final replay authority exists", { skip }, async (t) => {
   const database = await databaseAt019(t);
   const rejectedOwner = await owner(database.pool, "dispatch-rejected", "10000000-0000-4000-8000-000000000304");
@@ -181,8 +295,7 @@ test("definite rejection is terminal and no standalone success or final replay a
     "30000000-0000-4000-8000-000000000305",
     "30000000-0000-4000-8000-000000000306",
   ];
-  const service = createMemberConversationProviderDispatchService({
-    pool: database.pool,
+  const service = dispatchService(database.pool, {
     randomUUID() { return attempts.shift(); },
   });
   await service.reserve(rejectedInput);
@@ -221,9 +334,8 @@ test("expired pre-dispatch lease can be reclaimed but committed dispatch cannot"
     "30000000-0000-4000-8000-000000000307",
     "30000000-0000-4000-8000-000000000308",
   ];
-  const service = createMemberConversationProviderDispatchService({
+  const service = dispatchService(database.pool, {
     leaseMilliseconds: 20,
-    pool: database.pool,
     randomUUID() { return attempts.shift(); },
   });
   await service.reserve(input);
@@ -245,8 +357,7 @@ test("indeterminate transition is bounded and suppresses every late receipt", { 
   const owned = await owner(database.pool, "dispatch-indeterminate", "10000000-0000-4000-8000-000000000309");
   const input = reservationInput(owned, "20000000-0000-4000-8000-000000000309");
   const attemptId = "30000000-0000-4000-8000-000000000309";
-  const service = createMemberConversationProviderDispatchService({
-    pool: database.pool,
+  const service = dispatchService(database.pool, {
     randomUUID() { return attemptId; },
     reconciliationMilliseconds: 20,
   });
@@ -276,7 +387,7 @@ test("abort and deadline revoke transaction authority, drain late checkout, and 
       return new Promise((resolve) => { resolveCheckout = resolve; });
     },
   };
-  const service = createMemberConversationProviderDispatchService({ pool: delayedPool });
+  const service = dispatchService(delayedPool);
   const controller = new AbortController();
   let added = 0;
   let removed = 0;
@@ -309,7 +420,7 @@ test("abort and deadline revoke transaction authority, drain late checkout, and 
   )).rows[0].count, 0);
 
   const terminalState = createTerminalState();
-  const deadlineService = createMemberConversationProviderDispatchService({ pool: database.pool });
+  const deadlineService = dispatchService(database.pool);
   await assert.rejects(deadlineService.reserve(input, {
     monotonicNow,
     outerDeadlineNs: deadlineAfter(monotonicNow(), 1) - 2_000_000n,
