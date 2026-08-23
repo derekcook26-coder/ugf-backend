@@ -563,6 +563,39 @@ function createMemberConversationProviderDispatchService(options = {}) {
     });
   }
 
+  async function readFinalized(inputValue, operation = {}) {
+    const input = parseReservationInput(inputValue);
+    if (!input) throw new MemberConversationProviderDispatchError("invalid_reservation_input");
+    return transact(operation, true, async ({ query }) => {
+      const reservation = await exactReservation(query, input, false);
+      const current = await currentState(query, reservation.id);
+      if (current.state !== "finalized") return null;
+      const receiptResult = await query(
+        `SELECT attempt_id,response_digest_sha256
+           FROM goals_coach_member_conversation_turn_dispatch_events
+          WHERE reservation_id=$1 AND event_type='provider_succeeded'
+          ORDER BY event_sequence DESC LIMIT 1`,
+        [reservation.id]
+      );
+      const receipt = receiptResult.rows && receiptResult.rows[0];
+      const finalResult = await query(
+        `SELECT * FROM goals_coach_member_conversation_turn_idempotency
+          WHERE idempotency_key=$1::uuid
+            AND conversation_binding_id=$2
+            AND request_signature_sha256=$3`,
+        [input.idempotencyKey, input.conversationBindingId, input.requestSignatureSha256]
+      );
+      const response = storedSafeResponse(finalResult.rows && finalResult.rows[0]);
+      if (!receipt
+        || !UUID.test(String(receipt.attempt_id).toLowerCase())
+        || !SHA256.test(String(receipt.response_digest_sha256))
+        || receipt.response_digest_sha256 !== memberConversationTurnResponseDigest(response)) {
+        throw new MemberConversationProviderDispatchError("invalid_final_replay");
+      }
+      return Object.freeze({ response });
+    });
+  }
+
   async function acquireLease(inputValue, operation = {}) {
     const input = parseReservationInput(inputValue);
     if (!input) throw new MemberConversationProviderDispatchError("invalid_reservation_input");
@@ -766,6 +799,7 @@ function createMemberConversationProviderDispatchService(options = {}) {
     markIndeterminate,
     providerFree: true,
     read,
+    readFinalized,
     recordRejection,
     reserve,
     startDispatch,
