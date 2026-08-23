@@ -49,6 +49,8 @@ var { createGymMasterPublicWidgetsStartup } = require("./src/goals-coach/gymmast
 var { composeGymMasterPublicWidgetsRoutes } = require("./src/goals-coach/gymmaster-public-widgets-route-composition");
 var { createPublicHelpChatStartup } = require("./src/goals-coach/ugf-public-help-chat-startup");
 var { composePublicHelpChatRoute } = require("./src/goals-coach/ugf-public-help-chat-route-composition");
+var { createProspectCallbackStartup } = require("./src/goals-coach/ugf-gymmaster-prospect-callback-startup");
+var { composeProspectCallbackRoute } = require("./src/goals-coach/ugf-gymmaster-prospect-callback-route-composition");
   var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
   var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
   var { createGymMasterMemberConversationTurnStartup } = require("./src/goals-coach/gymmaster-member-conversation-turn-startup");
@@ -141,6 +143,12 @@ composeGymMasterPublicWidgetsRoutes(app, publicWidgetsStartup);
 // member-session, payment, GymMaster API, Goals Coach, or AI-provider access.
 var publicHelpChatStartup = createPublicHelpChatStartup();
 composePublicHelpChatRoute(app, publicHelpChatStartup);
+
+// Public callback requests are independently gated and create only a minimal
+// GymMaster prospect after explicit contact consent. Credentials and provider
+// identifiers remain server-side, and no submission is stored locally.
+var prospectCallbackStartup = createProspectCallbackStartup({ fetchImpl: fetch });
+composeProspectCallbackRoute(app, prospectCallbackStartup);
 
 // The member private shell is separately gated and performs no work at startup.
 // It revalidates the signed session, local mapping, and Gatekeeper membership
