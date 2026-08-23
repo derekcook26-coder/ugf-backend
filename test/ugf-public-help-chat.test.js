@@ -66,6 +66,17 @@ test("approved purchasing and account answers are fixed, minimized, and non-tran
   assert.equal(JSON.stringify(account.body).includes("memberId"), false);
 });
 
+test("access hours answer uses the owner-approved schedule", async (t) => {
+  const app = express(); app.use(express.json());
+  composePublicHelpChatRoute(app, createPublicHelpChatStartup({ environment: configuration() }));
+  const running = await startApp(app); t.after(() => running.close());
+  const hours = await request(running.url, "When is staff onsite and is member access 24/7?");
+  assert.equal(hours.body.category, "access_hours");
+  assert.match(hours.body.answer, /24\/7 access, 365 days a year/);
+  assert.match(hours.body.answer, /Monday–Friday from 9 AM–2 PM and 3 PM–6 PM/);
+  assert.equal(hours.body.needsStaff, false);
+});
+
 test("unknown and billing questions require staff without collecting sensitive data", async (t) => {
   const app = express(); app.use(express.json());
   composePublicHelpChatRoute(app, createPublicHelpChatStartup({ environment: configuration() }));

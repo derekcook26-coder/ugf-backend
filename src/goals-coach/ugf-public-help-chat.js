@@ -5,6 +5,13 @@ const MAX_QUESTION_LENGTH = 500;
 
 const INTENTS = Object.freeze([
   Object.freeze({
+    id: "access_hours",
+    terms: Object.freeze(["hours", "open", "staff", "onsite", "appointment", "24/7", "365"]),
+    answer: "Members have 24/7 access, 365 days a year. Staff is onsite Monday–Friday from 9 AM–2 PM and 3 PM–6 PM, with appointments available at other convenient times.",
+    linkKey: "contactUrl",
+    linkLabel: "Request staff follow-up",
+  }),
+  Object.freeze({
     id: "membership_purchase",
     terms: Object.freeze(["membership", "join", "sign up", "signup", "purchase", "buy", "price", "cost"]),
     answer: "You can review membership options and continue to UGF's secure GymMaster signup page. Payment and enrollment are completed there, not in this chat.",
