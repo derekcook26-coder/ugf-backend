@@ -6,6 +6,7 @@ const MEMBERSHIPS_PATH = "/portal/api/v1/memberships";
 const SCHEDULE_CACHE_MILLISECONDS = 5 * 60 * 1000;
 const MEMBERSHIPS_CACHE_MILLISECONDS = 2 * 60 * 1000;
 const DEFAULT_TIMEOUT_MILLISECONDS = 5000;
+const EXCLUDED_MEMBERSHIP_DIVISIONS = new Set(["tv service"]);
 
 function widgetsEnabled(value) {
   return value === "true";
@@ -71,6 +72,8 @@ function sanitizeScheduleItem(item) {
 
 function sanitizeMembershipItem(item) {
   if (!item || typeof item !== "object" || !Number.isInteger(item.id)) return null;
+  const divisionName = stringOrEmpty(item.divisionname, 160);
+  if (EXCLUDED_MEMBERSHIP_DIVISIONS.has(divisionName.trim().toLowerCase())) return null;
   const companyIds = Array.isArray(item.companyids)
     ? item.companyids.filter(Number.isInteger).slice(0, 20)
     : [];
@@ -83,7 +86,7 @@ function sanitizeMembershipItem(item) {
     signupFee: stringOrEmpty(item.signupfee, 80),
     signupFeeLabel: stringOrEmpty(item.signupfee_label, 120),
     hideSignupFee: booleanValue(item.hide_signupfee),
-    divisionName: stringOrEmpty(item.divisionname, 160),
+    divisionName,
     promotionalPeriod: stringOrEmpty(item.promotional_period, 120),
     promotionalPrice: stringOrEmpty(item.promotional_price, 80),
     promotionDescription: stringOrEmpty(item.promotion_period_description, 500),
