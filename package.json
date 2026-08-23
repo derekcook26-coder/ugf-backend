@@ -36,6 +36,8 @@
     "rollback:member-conversation-bindings": "node rollback_017.js",
     "migrate:member-conversation-turn-idempotency": "node migrate_018.js",
     "rollback:member-conversation-turn-idempotency": "node rollback_018.js",
+    "migrate:member-conversation-provider-dispatch": "node migrate_019.js",
+    "rollback:member-conversation-provider-dispatch": "node rollback_019.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },
