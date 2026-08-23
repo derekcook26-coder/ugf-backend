@@ -19,6 +19,9 @@ const {
 const {
   createMemberConversationAuthorizationAdapters,
 } = require("../src/goals-coach/member-conversation-authorization-adapters");
+const {
+  parseMemberConversationTurnResponse,
+} = require("../src/goals-coach/member-conversation-turn-contract");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 
@@ -141,6 +144,82 @@ function reservationInput(value, key, signature = "a".repeat(64)) {
 
 function attemptInput(reservation, attemptId) {
   return { ...reservation, attemptId };
+}
+
+function safeResponse(reservation) {
+  return {
+    contractVersion: reservation.contractVersion,
+    conversation: reservation.conversation,
+    idempotencyKey: reservation.idempotencyKey,
+    requestId: reservation.idempotencyKey,
+    result: {
+      reason: null,
+      safety: {
+        action: "allow_provider_processing",
+        classification: "clear",
+        requestHash: reservation.requestSignatureSha256,
+        ruleVersion: reservation.safetyRuleVersion,
+        sourceRuleVersion: reservation.safetySourceRuleVersion,
+      },
+      state: "safe_to_process",
+    },
+  };
+}
+
+function responseDigest(response) {
+  const canonical = parseMemberConversationTurnResponse(response);
+  return crypto.createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
+function successInput(reservation, attemptId, overrides = {}) {
+  const response = safeResponse(reservation);
+  return {
+    ...attemptInput(reservation, attemptId),
+    providerRequestId: "provider-request-success",
+    providerResponseId: "provider-response-success",
+    response,
+    responseDigestSha256: responseDigest(response),
+    ...overrides,
+  };
+}
+
+function failOncePool(pool, predicate) {
+  let failed = false;
+  return {
+    async connect() {
+      const client = await pool.connect();
+      return {
+        async query(...args) {
+          if (!failed && predicate(...args)) {
+            failed = true;
+            throw new Error("synthetic atomic finalization failure");
+          }
+          return client.query(...args);
+        },
+        release(error) { client.release(error); },
+      };
+    },
+  };
+}
+
+function commitUnknownOncePool(pool) {
+  let failed = false;
+  return {
+    async connect() {
+      const client = await pool.connect();
+      return {
+        async query(text, values) {
+          const result = await client.query(text, values);
+          if (!failed && String(text).trim().toUpperCase() === "COMMIT") {
+            failed = true;
+            throw new Error("synthetic_commit_result_lost");
+          }
+          return result;
+        },
+        release(error) { client.release(error); },
+      };
+    },
+  };
 }
 
 test("reservation binds exact key, signature, and conversation and replays one state", { skip }, async (t) => {
@@ -286,7 +365,7 @@ test("post-lease authorization drift cannot commit dispatch authority", { skip }
   }
 });
 
-test("definite rejection is terminal and no standalone success or final replay authority exists", { skip }, async (t) => {
+test("definite rejection is terminal and cannot be converted into success or final replay authority", { skip }, async (t) => {
   const database = await databaseAt019(t);
   const rejectedOwner = await owner(database.pool, "dispatch-rejected", "10000000-0000-4000-8000-000000000304");
   const rejectedInput = reservationInput(rejectedOwner, "20000000-0000-4000-8000-000000000304");
@@ -312,6 +391,9 @@ test("definite rejection is terminal and no standalone success or final replay a
   });
   await assert.rejects(service.acquireLease(rejectedInput),
     (error) => error.code === "transition_unavailable");
+  await assert.rejects(service.finalizeSuccess(
+    successInput(rejectedInput, rejectedLease.attemptId)
+  ), (error) => error.code === "transition_unavailable");
 
   assert.equal("execute" in service, false);
   assert.equal("operation" in service, false);
@@ -323,6 +405,198 @@ test("definite rejection is terminal and no standalone success or final replay a
   assert.equal((await database.pool.query(
     "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
   )).rows[0].count, 0);
+});
+
+test("provider success, exact replay, and finalized state commit atomically", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "dispatch-success", "10000000-0000-4000-8000-000000000311");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000311");
+  const attemptId = "30000000-0000-4000-8000-000000000311";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInput(input, attemptId);
+
+  const [first, concurrentReplay] = await Promise.all([
+    service.finalizeSuccess(success),
+    service.finalizeSuccess(success),
+  ]);
+  assert.deepEqual(first, { response: success.response });
+  assert.deepEqual(concurrentReplay, first);
+  assert.deepEqual(await service.finalizeSuccess(success), first);
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    responseDigestSha256: "d".repeat(64),
+  }), (error) => error.code === "invalid_success_input");
+  const reorderedResponse = {
+    result: success.response.result,
+    conversation: success.response.conversation,
+    requestId: success.response.requestId,
+    idempotencyKey: success.response.idempotencyKey,
+    contractVersion: success.response.contractVersion,
+  };
+  assert.deepEqual(await service.finalizeSuccess({
+    ...success,
+    response: reorderedResponse,
+    responseDigestSha256: responseDigest(reorderedResponse),
+  }), first);
+  assert.deepEqual(await service.read(input), { eventSequence: 5, state: "finalized" });
+
+  const events = (await database.pool.query(
+    `SELECT event_sequence,event_type,attempt_id,provider_request_id,
+            provider_response_id,response_digest_sha256
+       FROM goals_coach_member_conversation_turn_dispatch_events
+      ORDER BY event_sequence`
+  )).rows;
+  assert.deepEqual(events.map((row) => [Number(row.event_sequence), row.event_type]), [
+    [1, "reserved"],
+    [2, "lease_acquired"],
+    [3, "dispatch_started"],
+    [4, "provider_succeeded"],
+    [5, "finalized"],
+  ]);
+  assert.equal(events[3].attempt_id, attemptId);
+  assert.equal(events[3].provider_request_id, success.providerRequestId);
+  assert.equal(events[3].provider_response_id, success.providerResponseId);
+  assert.equal(events[3].response_digest_sha256, success.responseDigestSha256);
+  const replay = (await database.pool.query(
+    "SELECT * FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows;
+  assert.equal(replay.length, 1);
+  assert.equal(replay[0].idempotency_key, input.idempotencyKey);
+  assert.equal(replay[0].request_signature_sha256, input.requestSignatureSha256);
+  assert.equal(replay[0].response_state, "safe_to_process");
+  assert.equal(replay[0].response_reason, null);
+  assert.equal(replay[0].safety_classification, "clear");
+  assert.equal(replay[0].safety_action, "allow_provider_processing");
+});
+
+test("success conflicts and terminal states create no partial replay authority", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "dispatch-success-conflict", "10000000-0000-4000-8000-000000000312");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000312");
+  const attemptId = "30000000-0000-4000-8000-000000000312";
+  const service = dispatchService(database.pool, {
+    randomUUID() { return attemptId; },
+    reconciliationMilliseconds: 20,
+  });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInput(input, attemptId);
+
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    responseDigestSha256: "d".repeat(64),
+  }), (error) => error.code === "invalid_success_input");
+
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    response: {
+      ...success.response,
+      result: {
+        ...success.response.result,
+        safety: { ...success.response.result.safety, requestHash: "e".repeat(64) },
+      },
+    },
+  }), (error) => error.code === "invalid_success_input");
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    attemptId: "30000000-0000-4000-8000-000000000399",
+  }), (error) => error.code === "transition_unavailable");
+  await assert.rejects(service.finalizeSuccess({ ...success, operation: async () => undefined }),
+    (error) => error.code === "invalid_success_input");
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type IN ('provider_succeeded','finalized')`
+  )).rows[0].count, 0);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  await service.markIndeterminate(attemptInput(input, attemptId));
+  await assert.rejects(service.finalizeSuccess(success),
+    (error) => error.code === "transition_unavailable");
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type IN ('provider_succeeded','finalized')`
+  )).rows[0].count, 0);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+});
+
+test("failures after success receipt or replay insert roll back the entire finalization", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "dispatch-success-rollback", "10000000-0000-4000-8000-000000000313");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000313");
+  const attemptId = "30000000-0000-4000-8000-000000000313";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInput(input, attemptId);
+
+  const replayInsertFailure = dispatchService(failOncePool(database.pool, (text) =>
+    String(text).includes("INSERT INTO goals_coach_member_conversation_turn_idempotency")));
+  await assert.rejects(replayInsertFailure.finalizeSuccess(success),
+    (error) => error.code === "database_unavailable");
+  assert.equal((await service.read(input)).state, "dispatch_started");
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type IN ('provider_succeeded','finalized')`
+  )).rows[0].count, 0);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+
+  const finalizedInsertFailure = dispatchService(failOncePool(database.pool, (text, values) =>
+    String(text).includes("INSERT INTO goals_coach_member_conversation_turn_dispatch_events")
+      && values && values[1] === "finalized"));
+  await assert.rejects(finalizedInsertFailure.finalizeSuccess(success),
+    (error) => error.code === "database_unavailable");
+  assert.equal((await service.read(input)).state, "dispatch_started");
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type IN ('provider_succeeded','finalized')`
+  )).rows[0].count, 0);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+});
+
+test("an unknown commit result is recovered by exact durable replay without a second receipt", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "dispatch-success-commit-unknown", "10000000-0000-4000-8000-000000000314");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000314");
+  const attemptId = "30000000-0000-4000-8000-000000000314";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInput(input, attemptId);
+
+  const uncertain = dispatchService(commitUnknownOncePool(database.pool));
+  await assert.rejects(uncertain.finalizeSuccess(success),
+    (error) => error.code === "database_unavailable");
+
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+  assert.deepEqual(await service.read(input), { eventSequence: 5, state: "finalized" });
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type='provider_succeeded'`
+  )).rows[0].count, 1);
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type='finalized'`
+  )).rows[0].count, 1);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 1);
 });
 
 test("expired pre-dispatch lease can be reclaimed but committed dispatch cannot", { skip }, async (t) => {
