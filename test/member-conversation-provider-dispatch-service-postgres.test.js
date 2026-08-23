@@ -19,6 +19,9 @@ const {
 const {
   createMemberConversationAuthorizationAdapters,
 } = require("../src/goals-coach/member-conversation-authorization-adapters");
+const {
+  parseMemberConversationTurnResponse,
+} = require("../src/goals-coach/member-conversation-turn-contract");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 
@@ -163,13 +166,19 @@ function safeResponse(reservation) {
   };
 }
 
+function responseDigest(response) {
+  const canonical = parseMemberConversationTurnResponse(response);
+  return crypto.createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
 function successInput(reservation, attemptId, overrides = {}) {
+  const response = safeResponse(reservation);
   return {
     ...attemptInput(reservation, attemptId),
     providerRequestId: "provider-request-success",
     providerResponseId: "provider-response-success",
-    response: safeResponse(reservation),
-    responseDigestSha256: "d".repeat(64),
+    response,
+    responseDigestSha256: responseDigest(response),
     ...overrides,
   };
 }
@@ -416,6 +425,22 @@ test("provider success, exact replay, and finalized state commit atomically", { 
   assert.deepEqual(first, { response: success.response });
   assert.deepEqual(concurrentReplay, first);
   assert.deepEqual(await service.finalizeSuccess(success), first);
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    responseDigestSha256: "d".repeat(64),
+  }), (error) => error.code === "invalid_success_input");
+  const reorderedResponse = {
+    result: success.response.result,
+    conversation: success.response.conversation,
+    requestId: success.response.requestId,
+    idempotencyKey: success.response.idempotencyKey,
+    contractVersion: success.response.contractVersion,
+  };
+  assert.deepEqual(await service.finalizeSuccess({
+    ...success,
+    response: reorderedResponse,
+    responseDigestSha256: responseDigest(reorderedResponse),
+  }), first);
   assert.deepEqual(await service.read(input), { eventSequence: 5, state: "finalized" });
 
   const events = (await database.pool.query(
@@ -460,6 +485,11 @@ test("success conflicts and terminal states create no partial replay authority",
   await service.acquireLease(input);
   await service.startDispatch(attemptInput(input, attemptId));
   const success = successInput(input, attemptId);
+
+  await assert.rejects(service.finalizeSuccess({
+    ...success,
+    responseDigestSha256: "d".repeat(64),
+  }), (error) => error.code === "invalid_success_input");
 
   await assert.rejects(service.finalizeSuccess({
     ...success,

@@ -164,6 +164,12 @@ function parseRejectionInput(value) {
     : null;
 }
 
+function memberConversationTurnResponseDigest(response) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(response), "utf8")
+    .digest("hex");
+}
+
 function parseSuccessInput(value) {
   if (!exactKeys(value, SUCCESS_KEYS)) return null;
   const attempt = parseAttemptInput(Object.fromEntries(
@@ -179,6 +185,7 @@ function parseSuccessInput(value) {
     && providerRequestId
     && providerResponseId
     && responseDigestSha256
+    && responseDigestSha256 === memberConversationTurnResponseDigest(response)
     && response.requestId === attempt.reservation.idempotencyKey
     && response.idempotencyKey === attempt.reservation.idempotencyKey
     && response.contractVersion === attempt.reservation.contractVersion
@@ -689,6 +696,7 @@ function createMemberConversationProviderDispatchService(options = {}) {
           || receipt.provider_request_id !== input.providerRequestId
           || receipt.provider_response_id !== input.providerResponseId
           || receipt.response_digest_sha256 !== input.responseDigestSha256
+          || receipt.response_digest_sha256 !== memberConversationTurnResponseDigest(response)
           || !sameSafeResponse(response, input.response)) {
           throw new MemberConversationProviderDispatchError("success_conflict");
         }
