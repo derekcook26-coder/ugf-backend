@@ -158,6 +158,11 @@ test("public routes return minimized branded data without keys, tokens, or provi
       companyids: [1, 2],
       programme_ref: "private-provider-reference",
       account_credit: "$0",
+    }, {
+      id: 42,
+      name: "1 Month",
+      divisionname: " TV SERVICE ",
+      sortorder: 1,
     }]);
   };
   const { app, startup, composition } = await application(fetchImpl);
@@ -190,6 +195,7 @@ test("public routes return minimized branded data without keys, tokens, or provi
   assert.equal(memberships.response.status, 200);
   assert.equal(memberships.body.signupUrl, "https://ugf.gymmasteronline.com/portal/signup?logo=0");
   assert.equal(memberships.body.memberships.length, 1);
+  assert.equal(memberships.body.memberships[0].divisionName, "Monthly memberships");
   const serialized = JSON.stringify({ schedule: schedule.body, memberships: memberships.body });
   for (const forbidden of [API_KEY, "private-staff-id", "Private Name", "private-provider-reference", "token"]) {
     assert.equal(serialized.includes(forbidden), false);
