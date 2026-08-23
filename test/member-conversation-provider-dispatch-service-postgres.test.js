@@ -254,6 +254,37 @@ test("reservation binds exact key, signature, and conversation and replays one s
   )).rows[0].count, 1);
 });
 
+test("finalized replay is strict, minimized, read-only, and unavailable before finalization", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(
+    database.pool,
+    "dispatch-final-read",
+    "10000000-0000-4000-8000-000000000315"
+  );
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000315");
+  const service = dispatchService(database.pool);
+  await service.reserve(input);
+  assert.equal(await service.readFinalized(input), null);
+  const lease = await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, lease.attemptId));
+  const success = successInput(input, lease.attemptId);
+  await service.finalizeSuccess(success);
+
+  assert.deepEqual(await service.readFinalized(input), { response: success.response });
+  await assert.rejects(
+    service.readFinalized({ ...input, requestSignatureSha256: "b".repeat(64) }),
+    (error) => error instanceof MemberConversationProviderDispatchError
+      && error.code === "reservation_conflict"
+  );
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count
+       FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE reservation_id=(SELECT id FROM goals_coach_member_conversation_turn_reservations
+                             WHERE idempotency_key=$1::uuid)` ,
+    [input.idempotencyKey]
+  )).rows[0].count, 5);
+});
+
 test("concurrent lease acquisition grants one bounded attempt and dispatch starts once", { skip }, async (t) => {
   const database = await databaseAt019(t);
   const owned = await owner(database.pool, "dispatch-concurrent", "10000000-0000-4000-8000-000000000303");
