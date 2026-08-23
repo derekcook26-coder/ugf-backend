@@ -19,6 +19,9 @@ const {
   validConversationOwnershipResult,
   validMemberConversationTurnOwnership,
 } = require("./member-conversation-turn-ownership");
+const {
+  parseMemberConversationTurnResponse,
+} = require("./member-conversation-turn-contract");
 
 const MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION =
   "GC-MEMBER-CONVERSATION-PROVIDER-DISPATCH-1";
@@ -55,6 +58,13 @@ const REJECTION_KEYS = Object.freeze([
   ...ATTEMPT_KEYS,
   "providerRequestId",
   "terminalCategory",
+].sort());
+const SUCCESS_KEYS = Object.freeze([
+  ...ATTEMPT_KEYS,
+  "providerRequestId",
+  "providerResponseId",
+  "response",
+  "responseDigestSha256",
 ].sort());
 const REJECTION_CATEGORIES = Object.freeze([
   "authentication_rejected",
@@ -152,6 +162,43 @@ function parseRejectionInput(value) {
   return attempt && providerRequestId && REJECTION_CATEGORIES.includes(value.terminalCategory)
     ? Object.freeze({ ...attempt, providerRequestId, terminalCategory: value.terminalCategory })
     : null;
+}
+
+function parseSuccessInput(value) {
+  if (!exactKeys(value, SUCCESS_KEYS)) return null;
+  const attempt = parseAttemptInput(Object.fromEntries(
+    ATTEMPT_KEYS.map((key) => [key, value[key]])
+  ));
+  const providerRequestId = exactString(value.providerRequestId, PROVIDER_IDENTIFIER);
+  const providerResponseId = exactString(value.providerResponseId, PROVIDER_IDENTIFIER);
+  const responseDigestSha256 = exactString(value.responseDigestSha256, SHA256);
+  let response;
+  try { response = parseMemberConversationTurnResponse(value.response); }
+  catch { return null; }
+  return attempt
+    && providerRequestId
+    && providerResponseId
+    && responseDigestSha256
+    && response.requestId === attempt.reservation.idempotencyKey
+    && response.idempotencyKey === attempt.reservation.idempotencyKey
+    && response.contractVersion === attempt.reservation.contractVersion
+    && response.conversation.reference === attempt.reservation.conversation.reference
+    && response.conversation.version === attempt.reservation.conversation.version
+    && response.conversation.provenance === attempt.reservation.conversation.provenance
+    && response.result.state === "safe_to_process"
+    && response.result.reason === null
+    && response.result.safety.ruleVersion === attempt.reservation.safetyRuleVersion
+    && response.result.safety.sourceRuleVersion === attempt.reservation.safetySourceRuleVersion
+    && response.result.safety.requestHash === attempt.reservation.requestSignatureSha256
+    && response.result.safety.classification === "clear"
+    && response.result.safety.action === "allow_provider_processing"
+    ? Object.freeze({
+      ...attempt,
+      providerRequestId,
+      providerResponseId,
+      response,
+      responseDigestSha256,
+    }) : null;
 }
 
 function createOperationContext(options, operation = {}) {
@@ -303,6 +350,51 @@ function stateResult(row) {
     result.attemptId = attemptId;
   }
   return Object.freeze(result);
+}
+
+function storedSafeResponse(row) {
+  if (!row) throw new MemberConversationProviderDispatchError("final_replay_unavailable");
+  try {
+    return parseMemberConversationTurnResponse({
+      contractVersion: row.contract_version,
+      conversation: {
+        provenance: row.conversation_provenance,
+        reference: String(row.conversation_reference).toLowerCase(),
+        version: Number(row.conversation_version),
+      },
+      idempotencyKey: String(row.idempotency_key).toLowerCase(),
+      requestId: String(row.idempotency_key).toLowerCase(),
+      result: {
+        reason: row.response_reason,
+        safety: {
+          action: row.safety_action,
+          classification: row.safety_classification,
+          requestHash: row.request_signature_sha256,
+          ruleVersion: row.safety_rule_version,
+          sourceRuleVersion: row.safety_source_rule_version,
+        },
+        state: row.response_state,
+      },
+    });
+  } catch (error) {
+    throw new MemberConversationProviderDispatchError("invalid_final_replay", error);
+  }
+}
+
+function sameSafeResponse(left, right) {
+  return left.contractVersion === right.contractVersion
+    && left.requestId === right.requestId
+    && left.idempotencyKey === right.idempotencyKey
+    && left.conversation.reference === right.conversation.reference
+    && left.conversation.version === right.conversation.version
+    && left.conversation.provenance === right.conversation.provenance
+    && left.result.state === right.result.state
+    && left.result.reason === right.result.reason
+    && left.result.safety.ruleVersion === right.result.safety.ruleVersion
+    && left.result.safety.sourceRuleVersion === right.result.safety.sourceRuleVersion
+    && left.result.safety.requestHash === right.result.safety.requestHash
+    && left.result.safety.classification === right.result.safety.classification
+    && left.result.safety.action === right.result.safety.action;
 }
 
 function createMemberConversationProviderDispatchService(options = {}) {
@@ -559,6 +651,90 @@ function createMemberConversationProviderDispatchService(options = {}) {
     });
   }
 
+  async function finalizeSuccess(inputValue, operation = {}) {
+    const input = parseSuccessInput(inputValue);
+    if (!input) throw new MemberConversationProviderDispatchError("invalid_success_input");
+    return transact(operation, false, async ({ query }) => {
+      const reservation = await exactReservation(query, input.reservation, true);
+      await query(
+        `SELECT pg_advisory_xact_lock(
+           hashtextextended('goals_coach_member_conversation_turn_dispatch:' || $1::text, 0)
+         )`,
+        [reservation.id]
+      );
+      const current = await currentState(query, reservation.id);
+      if (current.state === "finalized") {
+        const receiptResult = await query(
+          `SELECT attempt_id,provider_request_id,provider_response_id,response_digest_sha256
+             FROM goals_coach_member_conversation_turn_dispatch_events
+            WHERE reservation_id=$1 AND event_type='provider_succeeded'
+            ORDER BY event_sequence DESC LIMIT 1`,
+          [reservation.id]
+        );
+        const receipt = receiptResult.rows && receiptResult.rows[0];
+        const finalResult = await query(
+          `SELECT * FROM goals_coach_member_conversation_turn_idempotency
+            WHERE idempotency_key=$1::uuid
+              AND conversation_binding_id=$2
+              AND request_signature_sha256=$3`,
+          [
+            input.reservation.idempotencyKey,
+            input.reservation.conversationBindingId,
+            input.reservation.requestSignatureSha256,
+          ]
+        );
+        const response = storedSafeResponse(finalResult.rows && finalResult.rows[0]);
+        if (!receipt
+          || String(receipt.attempt_id).toLowerCase() !== input.attemptId
+          || receipt.provider_request_id !== input.providerRequestId
+          || receipt.provider_response_id !== input.providerResponseId
+          || receipt.response_digest_sha256 !== input.responseDigestSha256
+          || !sameSafeResponse(response, input.response)) {
+          throw new MemberConversationProviderDispatchError("success_conflict");
+        }
+        return Object.freeze({ response });
+      }
+      if (current.state !== "dispatch_started" || current.attemptId !== input.attemptId) {
+        throw new MemberConversationProviderDispatchError("transition_unavailable");
+      }
+      await appendEvent(query, reservation.id, {
+        attemptId: input.attemptId,
+        clientRequestId: input.attemptId,
+        eventType: "provider_succeeded",
+        providerContractVersion: MEMBER_CONVERSATION_PROVIDER_CONTRACT_VERSION,
+        providerRequestId: input.providerRequestId,
+        providerResponseId: input.providerResponseId,
+        responseDigestSha256: input.responseDigestSha256,
+        terminalCategory: "success",
+      });
+      await query(
+        `INSERT INTO goals_coach_member_conversation_turn_idempotency
+           (idempotency_key,conversation_binding_id,conversation_reference,
+            conversation_version,conversation_provenance,request_signature_sha256,
+            contract_version,safety_rule_version,safety_source_rule_version,
+            response_state,response_reason,safety_classification,safety_action)
+         VALUES($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [
+          input.reservation.idempotencyKey,
+          input.reservation.conversationBindingId,
+          input.reservation.conversation.reference,
+          input.reservation.conversation.version,
+          input.reservation.conversation.provenance,
+          input.reservation.requestSignatureSha256,
+          input.reservation.contractVersion,
+          input.reservation.safetyRuleVersion,
+          input.reservation.safetySourceRuleVersion,
+          input.response.result.state,
+          input.response.result.reason,
+          input.response.result.safety.classification,
+          input.response.result.safety.action,
+        ]
+      );
+      await appendEvent(query, reservation.id, { eventType: "finalized" });
+      return Object.freeze({ response: input.response });
+    });
+  }
+
   async function markIndeterminate(inputValue, operation = {}) {
     const input = parseAttemptInput(inputValue);
     if (!input) throw new MemberConversationProviderDispatchError("invalid_attempt_input");
@@ -578,6 +754,7 @@ function createMemberConversationProviderDispatchService(options = {}) {
     acquireLease,
     contractVersion: MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION,
     externalEffectsPermitted: false,
+    finalizeSuccess,
     markIndeterminate,
     providerFree: true,
     read,
