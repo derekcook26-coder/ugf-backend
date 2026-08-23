@@ -1,0 +1,7 @@
+DROP TRIGGER enforce_member_conversation_turn_final_replay_insert
+  ON goals_coach_member_conversation_turn_idempotency;
+DROP TABLE goals_coach_member_conversation_turn_dispatch_events;
+DROP TABLE goals_coach_member_conversation_turn_reservations;
+DROP FUNCTION enforce_member_conversation_turn_dispatch_transition();
+DROP FUNCTION enforce_member_conversation_turn_final_replay_transition();
+DROP FUNCTION prevent_member_conversation_turn_provider_dispatch_mutation();
