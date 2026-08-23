@@ -74,6 +74,7 @@ const REJECTION_CATEGORIES = Object.freeze([
 const AUTHORIZATION_KEYS = Object.freeze([
   "authMappingId", "conversation", "memberId", "memberSessionId",
 ]);
+const brandedDispatchServices = new WeakSet();
 
 class MemberConversationProviderDispatchError extends Error {
   constructor(code, cause) {
@@ -791,7 +792,7 @@ function createMemberConversationProviderDispatchService(options = {}) {
     });
   }
 
-  return Object.freeze({
+  const service = Object.freeze({
     acquireLease,
     contractVersion: MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION,
     externalEffectsPermitted: false,
@@ -804,6 +805,19 @@ function createMemberConversationProviderDispatchService(options = {}) {
     reserve,
     startDispatch,
   });
+  brandedDispatchServices.add(service);
+  return service;
+}
+
+function validMemberConversationProviderDispatchService(value) {
+  return Boolean(value && brandedDispatchServices.has(value)
+    && Object.isFrozen(value)
+    && value.contractVersion === MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION
+    && value.externalEffectsPermitted === false
+    && value.providerFree === true
+    && ["acquireLease", "finalizeSuccess", "markIndeterminate", "read",
+      "readFinalized", "recordRejection", "reserve", "startDispatch"]
+      .every((name) => typeof value[name] === "function"));
 }
 
 module.exports = {
@@ -816,4 +830,5 @@ module.exports = {
   MemberConversationProviderDispatchError,
   createMemberConversationProviderDispatchAuthorization,
   createMemberConversationProviderDispatchService,
+  validMemberConversationProviderDispatchService,
 };
