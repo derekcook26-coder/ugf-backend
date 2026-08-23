@@ -51,6 +51,7 @@ var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-
   var { composeGymMasterMemberConversationTurnRoute } = require("./src/goals-coach/gymmaster-member-conversation-turn-route-composition");
   var { createProductionMemberConversationAuthorizationAdapters } = require("./src/goals-coach/member-conversation-authorization-adapters");
   var { createMemberConversationTurnSafetyClassifier } = require("./src/goals-coach/member-conversation-turn-safety");
+  var { createProductionMemberConversationProviderDispatchComposition } = require("./src/goals-coach/member-conversation-provider-dispatch-composition");
 var {
   completeNamePair,
   createPlanRouteTerminalContext,
@@ -173,6 +174,15 @@ composeGymMasterMemberTodayRoute(app, memberTodayStartup);
     createProductionMemberConversationAuthorizationAdapters({
       pool: db,
       fetchImpl: fetch,
+    });
+  // The durable provider-dispatch repository is constructed provider-free and
+  // performs no startup work. It is deliberately not supplied as the turn
+  // idempotency dependency: provider transport and runtime orchestration remain
+  // separately gated, so the route stays absent/not_ready.
+  var memberConversationProviderDispatch =
+    createProductionMemberConversationProviderDispatchComposition({
+      pool: db,
+      authorizationAdapters: memberConversationAuthorization,
     });
   var memberConversationTurnSafetyClassifier =
     createMemberConversationTurnSafetyClassifier();
