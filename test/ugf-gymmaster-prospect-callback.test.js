@@ -63,7 +63,11 @@ test("submission validation accepts only four contact fields, consent, and an em
   assert.deepEqual(normalizeSubmission({
     firstName: "  Ana María ", lastName: "O’Neil-Smith", email: " ANA@EXAMPLE.COM ",
     phone: "+1 (605) 555-0123", location: "rapid_valley", consent: true, website: "",
-  }), { firstName: "Ana María", lastName: "O’Neil-Smith", email: "ana@example.com", phone: "+16055550123", location: "rapid_valley" });
+  }), { firstName: "Ana María", lastName: "O’Neil-Smith", email: "ana@example.com", phone: "+16055550123", location: "rapid_valley", inquiryType: "callback" });
+  assert.deepEqual(normalizeSubmission({
+    firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123",
+    location: "black_hawk", inquiryType: "free_week_trial", consent: true,
+  }).inquiryType, "free_week_trial");
   for (const invalid of [
     {},
     { firstName: "Ana", lastName: "Smith", email: "bad", phone: "6055550123", location: "black_hawk", consent: true },
@@ -72,6 +76,7 @@ test("submission validation accepts only four contact fields, consent, and an em
     { firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123", location: "black_hawk", consent: false },
     { firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123", location: "black_hawk", consent: true, website: "bot" },
     { firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123", location: "black_hawk", consent: true, memberId: 42 },
+    { firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123", location: "black_hawk", inquiryType: "anything", consent: true },
   ]) assert.equal(normalizeSubmission(invalid), null);
 });
 
@@ -99,7 +104,7 @@ test("approved callback sends minimized multipart data server-side and conceals 
   });
   const blackHawk = await submit(running.url, {
     firstName: "Taylor", lastName: "Hill", email: "taylor@example.com",
-    phone: "605-555-0199", location: "black_hawk", consent: true,
+    phone: "605-555-0199", location: "black_hawk", inquiryType: "free_week_trial", consent: true,
   });
   assert.equal(blackHawk.response.status, 201);
   assert.equal(JSON.stringify(result.body).includes("9182"), false);
@@ -114,6 +119,7 @@ test("approved callback sends minimized multipart data server-side and conceals 
     assert.equal(calls[0].text.includes(expected), true);
   }
   assert.equal(calls[1].text.includes("companyid\"\r\n\r\n1"), true);
+  assert.equal(calls[1].text.includes("Website free-week trial request (new members only)."), true);
   for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[0].text.includes(forbidden), false);
 });
 

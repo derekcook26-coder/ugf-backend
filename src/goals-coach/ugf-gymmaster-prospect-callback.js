@@ -37,9 +37,20 @@ function normalizeLocation(value) {
   return value === "black_hawk" || value === "rapid_valley" ? value : null;
 }
 
+function normalizeInquiryType(value) {
+  if (value === undefined) return "callback";
+  return value === "callback" || value === "free_week_trial" || value === "price_match" ? value : null;
+}
+
+function inquiryNote(value) {
+  if (value === "free_week_trial") return "Website free-week trial request (new members only). Contact information submitted with explicit consent.";
+  if (value === "price_match") return "Website 24/7 gym price-matching inquiry. Contact information submitted with explicit consent.";
+  return "Website callback request. Contact information submitted with explicit consent.";
+}
+
 function normalizeSubmission(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const allowed = new Set(["firstName", "lastName", "email", "phone", "location", "consent", "website"]);
+  const allowed = new Set(["firstName", "lastName", "email", "phone", "location", "inquiryType", "consent", "website"]);
   if (Object.keys(body).some((key) => !allowed.has(key)) || body.consent !== true
     || (body.website !== undefined && body.website !== "")) return null;
   const submission = {
@@ -48,6 +59,7 @@ function normalizeSubmission(body) {
     email: normalizeEmail(body.email),
     phone: normalizePhone(body.phone),
     location: normalizeLocation(body.location),
+    inquiryType: normalizeInquiryType(body.inquiryType),
   };
   return Object.values(submission).some((value) => !value) ? null : Object.freeze(submission);
 }
@@ -86,7 +98,7 @@ function createGymMasterProspectClient(options = {}) {
         email: submission.email,
         companyid: String(companyIds[submission.location]),
         phonecell: submission.phone,
-        notes: "Website callback request. Contact information submitted with explicit consent.",
+        notes: inquiryNote(submission.inquiryType),
       });
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
@@ -139,6 +151,7 @@ module.exports = {
   enabled,
   multipartBody,
   normalizeEmail,
+  normalizeInquiryType,
   normalizeLocation,
   normalizeName,
   normalizePhone,
