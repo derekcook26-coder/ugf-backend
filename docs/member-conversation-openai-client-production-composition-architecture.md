@@ -59,9 +59,11 @@ adapter, transport, or callable provider function.
 
 The credential resolver factory accepts an exact dependency object and returns
 an opaque, privately branded resolver. The public object exposes only frozen
-version metadata and one narrow `resolve(operation)` method. Secret material is
-held behind module-private state and has no enumerable property, serializer,
-inspection method, debug representation, or logger field.
+version metadata. Resolution is available only through the narrow exported
+`resolveMemberConversationOpenAICredential(resolver, operation)` function,
+which validates the private resolver brand. Secret material is held behind
+module-private state and has no enumerable property, serializer, inspection
+method, debug representation, or logger field.
 
 Resolution occurs only after all of the following are true:
 
