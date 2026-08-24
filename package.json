@@ -38,6 +38,8 @@
     "rollback:member-conversation-turn-idempotency": "node rollback_018.js",
     "migrate:member-conversation-provider-dispatch": "node migrate_019.js",
     "rollback:member-conversation-provider-dispatch": "node rollback_019.js",
+    "migrate:member-conversation-provider-coaching-replay": "node migrate_020.js",
+    "rollback:member-conversation-provider-coaching-replay": "node rollback_020.js",
     "provision:staff": "node scripts/provision-staff-user.js",
     "provision:alpha-owner": "node scripts/provision-alpha-owner.js"
   },
