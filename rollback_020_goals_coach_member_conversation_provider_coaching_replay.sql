@@ -1,0 +1,9 @@
+DROP TRIGGER enforce_member_conversation_provider_coaching_finalization_insert
+  ON goals_coach_member_conversation_turn_dispatch_events;
+DROP TABLE goals_coach_member_conversation_provider_coaching_replays;
+DROP FUNCTION enforce_member_conversation_provider_coaching_finalization();
+DROP FUNCTION enforce_member_conversation_provider_coaching_replay_insert();
+DROP FUNCTION prevent_member_conversation_provider_coaching_replay_mutation();
+DROP FUNCTION canonical_member_conversation_turn_response_v2(UUID, UUID, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT);
+ALTER TABLE goals_coach_member_conversation_turn_idempotency
+  DROP CONSTRAINT uq_member_conversation_turn_idempotency_exact_identity;
