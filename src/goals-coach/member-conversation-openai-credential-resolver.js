@@ -79,6 +79,7 @@ function createMemberConversationOpenAICredentialAuthority(value = {}) {
   const authority = opaqueToken();
   authorities.set(authority, {
     attemptId: value.attemptId,
+    consumers: new Set(),
     consumed: false,
     generation: 1,
     leases: new Set(),
@@ -93,11 +94,20 @@ function validMemberConversationOpenAICredentialAuthority(value) {
   return Boolean(activeAuthority(value));
 }
 
+function memberConversationOpenAICredentialAuthorityMatchesAttempt(
+  value, attemptId
+) {
+  const state = activeAuthority(value);
+  return Boolean(state && state.attemptId === attemptId);
+}
+
 function revokeMemberConversationOpenAICredentialAuthority(value) {
   const state = value && authorities.get(value);
   if (!state || state.revoked) return false;
   state.revoked = true;
   state.generation += 1;
+  for (const abort of Array.from(state.consumers)) abort();
+  state.consumers.clear();
   for (const controller of Array.from(state.resolutions)) controller.abort();
   state.resolutions.clear();
   for (const lease of Array.from(state.leases)) revokeLeaseState(lease);
@@ -228,14 +238,53 @@ function revokeMemberConversationOpenAICredentialLease(value) {
   return revokeLeaseState(state);
 }
 
+function consumeMemberConversationOpenAICredentialLease(
+  lease, authorityToken, consumer
+) {
+  const { validMemberConversationOpenAIHTTPCredentialConsumer } = require(
+    "./member-conversation-openai-http-client"
+  );
+  if (!validMemberConversationOpenAIHTTPCredentialConsumer(consumer)
+    || !validMemberConversationOpenAICredentialLease(lease, authorityToken)) {
+    return null;
+  }
+  const state = leases.get(lease);
+  const credential = state.credential;
+  revokeLeaseState(state);
+  return credential;
+}
+
+function subscribeMemberConversationOpenAICredentialAuthority(
+  authorityToken, consumer, abort
+) {
+  const { validMemberConversationOpenAIHTTPCredentialConsumer } = require(
+    "./member-conversation-openai-http-client"
+  );
+  const state = activeAuthority(authorityToken);
+  if (!state || !validMemberConversationOpenAIHTTPCredentialConsumer(consumer)
+    || typeof abort !== "function") return null;
+  state.consumers.add(abort);
+  const unsubscribeTerminal = state.terminalState.subscribe(abort);
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    state.consumers.delete(abort);
+    unsubscribeTerminal();
+  };
+}
+
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
   MEMBER_CONVERSATION_OPENAI_CREDENTIAL_RESOLVER_VERSION,
   createMemberConversationOpenAICredentialAuthority,
   createMemberConversationOpenAICredentialResolver,
+  consumeMemberConversationOpenAICredentialLease,
+  memberConversationOpenAICredentialAuthorityMatchesAttempt,
   resolveMemberConversationOpenAICredential,
   revokeMemberConversationOpenAICredentialAuthority,
   revokeMemberConversationOpenAICredentialLease,
+  subscribeMemberConversationOpenAICredentialAuthority,
   validMemberConversationOpenAICredentialAuthority,
   validMemberConversationOpenAICredentialLease,
   validMemberConversationOpenAICredentialResolver,
