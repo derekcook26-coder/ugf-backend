@@ -14,6 +14,7 @@ const {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
   MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
   createMemberConversationOpenAIResponsesAdapter,
+  createMemberConversationOpenAIResponsesRequest,
   createMemberConversationOpenAIResponsesClient,
   validMemberConversationOpenAIResponsesAdapter,
   validMemberConversationOpenAIResponsesClient,
@@ -149,6 +150,38 @@ test("one offline call emits only the exact privately branded provider result", 
     requestEnvelopeDigestSha256: sha256(JSON.stringify(created.request)),
     version: "GC-MEMBER-CONVERSATION-PROVIDER-RESULT-1",
   });
+});
+
+test("genuine adapter derives one exact branded request from its private closed policy", () => {
+  const created = setup();
+  const prepared = createDeterministicMemberConversationProviderRequest({
+    developerPromptSha256: sha256(developerPrompt),
+    responseSchemaSha256: sha256(JSON.stringify(responseSchema)),
+  });
+  const assignedAttempt = "10000000-0000-4000-8000-000000000099";
+  const request = createMemberConversationOpenAIResponsesRequest(created.adapter, {
+    attemptId: assignedAttempt,
+    turnRequest: prepared.input.turnRequest,
+    turnResponse: prepared.input.turnResponse,
+  });
+  assert.ok(request);
+  assert.equal(request.attemptId, assignedAttempt);
+  assert.equal(request.model, created.adapter.model);
+  assert.equal(request.responseSchemaVersion, created.adapter.responseSchemaVersion);
+  assert.equal(request.memberTurn, prepared.input.turnRequest.memberText);
+  assert.equal(createMemberConversationOpenAIResponsesRequest(
+    Object.freeze({ ...created.adapter }), {
+      attemptId: assignedAttempt,
+      turnRequest: prepared.input.turnRequest,
+      turnResponse: prepared.input.turnResponse,
+    }
+  ), null);
+  assert.equal(createMemberConversationOpenAIResponsesRequest(created.adapter, {
+    attemptId: assignedAttempt,
+    turnRequest: prepared.input.turnRequest,
+    turnResponse: prepared.input.turnResponse,
+    unknown: true,
+  }), null);
 });
 
 test("captured request is minimized, stateless, exact, and provider-identity free", async () => {
