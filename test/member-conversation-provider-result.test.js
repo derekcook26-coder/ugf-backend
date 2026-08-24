@@ -16,6 +16,7 @@ const {
   createMemberConversationProviderResultAuthority,
   createMemberConversationTurnResponseV2,
   memberConversationTurnResponseV2Digest,
+  memberConversationProviderResultAuthorityMatchesRequest,
   parseMemberConversationTurnResponseV2,
   readMemberConversationProviderResult,
   revokeMemberConversationProviderResultAuthority,
@@ -150,6 +151,30 @@ test("cross-authority swaps fail and explicit generation revocation is permanent
     providerRequestId: "request-late",
     providerResponseId: "response-late",
   }), null);
+});
+
+test("authority request binding is exact and revocation-aware", () => {
+  const firstRequest = createDeterministicMemberConversationProviderRequest().request;
+  const secondRequest = createDeterministicMemberConversationProviderRequest({
+    memberTurn: "Different safe turn.",
+  }).request;
+  const authority = createMemberConversationProviderResultAuthority({
+    request: firstRequest,
+    terminalState: createTerminalState(),
+  });
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    authority, firstRequest
+  ), true);
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    authority, secondRequest
+  ), false);
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    authority, Object.freeze({ ...firstRequest })
+  ), false);
+  revokeMemberConversationProviderResultAuthority(authority);
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    authority, firstRequest
+  ), false);
 });
 
 test("terminal abort or deadline revokes every later result operation", () => {

@@ -151,6 +151,14 @@ function validMemberConversationProviderResultAuthority(value) {
   return Boolean(activeAuthority(value));
 }
 
+function memberConversationProviderResultAuthorityMatchesRequest(authorityToken, request) {
+  const authority = activeAuthority(authorityToken);
+  if (!authority || !validMemberConversationProviderRequest(request)) return false;
+  const requestEnvelopeDigestSha256 = memberConversationProviderRequestDigest(request);
+  return request.attemptId === authority.attemptId
+    && requestEnvelopeDigestSha256 === authority.requestEnvelopeDigestSha256;
+}
+
 function revokeMemberConversationProviderResultAuthority(value) {
   const state = value && authorities.get(value);
   if (!state || state.revoked) return false;
@@ -211,6 +219,7 @@ module.exports = {
   createMemberConversationProviderResultAuthority,
   createMemberConversationTurnResponseV2,
   memberConversationTurnResponseV2Digest,
+  memberConversationProviderResultAuthorityMatchesRequest,
   parseMemberConversationTurnResponseV2,
   readMemberConversationProviderResult,
   revokeMemberConversationProviderResultAuthority,
