@@ -6,6 +6,8 @@ const {
   positiveRemainingMilliseconds,
 } = require("./bounded-postgres-transaction");
 const {
+  MEMBER_CONVERSATION_PROVIDER_REQUEST_VERSION,
+  createMemberConversationProviderRequest,
   validMemberConversationProviderRequest,
 } = require("./member-conversation-provider-request-envelope");
 const {
@@ -20,6 +22,9 @@ const {
   MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
   parseMemberConversationProviderOutput,
 } = require("./member-conversation-provider-output-policy");
+const {
+  MEMBER_CONVERSATION_PROVIDER_TRANSPORT_VERSION,
+} = require("./member-conversation-provider-transport");
 
 const MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION =
   "GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-ADAPTER-1";
@@ -30,6 +35,7 @@ const PROVIDER_SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const PROVIDER_IDENTIFIER = /^[\x21-\x7e]{1,255}$/;
 const ADAPTER_KEYS = Object.freeze(["client", "policy", "version"]);
+const ADAPTER_REQUEST_KEYS = Object.freeze(["attemptId", "turnRequest", "turnResponse"]);
 const CLIENT_KEYS = Object.freeze([
   "automaticRetries", "createResponse", "maximumAttempts", "version",
 ]);
@@ -51,7 +57,7 @@ const SCHEMA_KEYS = Object.freeze([
 const SCHEMA_PROPERTY_KEYS = Object.freeze(["coaching"]);
 const SCHEMA_COACHING_KEYS = Object.freeze(["maxLength", "type"]);
 const brandedClients = new WeakSet();
-const brandedAdapters = new WeakSet();
+const brandedAdapters = new WeakMap();
 const consumedAuthorities = new WeakSet();
 
 function exactObject(value) {
@@ -343,8 +349,38 @@ function createMemberConversationOpenAIResponsesAdapter(value = {}) {
     runtimeWired: false,
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
   });
-  brandedAdapters.add(adapter);
+  brandedAdapters.set(adapter, { policy });
   return adapter;
+}
+
+function createMemberConversationOpenAIResponsesRequest(adapter, value = {}) {
+  const state = adapter && brandedAdapters.get(adapter);
+  if (!state || !exactKeys(value, ADAPTER_REQUEST_KEYS)) return null;
+  const policy = state.policy;
+  return createMemberConversationProviderRequest({
+    version: MEMBER_CONVERSATION_PROVIDER_REQUEST_VERSION,
+    transportVersion: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_VERSION,
+    attemptId: value.attemptId,
+    model: policy.model,
+    developerPromptVersion: policy.developerPromptVersion,
+    developerPromptSha256: policy.developerPromptSha256,
+    responseSchemaVersion: policy.responseSchemaVersion,
+    responseSchemaSha256: policy.responseSchemaSha256,
+    turnRequest: value.turnRequest,
+    turnResponse: value.turnResponse,
+    controls: {
+      background: false,
+      conversation: null,
+      maxOutputTokens: policy.maxOutputTokens,
+      metadata: null,
+      previousResponseId: null,
+      store: false,
+      stream: false,
+      tools: [],
+      truncation: "disabled",
+    },
+    regionPolicy: policy.regionPolicy,
+  });
 }
 
 function validMemberConversationOpenAIResponsesAdapter(value) {
@@ -360,6 +396,7 @@ module.exports = {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
   MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
   createMemberConversationOpenAIResponsesAdapter,
+  createMemberConversationOpenAIResponsesRequest,
   createMemberConversationOpenAIResponsesClient,
   validMemberConversationOpenAIResponsesAdapter,
   validMemberConversationOpenAIResponsesClient,
