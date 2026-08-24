@@ -10,8 +10,14 @@ function createDeterministicMemberConversationOpenAIResponsesClient(options = {}
   let resolvePending;
   const client = createMemberConversationOpenAIResponsesClient({
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
+    automaticRetries: false,
+    maximumAttempts: 1,
     createResponse: async (request) => {
       calls.push(request);
+      if (options.blockMilliseconds) {
+        const until = Date.now() + options.blockMilliseconds;
+        while (Date.now() < until) {}
+      }
       if (options.pending) await new Promise((resolve, reject) => {
         const cleanup = () => request.signal.removeEventListener("abort", abort);
         const abort = () => {

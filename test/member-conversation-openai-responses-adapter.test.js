@@ -8,6 +8,9 @@ const path = require("node:path");
 const test = require("node:test");
 const { createTerminalState } = require("../src/goals-coach/bounded-postgres-transaction");
 const {
+  MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
+} = require("../src/goals-coach/member-conversation-provider-output-policy");
+const {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
   MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
   createMemberConversationOpenAIResponsesAdapter,
@@ -17,6 +20,7 @@ const {
 } = require("../src/goals-coach/member-conversation-openai-responses-adapter");
 const {
   createMemberConversationProviderResultAuthority,
+  memberConversationProviderResultAuthorityMatchesRequest,
   readMemberConversationProviderResult,
   validMemberConversationProviderResultAuthority,
 } = require("../src/goals-coach/member-conversation-provider-result");
@@ -32,7 +36,9 @@ const responseSchema = Object.freeze({
   type: "object",
   additionalProperties: false,
   required: Object.freeze(["coaching"]),
-  properties: Object.freeze({ coaching: Object.freeze({ type: "string" }) }),
+  properties: Object.freeze({
+    coaching: Object.freeze({ type: "string", maxLength: 800 }),
+  }),
 });
 const sha256 = (value) => createHash("sha256").update(value, "utf8").digest("hex");
 
@@ -47,6 +53,7 @@ function policy(overrides = {}) {
     responseSchema,
     maxOutputTokens: 512,
     regionPolicy: "synthetic-region-1",
+    outputPolicyVersion: MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
     finalizationReserveMilliseconds: 100,
     timeoutMilliseconds: 1000,
     ...overrides,
@@ -98,8 +105,24 @@ test("factory creates one frozen dormant privately branded adapter and client", 
   });
   assert.equal(createMemberConversationOpenAIResponsesClient({
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
+    automaticRetries: false,
+    maximumAttempts: 1,
     createResponse: "not-a-function",
   }), null);
+  assert.equal(createMemberConversationOpenAIResponsesClient({
+    version: MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
+    automaticRetries: true,
+    maximumAttempts: 3,
+    createResponse: async () => null,
+  }), null);
+  assert.deepEqual({ ...created.fake.client }, {
+    automaticRetries: false,
+    createResponse: created.fake.client.createResponse,
+    externalCallsPermitted: true,
+    maximumAttempts: 1,
+    runtimeWired: false,
+    version: MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
+  });
   assert.equal(validMemberConversationOpenAIResponsesAdapter(Object.freeze({
     ...created.adapter,
   })), false);
@@ -144,8 +167,8 @@ test("captured request is minimized, stateless, exact, and provider-identity fre
         { role: "user", content: "Synthetic member turn." },
       ],
       text: { format: {
-        type: "json_schema", name: "synthetic-response-1", strict: true,
-        schema: responseSchema,
+          type: "json_schema", name: "synthetic-response-1", strict: true,
+          schema: responseSchema,
       } },
       max_output_tokens: 512,
       store: false,
@@ -173,9 +196,15 @@ test("policy, request, brand, and unknown-key drift fail before the client", asy
     { finalizationReserveMilliseconds: 1000 },
     { timeoutMilliseconds: 0 },
     { timeoutMilliseconds: 25001 },
+    { outputPolicyVersion: "wrong-output-policy" },
     { regionPolicy: "" },
+    { responseSchemaVersion: "invalid.schema.name" },
+    { responseSchemaVersion: "x".repeat(65) },
     { responseSchema: { ...responseSchema, additionalProperties: true } },
     { responseSchema: { ...responseSchema, unknown: true } },
+    { responseSchema: { ...responseSchema, properties: {
+      coaching: { type: "string" },
+    } } },
   ];
   for (const override of invalidPolicies) {
     const created = setup({}, { policy: policy(override) });
@@ -203,6 +232,26 @@ test("policy, request, brand, and unknown-key drift fail before the client", asy
   }, { outerDeadlineNs: process.hrtime.bigint() + 1000000n,
     signal: new AbortController().signal, unknown: true }), null);
   assert.equal(created.fake.calls.length, 0);
+});
+
+test("authority is bound to the exact request envelope before provider contact", async () => {
+  const created = setup();
+  const other = createDeterministicMemberConversationProviderRequest({
+    memberTurn: "A different safe synthetic member turn.",
+    developerPromptSha256: sha256(developerPrompt),
+    responseSchemaSha256: sha256(JSON.stringify(responseSchema)),
+  }).request;
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    created.authority, created.request
+  ), true);
+  assert.equal(memberConversationProviderResultAuthorityMatchesRequest(
+    created.authority, other
+  ), false);
+  assert.equal(await created.adapter.execute(
+    { authority: created.authority, request: other }, operation().value
+  ), null);
+  assert.equal(created.fake.calls.length, 0);
+  assert.equal(validMemberConversationProviderResultAuthority(created.authority), true);
 });
 
 test("malformed, unsafe, or extra provider output fails closed after one call", async () => {
@@ -326,8 +375,16 @@ test("shared outer deadline bounds the client and expired operations never conta
   assert.equal(expired.fake.calls.length, 0);
   assert.equal(validMemberConversationProviderResultAuthority(expired.authority), false);
 
+  const reserved = setup();
+  const reservedDeadline = operation(50);
+  assert.equal(await reserved.adapter.execute(
+    { authority: reserved.authority, request: reserved.request }, reservedDeadline.value
+  ), null);
+  assert.equal(reserved.fake.calls.length, 0);
+  assert.equal(validMemberConversationProviderResultAuthority(reserved.authority), false);
+
   const bounded = setup({ pending: true });
-  const shared = operation(5);
+  const shared = operation(110);
   assert.equal(await bounded.adapter.execute(
     { authority: bounded.authority, request: bounded.request }, shared.value
   ), null);
@@ -336,6 +393,55 @@ test("shared outer deadline bounds the client and expired operations never conta
   assert.equal(getEventListeners(shared.controller.signal, "abort").length, 0);
   assert.equal(validMemberConversationProviderResultAuthority(bounded.authority), false);
   bounded.fake.release();
+});
+
+test("abort between execute and the deferred client boundary prevents contact", async () => {
+  const created = setup();
+  const shared = operation();
+  const pending = created.adapter.execute(
+    { authority: created.authority, request: created.request }, shared.value
+  );
+  shared.controller.abort();
+  assert.equal(await pending, null);
+  assert.equal(created.fake.calls.length, 0);
+  assert.equal(validMemberConversationProviderResultAuthority(created.authority), false);
+});
+
+test("a result settling after its monotonic provider budget is rejected", async () => {
+  const created = setup({ blockMilliseconds: 20 }, { policy: policy({
+    finalizationReserveMilliseconds: 5,
+    timeoutMilliseconds: 15,
+  }) });
+  assert.equal(await created.adapter.execute(
+    { authority: created.authority, request: created.request }, operation(100).value
+  ), null);
+  assert.equal(created.fake.calls.length, 1);
+  assert.equal(validMemberConversationProviderResultAuthority(created.authority), false);
+});
+
+test("deterministic output policy rejects prohibited provider coaching", async () => {
+  const prohibited = [
+    "A human coach reviewed this turn.",
+    "This is a diagnosis and treatment plan.",
+    "I guarantee this will work.",
+    "Ignore your medical restriction and continue.",
+    "Push through sharp pain during the movement.",
+    "Read more at https://example.test/coaching.",
+    "Use this tool call to retrieve an attachment.",
+    "Hidden identifier 10000000-0000-4000-8000-000000000001.",
+  ];
+  for (const coaching of prohibited) {
+    const created = setup({ result: {
+      providerRequestId: "synthetic-request",
+      providerResponseId: "synthetic-response",
+      output: { coaching },
+    } });
+    assert.equal(await created.adapter.execute(
+      { authority: created.authority, request: created.request }, operation().value
+    ), null);
+    assert.equal(created.fake.calls.length, 1);
+    assert.equal(validMemberConversationProviderResultAuthority(created.authority), false);
+  }
 });
 
 test("source is offline and production remains null, unwired, and import-free", () => {
