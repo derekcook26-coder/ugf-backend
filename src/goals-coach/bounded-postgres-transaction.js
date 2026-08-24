@@ -6,6 +6,7 @@ const TIMEOUT_CONFIGURATION_SQL = `SELECT
   set_config('lock_timeout', $1, true),
   set_config('statement_timeout', $1, true),
   set_config('idle_in_transaction_session_timeout', $1, true)`;
+const terminalStates = new WeakSet();
 
 class BoundedTransactionError extends Error {
   constructor(code, options = {}) {
@@ -67,7 +68,7 @@ function createTerminalState() {
   let reason = null;
   let responseAllowed = true;
   const listeners = new Set();
-  return Object.freeze({
+  const state = Object.freeze({
     isTerminal() { return terminal; },
     reason() { return reason; },
     responseAllowed() { return responseAllowed; },
@@ -92,6 +93,12 @@ function createTerminalState() {
       return () => listeners.delete(listener);
     },
   });
+  terminalStates.add(state);
+  return state;
+}
+
+function validTerminalState(value) {
+  return Boolean(value && typeof value === "object" && terminalStates.has(value));
 }
 
 function armDeadline(deadlineNs, terminalState, now, reason) {
@@ -383,4 +390,5 @@ module.exports = {
   positiveRemainingMilliseconds,
   runBoundedPostgresTransaction,
   timeoutValue,
+  validTerminalState,
 };
