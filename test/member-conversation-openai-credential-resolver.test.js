@@ -176,10 +176,13 @@ test("abort or revocation before the deferred resolver boundary performs zero re
 });
 
 test("malformed, throwing, cross-authority, and revoked leases fail closed", async () => {
+  let coercions = 0;
   for (const options of [
     { credential: "" },
     { credential: " contains-space " },
     { credential: "x".repeat(513) },
+    { credential: Object("synthetic-openai-credential") },
+    { credential: { toString() { coercions += 1; throw new Error("must not coerce"); } } },
     { error: new Error("synthetic resolver failure") },
   ]) {
     const fake = createDeterministicMemberConversationOpenAICredentialResolver(options);
@@ -188,6 +191,7 @@ test("malformed, throwing, cross-authority, and revoked leases fail closed", asy
       fake.resolver, operation(created.value).value
     ), null);
   }
+  assert.equal(coercions, 0);
 
   const fake = createDeterministicMemberConversationOpenAICredentialResolver();
   const first = authority();
@@ -208,6 +212,23 @@ test("malformed, throwing, cross-authority, and revoked leases fail closed", asy
   assert.equal(revokeMemberConversationOpenAICredentialAuthority(next.value), false);
   assert.equal(validMemberConversationOpenAICredentialAuthority(next.value), false);
   assert.equal(validMemberConversationOpenAICredentialLease(nextLease, next.value), false);
+});
+
+test("authority revocation promptly aborts and settles an in-flight resolution", async () => {
+  const fake = createDeterministicMemberConversationOpenAICredentialResolver({ pending: true });
+  const created = authority();
+  const shared = operation(created.value);
+  const pending = resolveMemberConversationOpenAICredential(fake.resolver, shared.value);
+  while (fake.calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(revokeMemberConversationOpenAICredentialAuthority(created.value), true);
+  assert.equal(fake.calls[0].signal.aborted, true);
+  assert.equal(await Promise.race([
+    pending,
+    new Promise((resolve) => setTimeout(() => resolve("did_not_settle"), 50)),
+  ]), null);
+  assert.equal(getEventListeners(shared.controller.signal, "abort").length, 0);
+  fake.release();
 });
 
 test("a resolved lease is erased by later abort, terminal, deadline, or authority revocation",

@@ -82,6 +82,7 @@ function createMemberConversationOpenAICredentialAuthority(value = {}) {
     consumed: false,
     generation: 1,
     leases: new Set(),
+    resolutions: new Set(),
     revoked: false,
     terminalState: value.terminalState,
   });
@@ -97,6 +98,8 @@ function revokeMemberConversationOpenAICredentialAuthority(value) {
   if (!state || state.revoked) return false;
   state.revoked = true;
   state.generation += 1;
+  for (const controller of Array.from(state.resolutions)) controller.abort();
+  state.resolutions.clear();
   for (const lease of Array.from(state.leases)) revokeLeaseState(lease);
   return true;
 }
@@ -121,6 +124,7 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
 
   const generation = authority.generation;
   const controller = new AbortController();
+  authority.resolutions.add(controller);
   const abort = () => controller.abort();
   let unsubscribe = authority.terminalState.subscribe(abort);
   value.signal.addEventListener("abort", abort, { once: true });
@@ -167,7 +171,8 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
       || !current || current !== authority
       || current.generation !== generation || value.signal.aborted
       || positiveRemainingMilliseconds(value.outerDeadlineNs, monotonicNow()) === null
-      || !CREDENTIAL.test(resolved.credential || "")) return null;
+      || typeof resolved.credential !== "string"
+      || !CREDENTIAL.test(resolved.credential)) return null;
     const lease = opaqueToken();
     const leaseState = {
       authority,
@@ -196,6 +201,7 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
     if (leaseState.revoked) return null;
     return lease;
   } finally {
+    authority.resolutions.delete(controller);
     if (timer) clearTimeout(timer);
     unsubscribe();
     unsubscribe = () => {};
