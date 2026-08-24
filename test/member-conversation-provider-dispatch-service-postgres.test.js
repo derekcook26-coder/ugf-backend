@@ -24,6 +24,10 @@ const {
   parseMemberConversationTurnResponse,
 } = require("../src/goals-coach/member-conversation-turn-contract");
 const {
+  memberConversationTurnResponseV2Digest,
+  parseMemberConversationTurnResponseV2,
+} = require("../src/goals-coach/member-conversation-provider-result");
+const {
   createMemberConversationProviderOrchestrator,
   validMemberConversationProviderOrchestrator,
 } = require("../src/goals-coach/member-conversation-provider-orchestrator");
@@ -36,6 +40,7 @@ const { seedMemberAndPlan } = require("./helpers/disposable-db");
 const migrations = Array.from({ length: 14 }, (_, index) => String(index + 5).padStart(3, "0"))
   .map((number) => require(`../migrate_${number}`).runMigration);
 const { runMigration: runMigration019 } = require("../migrate_019");
+const { runMigration: runMigration020 } = require("../migrate_020");
 const skip = typeof process.getuid === "function" && process.getuid() === 0
   ? "requires unprivileged PostgreSQL 16" : false;
 
@@ -68,6 +73,12 @@ async function databaseAt019(t) {
   });
   await runMigration019({ pool: database.pool });
   assert.match((await database.pool.query("SHOW server_version")).rows[0].server_version, /^16\./);
+  return database;
+}
+
+async function databaseAt020(t) {
+  const database = await databaseAt019(t);
+  await runMigration020({ pool: database.pool });
   return database;
 }
 
@@ -188,6 +199,26 @@ function successInput(reservation, attemptId, overrides = {}) {
     response,
     responseDigestSha256: responseDigest(response),
     ...overrides,
+  };
+}
+
+function successInputV2(reservation, attemptId, coaching = "Keep the movement controlled.") {
+  const base = safeResponse(reservation);
+  const response = parseMemberConversationTurnResponseV2({
+    coaching,
+    contractVersion: "GC-MEMBER-CONVERSATION-TURN-RESPONSE-2",
+    conversation: base.conversation,
+    idempotencyKey: base.idempotencyKey,
+    requestContractVersion: base.contractVersion,
+    requestId: base.requestId,
+    result: base.result,
+  });
+  return {
+    ...attemptInput(reservation, attemptId),
+    providerRequestId: "provider-request-success-v2",
+    providerResponseId: "provider-response-success-v2",
+    response,
+    responseDigestSha256: memberConversationTurnResponseV2Digest(response),
   };
 }
 
@@ -747,6 +778,72 @@ test("provider success, exact replay, and finalized state commit atomically", { 
   assert.equal(replay[0].response_reason, null);
   assert.equal(replay[0].safety_classification, "clear");
   assert.equal(replay[0].safety_action, "allow_provider_processing");
+});
+
+test("RESPONSE-2 coaching replay joins M018 and M020 atomically and replays strictly", { skip }, async (t) => {
+  const database = await databaseAt020(t);
+  const owned = await owner(database.pool, "dispatch-success-v2", "10000000-0000-4000-8000-000000000321");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000321");
+  const attemptId = "30000000-0000-4000-8000-000000000321";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInputV2(input, attemptId, "Breathe steadily.\nKeep the movement controlled.");
+
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+  assert.deepEqual(await service.readFinalized(input), { response: success.response });
+
+  const durable = (await database.pool.query(
+    `SELECT replay.coaching_text,replay.response_digest_sha256,
+            replay.migration_018_row_id,final_row.id AS final_row_id
+       FROM goals_coach_member_conversation_provider_coaching_replays replay
+       JOIN goals_coach_member_conversation_turn_idempotency final_row
+         ON final_row.id=replay.migration_018_row_id
+      WHERE replay.reservation_id=(
+        SELECT id FROM goals_coach_member_conversation_turn_reservations
+         WHERE idempotency_key=$1::uuid)`,
+    [input.idempotencyKey]
+  )).rows;
+  assert.equal(durable.length, 1);
+  assert.equal(durable[0].coaching_text, success.response.coaching);
+  assert.equal(durable[0].response_digest_sha256, success.responseDigestSha256);
+  assert.equal(String(durable[0].migration_018_row_id), String(durable[0].final_row_id));
+  assert.deepEqual((await database.pool.query(
+    `SELECT event_type FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE reservation_id=(SELECT id FROM goals_coach_member_conversation_turn_reservations
+                             WHERE idempotency_key=$1::uuid)
+      ORDER BY event_sequence`,
+    [input.idempotencyKey]
+  )).rows.map((row) => row.event_type), [
+    "reserved", "lease_acquired", "dispatch_started", "provider_succeeded", "finalized",
+  ]);
+});
+
+test("RESPONSE-2 companion or finalized failures roll back every success authority row", { skip }, async (t) => {
+  const database = await databaseAt020(t);
+  const owned = await owner(database.pool, "dispatch-success-v2-rollback", "10000000-0000-4000-8000-000000000322");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000322");
+  const attemptId = "30000000-0000-4000-8000-000000000322";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInputV2(input, attemptId);
+
+  const failing = dispatchService(failOncePool(database.pool, (text) =>
+    String(text).includes("INSERT INTO goals_coach_member_conversation_provider_coaching_replays")));
+  await assert.rejects(failing.finalizeSuccess(success), (error) => error.code === "database_unavailable");
+  const counts = (await database.pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_turn_idempotency) final_rows,
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_provider_coaching_replays) companions,
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_turn_dispatch_events
+         WHERE event_type IN ('provider_succeeded','finalized')) terminal_events`
+  )).rows[0];
+  assert.deepEqual(counts, { final_rows: 0, companions: 0, terminal_events: 0 });
+  assert.equal((await service.read(input)).state, "dispatch_started");
 });
 
 test("success conflicts and terminal states create no partial replay authority", { skip }, async (t) => {
