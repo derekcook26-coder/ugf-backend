@@ -22,6 +22,10 @@ const {
 const {
   parseMemberConversationTurnResponse,
 } = require("./member-conversation-turn-contract");
+const {
+  memberConversationTurnResponseV2Digest,
+  parseMemberConversationTurnResponseV2,
+} = require("./member-conversation-provider-result");
 
 const MEMBER_CONVERSATION_PROVIDER_DISPATCH_CONTRACT_VERSION =
   "GC-MEMBER-CONVERSATION-PROVIDER-DISPATCH-1";
@@ -180,16 +184,25 @@ function parseSuccessInput(value) {
   const providerResponseId = exactString(value.providerResponseId, PROVIDER_IDENTIFIER);
   const responseDigestSha256 = exactString(value.responseDigestSha256, SHA256);
   let response;
-  try { response = parseMemberConversationTurnResponse(value.response); }
-  catch { return null; }
+  let responseVersion = 1;
+  try { response = parseMemberConversationTurnResponseV2(value.response); responseVersion = 2; }
+  catch (_) {
+    try { response = parseMemberConversationTurnResponse(value.response); }
+    catch { return null; }
+  }
+  const derivedDigest = responseVersion === 2
+    ? memberConversationTurnResponseV2Digest(response)
+    : memberConversationTurnResponseDigest(response);
   return attempt
     && providerRequestId
     && providerResponseId
     && responseDigestSha256
-    && responseDigestSha256 === memberConversationTurnResponseDigest(response)
+    && responseDigestSha256 === derivedDigest
     && response.requestId === attempt.reservation.idempotencyKey
     && response.idempotencyKey === attempt.reservation.idempotencyKey
-    && response.contractVersion === attempt.reservation.contractVersion
+    && (responseVersion === 2
+      ? response.requestContractVersion === attempt.reservation.contractVersion
+      : response.contractVersion === attempt.reservation.contractVersion)
     && response.conversation.reference === attempt.reservation.conversation.reference
     && response.conversation.version === attempt.reservation.conversation.version
     && response.conversation.provenance === attempt.reservation.conversation.provenance
@@ -206,6 +219,7 @@ function parseSuccessInput(value) {
       providerResponseId,
       response,
       responseDigestSha256,
+      responseVersion,
     }) : null;
 }
 
@@ -387,6 +401,58 @@ function storedSafeResponse(row) {
   } catch (error) {
     throw new MemberConversationProviderDispatchError("invalid_final_replay", error);
   }
+}
+
+function storedResponseV2(row, companion) {
+  if (!companion) return null;
+  try {
+    return parseMemberConversationTurnResponseV2({
+      coaching: companion.coaching_text,
+      contractVersion: companion.response_contract_version,
+      conversation: {
+        provenance: row.conversation_provenance,
+        reference: String(row.conversation_reference).toLowerCase(),
+        version: Number(row.conversation_version),
+      },
+      idempotencyKey: String(row.idempotency_key).toLowerCase(),
+      requestContractVersion: row.contract_version,
+      requestId: String(row.idempotency_key).toLowerCase(),
+      result: {
+        reason: row.response_reason,
+        safety: {
+          action: row.safety_action,
+          classification: row.safety_classification,
+          requestHash: row.request_signature_sha256,
+          ruleVersion: row.safety_rule_version,
+          sourceRuleVersion: row.safety_source_rule_version,
+        },
+        state: row.response_state,
+      },
+    });
+  } catch (error) {
+    throw new MemberConversationProviderDispatchError("invalid_final_replay", error);
+  }
+}
+
+function finalResponseDigest(response) {
+  return response.contractVersion === "GC-MEMBER-CONVERSATION-TURN-RESPONSE-2"
+    ? memberConversationTurnResponseV2Digest(response)
+    : memberConversationTurnResponseDigest(response);
+}
+
+async function coachingReplay(query, reservationId) {
+  const schema = await query(
+    `SELECT to_regclass(
+       'public.goals_coach_member_conversation_provider_coaching_replays'
+     )::text AS relation`
+  );
+  if (!(schema.rows && schema.rows[0] && schema.rows[0].relation)) return null;
+  const result = await query(
+    `SELECT * FROM goals_coach_member_conversation_provider_coaching_replays
+      WHERE reservation_id=$1`,
+    [reservationId]
+  );
+  return result.rows && result.rows[0] ? result.rows[0] : null;
 }
 
 function sameSafeResponse(left, right) {
@@ -586,11 +652,15 @@ function createMemberConversationProviderDispatchService(options = {}) {
             AND request_signature_sha256=$3`,
         [input.idempotencyKey, input.conversationBindingId, input.requestSignatureSha256]
       );
-      const response = storedSafeResponse(finalResult.rows && finalResult.rows[0]);
+      const finalRow = finalResult.rows && finalResult.rows[0];
+      const companion = await coachingReplay(query, reservation.id);
+      const response = companion
+        ? storedResponseV2(finalRow, companion) : storedSafeResponse(finalRow);
       if (!receipt
         || !UUID.test(String(receipt.attempt_id).toLowerCase())
         || !SHA256.test(String(receipt.response_digest_sha256))
-        || receipt.response_digest_sha256 !== memberConversationTurnResponseDigest(response)) {
+        || receipt.response_digest_sha256 !== finalResponseDigest(response)
+        || (companion && companion.response_digest_sha256 !== receipt.response_digest_sha256)) {
         throw new MemberConversationProviderDispatchError("invalid_final_replay");
       }
       return Object.freeze({ response });
@@ -724,14 +794,17 @@ function createMemberConversationProviderDispatchService(options = {}) {
             input.reservation.requestSignatureSha256,
           ]
         );
-        const response = storedSafeResponse(finalResult.rows && finalResult.rows[0]);
+        const finalRow = finalResult.rows && finalResult.rows[0];
+        const companion = await coachingReplay(query, reservation.id);
+        const response = companion
+          ? storedResponseV2(finalRow, companion) : storedSafeResponse(finalRow);
         if (!receipt
           || String(receipt.attempt_id).toLowerCase() !== input.attemptId
           || receipt.provider_request_id !== input.providerRequestId
           || receipt.provider_response_id !== input.providerResponseId
           || receipt.response_digest_sha256 !== input.responseDigestSha256
-          || receipt.response_digest_sha256 !== memberConversationTurnResponseDigest(response)
-          || !sameSafeResponse(response, input.response)) {
+          || receipt.response_digest_sha256 !== finalResponseDigest(response)
+          || JSON.stringify(response) !== JSON.stringify(input.response)) {
           throw new MemberConversationProviderDispatchError("success_conflict");
         }
         return Object.freeze({ response });
@@ -749,13 +822,14 @@ function createMemberConversationProviderDispatchService(options = {}) {
         responseDigestSha256: input.responseDigestSha256,
         terminalCategory: "success",
       });
-      await query(
+      const finalInsert = await query(
         `INSERT INTO goals_coach_member_conversation_turn_idempotency
            (idempotency_key,conversation_binding_id,conversation_reference,
             conversation_version,conversation_provenance,request_signature_sha256,
             contract_version,safety_rule_version,safety_source_rule_version,
             response_state,response_reason,safety_classification,safety_action)
-         VALUES($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+         VALUES($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         RETURNING id`,
         [
           input.reservation.idempotencyKey,
           input.reservation.conversationBindingId,
@@ -772,6 +846,36 @@ function createMemberConversationProviderDispatchService(options = {}) {
           input.response.result.safety.action,
         ]
       );
+      if (input.responseVersion === 2) {
+        const finalRow = finalInsert.rows && finalInsert.rows[0];
+        if (!finalRow || !DATABASE_ID.test(String(finalRow.id))) {
+          throw new MemberConversationProviderDispatchError("invalid_final_replay");
+        }
+        const coachingDigestSha256 = crypto.createHash("sha256")
+          .update(input.response.coaching, "utf8").digest("hex");
+        await query(
+          `INSERT INTO goals_coach_member_conversation_provider_coaching_replays
+             (reservation_id,migration_018_row_id,idempotency_key,
+              conversation_binding_id,conversation_reference,conversation_version,
+              conversation_provenance,request_signature_sha256,response_contract_version,
+              coaching_text,response_digest_sha256,coaching_digest_sha256)
+           VALUES($1,$2,$3::uuid,$4,$5::uuid,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            reservation.id,
+            finalRow.id,
+            input.reservation.idempotencyKey,
+            input.reservation.conversationBindingId,
+            input.reservation.conversation.reference,
+            input.reservation.conversation.version,
+            input.reservation.conversation.provenance,
+            input.reservation.requestSignatureSha256,
+            input.response.contractVersion,
+            input.response.coaching,
+            input.responseDigestSha256,
+            coachingDigestSha256,
+          ]
+        );
+      }
       await appendEvent(query, reservation.id, { eventType: "finalized" });
       return Object.freeze({ response: input.response });
     });
