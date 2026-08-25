@@ -7,6 +7,7 @@ const {
 } = require("./bounded-postgres-transaction");
 const {
   createMemberConversationOpenAIResponsesRequest,
+  readMemberConversationOpenAIResponsesRejection,
   validMemberConversationOpenAIResponsesAdapter,
 } = require("./member-conversation-openai-responses-adapter");
 const {
@@ -139,6 +140,12 @@ function createMemberConversationOpenAIResponsesTransport(value = {}) {
           outerDeadlineNs: operation.outerDeadlineNs,
           signal: controller.signal,
         }));
+        const rejection = readMemberConversationOpenAIResponsesRejection(resultToken);
+        if (rejection && !operation.terminalState.isTerminal()
+          && !(operation.signal && operation.signal.aborted)
+          && positiveRemainingMilliseconds(
+            operation.outerDeadlineNs, monotonicNow()
+          ) !== null) return Object.freeze({ category: "rejected", ...rejection });
         const result = readMemberConversationProviderResult(resultToken, authority);
         if (!result || operation.terminalState.isTerminal()
           || (operation.signal && operation.signal.aborted)

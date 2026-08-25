@@ -174,6 +174,8 @@ function parsedOutcome(value, state) {
   return {
     body: Buffer.from(value.body),
     contentType: value.headers["content-type"],
+    providerRequestId: typeof value.headers["x-request-id"] === "string"
+      ? value.headers["x-request-id"] : null,
     statusCode: value.statusCode,
   };
 }
@@ -312,8 +314,15 @@ function readMemberConversationOpenAIHTTPResponse(value) {
   return Object.freeze({
     body: Buffer.from(state.body),
     contentType: state.contentType,
+    providerRequestId: state.providerRequestId,
     statusCode: state.statusCode,
   });
+}
+
+function memberConversationOpenAIHTTPClientMatchesOrigin(value, origin) {
+  const state = value && clients.get(value);
+  const normalized = normalizedOrigin(origin);
+  return Boolean(state && normalized && state.origin === normalized);
 }
 
 module.exports = {
@@ -322,6 +331,7 @@ module.exports = {
   createMemberConversationOpenAIBoundedHTTPInterface,
   createMemberConversationOpenAIHTTPClient,
   executeMemberConversationOpenAIHTTPRequest,
+  memberConversationOpenAIHTTPClientMatchesOrigin,
   readMemberConversationOpenAIHTTPResponse,
   validMemberConversationOpenAIBoundedHTTPInterface,
   validMemberConversationOpenAIHTTPCredentialConsumer,

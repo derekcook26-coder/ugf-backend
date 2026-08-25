@@ -50,6 +50,10 @@ const OPERATION_KEYS = Object.freeze(["outerDeadlineNs", "signal"]);
 const CLIENT_RESULT_KEYS = Object.freeze([
   "output", "providerRequestId", "providerResponseId",
 ]);
+const CLIENT_REJECTION_KEYS = Object.freeze(["classification", "providerRequestId"]);
+const REJECTION_CATEGORIES = Object.freeze([
+  "authentication_rejected", "rate_limited", "request_rejected",
+]);
 const OUTPUT_KEYS = Object.freeze(["coaching"]);
 const SCHEMA_KEYS = Object.freeze([
   "additionalProperties", "properties", "required", "type",
@@ -59,6 +63,7 @@ const SCHEMA_COACHING_KEYS = Object.freeze(["maxLength", "type"]);
 const brandedClients = new WeakSet();
 const brandedAdapters = new WeakMap();
 const consumedAuthorities = new WeakSet();
+const rejectionResults = new WeakMap();
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -212,6 +217,14 @@ function providerRequest(request, policy, signal) {
 }
 
 function parseClientResult(value) {
+  if (exactKeys(value, CLIENT_REJECTION_KEYS)
+    && REJECTION_CATEGORIES.includes(value.classification)
+    && PROVIDER_IDENTIFIER.test(value.providerRequestId || "")) {
+    return Object.freeze({
+      rejection: value.classification,
+      providerRequestId: value.providerRequestId,
+    });
+  }
   return exactKeys(value, CLIENT_RESULT_KEYS)
     && exactKeys(value.output, OUTPUT_KEYS)
     && PROVIDER_IDENTIFIER.test(value.providerRequestId || "")
@@ -285,9 +298,13 @@ function createMemberConversationOpenAIResponsesAdapter(value = {}) {
           || !memberConversationProviderResultAuthorityMatchesRequest(
             input.authority, input.request
           )) throw new Error("Provider contact authority expired");
-        return client.createResponse(providerRequest(
-          input.request, policy, controller.signal
-        ));
+        return client.createResponse(
+          providerRequest(input.request, policy, controller.signal),
+          Object.freeze({
+            outerDeadlineNs: operation.outerDeadlineNs,
+            signal: controller.signal,
+          })
+        );
       })
       .then((result) => ({ result }), () => ({ failed: true }));
     const winner = await Promise.race([pending, timeout, cancellation]);
@@ -320,6 +337,12 @@ function createMemberConversationOpenAIResponsesAdapter(value = {}) {
       revokeMemberConversationProviderResultAuthority(input.authority);
       return null;
     }
+    if (parsed.rejection) {
+      const token = Object.freeze(Object.create(null));
+      rejectionResults.set(token, parsed);
+      revokeMemberConversationProviderResultAuthority(input.authority);
+      return token;
+    }
     const approved = parseMemberConversationProviderOutput({
       coaching: parsed.output.coaching,
       version: policy.outputPolicyVersion,
@@ -351,6 +374,16 @@ function createMemberConversationOpenAIResponsesAdapter(value = {}) {
   });
   brandedAdapters.set(adapter, { policy });
   return adapter;
+}
+
+function readMemberConversationOpenAIResponsesRejection(value) {
+  const state = value && rejectionResults.get(value);
+  if (!state) return null;
+  rejectionResults.delete(value);
+  return Object.freeze({
+    providerRequestId: state.providerRequestId,
+    terminalCategory: state.rejection,
+  });
 }
 
 function createMemberConversationOpenAIResponsesRequest(adapter, value = {}) {
@@ -398,6 +431,7 @@ module.exports = {
   createMemberConversationOpenAIResponsesAdapter,
   createMemberConversationOpenAIResponsesRequest,
   createMemberConversationOpenAIResponsesClient,
+  readMemberConversationOpenAIResponsesRejection,
   validMemberConversationOpenAIResponsesAdapter,
   validMemberConversationOpenAIResponsesClient,
 };
