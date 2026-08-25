@@ -81,6 +81,35 @@ function exactIdentifier(value) {
     ? value : null;
 }
 
+function exactSha256(value) {
+  return typeof value === "string" && SHA256.test(value) ? value : null;
+}
+
+function exactUuid(value) {
+  return typeof value === "string" && UUID.test(value) ? value : null;
+}
+
+function safeStructuralData(value, seen = new Set()) {
+  if (value === null || typeof value !== "object") return true;
+  if (isProxy(value) || seen.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype) return false;
+  seen.add(value);
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return ownKeys.every((key) => {
+    const descriptor = descriptors[key];
+    const arrayLength = Array.isArray(value) && key === "length";
+    return descriptor
+      && Object.prototype.hasOwnProperty.call(descriptor, "value")
+      && !Object.prototype.hasOwnProperty.call(descriptor, "get")
+      && !Object.prototype.hasOwnProperty.call(descriptor, "set")
+      && (arrayLength || descriptor.enumerable === true)
+      && safeStructuralData(descriptor.value, seen);
+  });
+}
+
 function parsePolicyCopy(value) {
   if (!exactKeys(value, POLICY_KEYS)
     || value.mode !== "explicit"
@@ -152,9 +181,11 @@ function normalizedRequest(value) {
   if (!exactKeys(value, INPUT_KEYS)
     || value.version !== MEMBER_CONVERSATION_PROVIDER_REQUEST_V2_VERSION
     || value.transportVersion !== MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION
-    || !UUID.test(value.attemptId || "")
-    || !SHA256.test(value.developerPromptSha256 || "")
-    || !SHA256.test(value.responseSchemaSha256 || "")) return null;
+    || !exactUuid(value.attemptId)
+    || !exactSha256(value.developerPromptSha256)
+    || !exactSha256(value.responseSchemaSha256)
+    || !safeStructuralData(value.turnRequest)
+    || !safeStructuralData(value.turnResponse)) return null;
   const promptCachePolicy = readMemberConversationOpenAIPromptCachePolicy(
     value.promptCachePolicy
   );
@@ -181,12 +212,12 @@ function normalizedRequest(value) {
   const normalized = {
     version: MEMBER_CONVERSATION_PROVIDER_REQUEST_V2_VERSION,
     transportVersion: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
-    attemptId: value.attemptId.toLowerCase(),
+    attemptId: exactUuid(value.attemptId).toLowerCase(),
     model,
     developerPromptVersion,
-    developerPromptSha256: value.developerPromptSha256,
+    developerPromptSha256: exactSha256(value.developerPromptSha256),
     responseSchemaVersion,
-    responseSchemaSha256: value.responseSchemaSha256,
+    responseSchemaSha256: exactSha256(value.responseSchemaSha256),
     requestSignatureSha256: memberConversationTurnRequestHash(turnRequest),
     safetyRuleVersion: turnResponse.result.safety.ruleVersion,
     safetySourceRuleVersion: turnResponse.result.safety.sourceRuleVersion,
@@ -202,13 +233,13 @@ function validNormalizedRequest(value) {
   return exactKeys(value, REQUEST_KEYS)
     && value.version === MEMBER_CONVERSATION_PROVIDER_REQUEST_V2_VERSION
     && value.transportVersion === MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION
-    && UUID.test(value.attemptId || "")
+    && exactUuid(value.attemptId)
     && exactIdentifier(value.model)
     && exactIdentifier(value.developerPromptVersion)
-    && SHA256.test(value.developerPromptSha256 || "")
+    && exactSha256(value.developerPromptSha256)
     && exactIdentifier(value.responseSchemaVersion)
-    && SHA256.test(value.responseSchemaSha256 || "")
-    && SHA256.test(value.requestSignatureSha256 || "")
+    && exactSha256(value.responseSchemaSha256)
+    && exactSha256(value.requestSignatureSha256)
     && value.safetyRuleVersion === MEMBER_CONVERSATION_SAFETY_RULE_VERSION
     && value.safetySourceRuleVersion === MEMBER_CONVERSATION_SAFETY_SOURCE_RULE_VERSION
     && parseMemberTurn(value.memberTurn)

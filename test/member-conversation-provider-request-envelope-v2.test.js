@@ -176,6 +176,50 @@ test("V2 factory rejects top-level, controls, and tools accessors or proxies uno
   assert.equal(traps, 0);
 });
 
+test("V2 factory rejects nested turn accessors and proxies without observation", () => {
+  const base = deterministicMemberConversationProviderRequestV2Input();
+  let getterCalls = 0;
+  const turnRequest = {};
+  for (const [key, value] of Object.entries(base.turnRequest)) {
+    Object.defineProperty(turnRequest, key, key === "memberText" ? {
+      enumerable: true,
+      get() { getterCalls += 1; throw new Error("observed"); },
+    } : { enumerable: true, value });
+  }
+  assert.equal(createMemberConversationProviderRequestV2({ ...base, turnRequest }), null);
+  assert.equal(getterCalls, 0);
+
+  let traps = 0;
+  const nestedProxy = new Proxy({}, {
+    getPrototypeOf() { traps += 1; throw new Error("prototype trap"); },
+    ownKeys() { traps += 1; throw new Error("keys trap"); },
+    get() { traps += 1; throw new Error("get trap"); },
+  });
+  const turnResponse = {
+    ...base.turnResponse,
+    result: { ...base.turnResponse.result, safety: nestedProxy },
+  };
+  assert.equal(createMemberConversationProviderRequestV2({ ...base, turnResponse }), null);
+  assert.equal(traps, 0);
+});
+
+test("V2 factory rejects coercible or mutable digest inputs", () => {
+  const base = deterministicMemberConversationProviderRequestV2Input();
+  let coercions = 0;
+  const digest = {
+    toString() { coercions += 1; return "a".repeat(64); },
+  };
+  assert.equal(createMemberConversationProviderRequestV2({
+    ...base,
+    developerPromptSha256: digest,
+  }), null);
+  assert.equal(createMemberConversationProviderRequestV2({
+    ...base,
+    responseSchemaSha256: digest,
+  }), null);
+  assert.equal(coercions, 0);
+});
+
 test("caller insertion order is ignored but every normalized field is digest-bound", () => {
   const original = createDeterministicMemberConversationProviderRequestV2();
   const input = original.input;
@@ -211,12 +255,15 @@ test("caller insertion order is ignored but every normalized field is digest-bou
 });
 
 test("approved synthetic canonical request vector remains exact", () => {
-  const canonical = "{\"version\":\"GC-MEMBER-CONVERSATION-PROVIDER-REQUEST-2\",\"transportVersion\":\"GC-MEMBER-CONVERSATION-PROVIDER-TRANSPORT-2\",\"attemptId\":\"00000000-0000-4000-8000-000000000001\",\"model\":\"gpt-5.6-terra-2099-01-01\",\"developerPromptVersion\":\"synthetic-prompt-2\",\"developerPromptSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"responseSchemaVersion\":\"synthetic_response_2\",\"responseSchemaSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requestSignatureSha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"safetyRuleVersion\":\"GC-MEMBER-CONVERSATION-SAFETY-1\",\"safetySourceRuleVersion\":\"GC-MEMBER-CONVERSATION-SAFETY-RULES-1\",\"memberTurn\":\"How should I start?\",\"controls\":{\"background\":false,\"conversation\":null,\"maxOutputTokens\":512,\"metadata\":null,\"previousResponseId\":null,\"promptCachePolicy\":{\"version\":\"GC-MEMBER-CONVERSATION-OPENAI-PROMPT-CACHE-POLICY-1\",\"mode\":\"explicit\",\"breakpointCount\":0},\"store\":false,\"stream\":false,\"tools\":[],\"truncation\":\"disabled\"},\"regionPolicy\":\"synthetic-region-2\"}";
+  const created = createDeterministicMemberConversationProviderRequestV2();
+  const canonical = "{\"version\":\"GC-MEMBER-CONVERSATION-PROVIDER-REQUEST-2\",\"transportVersion\":\"GC-MEMBER-CONVERSATION-PROVIDER-TRANSPORT-2\",\"attemptId\":\"00000000-0000-4000-8000-000000000001\",\"model\":\"gpt-5.6-terra-2099-01-01\",\"developerPromptVersion\":\"synthetic-prompt-2\",\"developerPromptSha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"responseSchemaVersion\":\"synthetic_response_2\",\"responseSchemaSha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requestSignatureSha256\":\"d837de18b0b0b06ae191a9a809b7f55d5cea0c077f7d73abe7407c5c7f915baf\",\"safetyRuleVersion\":\"GC-MEMBER-CONVERSATION-SAFETY-1\",\"safetySourceRuleVersion\":\"GC-MEMBER-CONVERSATION-SAFETY-RULES-1\",\"memberTurn\":\"How should I start?\",\"controls\":{\"background\":false,\"conversation\":null,\"maxOutputTokens\":512,\"metadata\":null,\"previousResponseId\":null,\"promptCachePolicy\":{\"version\":\"GC-MEMBER-CONVERSATION-OPENAI-PROMPT-CACHE-POLICY-1\",\"mode\":\"explicit\",\"breakpointCount\":0},\"store\":false,\"stream\":false,\"tools\":[],\"truncation\":\"disabled\"},\"regionPolicy\":\"synthetic-region-2\"}";
+  assert.equal(JSON.stringify(created.request), canonical);
   assert.equal(Buffer.byteLength(canonical, "utf8"), 1067);
   assert.equal(
     createHash("sha256").update(canonical, "utf8").digest("hex"),
-    "35874ca2a686e000c43a9b3fcd581d3fe250f040820d93d186ebeef26001bea7"
+    "6638bce66a2124c5dc19187da966236e6cf3abc7a748b9de7b34b7a0ecb13c5e"
   );
+  assert.equal(created.digestSha256, "6638bce66a2124c5dc19187da966236e6cf3abc7a748b9de7b34b7a0ecb13c5e");
 });
 
 test("new V2 modules and deterministic helper remain absent from production startup", () => {
