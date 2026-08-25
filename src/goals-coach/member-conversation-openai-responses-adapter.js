@@ -285,9 +285,13 @@ function createMemberConversationOpenAIResponsesAdapter(value = {}) {
           || !memberConversationProviderResultAuthorityMatchesRequest(
             input.authority, input.request
           )) throw new Error("Provider contact authority expired");
-        return client.createResponse(providerRequest(
-          input.request, policy, controller.signal
-        ));
+        return client.createResponse(
+          providerRequest(input.request, policy, controller.signal),
+          Object.freeze({
+            outerDeadlineNs: operation.outerDeadlineNs,
+            signal: controller.signal,
+          })
+        );
       })
       .then((result) => ({ result }), () => ({ failed: true }));
     const winner = await Promise.race([pending, timeout, cancellation]);

@@ -174,6 +174,8 @@ function parsedOutcome(value, state) {
   return {
     body: Buffer.from(value.body),
     contentType: value.headers["content-type"],
+    providerRequestId: typeof value.headers["x-request-id"] === "string"
+      ? value.headers["x-request-id"] : null,
     statusCode: value.statusCode,
   };
 }
@@ -312,6 +314,7 @@ function readMemberConversationOpenAIHTTPResponse(value) {
   return Object.freeze({
     body: Buffer.from(state.body),
     contentType: state.contentType,
+    providerRequestId: state.providerRequestId,
     statusCode: state.statusCode,
   });
 }
