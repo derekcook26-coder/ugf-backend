@@ -15,6 +15,7 @@ const {
 const {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
   createMemberConversationOpenAIResponsesAdapter,
+  readMemberConversationOpenAIResponsesRejection,
   validMemberConversationOpenAIResponsesClient,
 } = require("../src/goals-coach/member-conversation-openai-responses-adapter");
 const {
@@ -95,15 +96,17 @@ function created(options = {}) {
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_CLIENT_VERSION,
     resolver: resolver.resolver,
     httpClient,
+    origin: "https://api.openai.com",
+    regionPolicy: "synthetic-region-1",
   });
-  return { client, fake, resolver };
+  return { client, fake, httpClient, resolver };
 }
 
 function request(signal) {
   return Object.freeze({
     body: Object.freeze({ model: "synthetic-model", input: [] }),
     clientRequestId: attemptId,
-    regionPolicy: "synthetic-region",
+    regionPolicy: "synthetic-region-1",
     signal,
   });
 }
@@ -122,8 +125,27 @@ test("offline bridge is branded and rejects dependency lookalikes", () => {
   assert.equal(value.runtimeWired, false);
   assert.equal(createMemberConversationOpenAIResponsesHTTPClient({
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_CLIENT_VERSION,
-    resolver: {}, httpClient: {},
+    resolver: {}, httpClient: {}, origin: "https://api.openai.com",
+    regionPolicy: "synthetic-region-1",
   }), null);
+  const genuine = created();
+  assert.equal(createMemberConversationOpenAIResponsesHTTPClient({
+    version: MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_CLIENT_VERSION,
+    resolver: genuine.resolver.resolver,
+    httpClient: genuine.httpClient,
+    origin: "https://eu.api.openai.com",
+    regionPolicy: "synthetic-region-1",
+  }), null);
+});
+
+test("region policy drift fails before credential resolution or HTTP contact", async () => {
+  const value = created();
+  const controller = new AbortController();
+  assert.equal(await value.client.createResponse(Object.freeze({
+    ...request(controller.signal), regionPolicy: "different-region",
+  }), operation(controller.signal)), null);
+  assert.equal(value.resolver.calls.length, 0);
+  assert.equal(value.fake.calls.length, 0);
 });
 
 test("resolves one credential, performs one bounded request, and parses provenance", async () => {
@@ -224,6 +246,73 @@ test("malformed or unbound provider responses fail closed after one call", async
     assert.equal(value.fake.calls.length, 1);
     assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   }
+});
+
+test("definite attributable 4xx responses preserve rejection and request provenance", async () => {
+  for (const [statusCode, classification] of [
+    [401, "authentication_rejected"], [403, "authentication_rejected"],
+    [429, "rate_limited"], [400, "request_rejected"],
+    [404, "request_rejected"], [405, "request_rejected"],
+    [413, "request_rejected"], [415, "request_rejected"],
+    [422, "request_rejected"],
+  ]) {
+    const value = created({ outcome: providerOutcome({ statusCode }) });
+    const controller = new AbortController();
+    assert.deepEqual(await value.client.createResponse(
+      request(controller.signal), operation(controller.signal)
+    ), { classification, providerRequestId: "req_synthetic_1" });
+    assert.equal(value.resolver.calls.length, 1);
+    assert.equal(value.fake.calls.length, 1);
+  }
+  for (const statusCode of [408, 409, 425, 500]) {
+    const value = created({ outcome: providerOutcome({ statusCode }) });
+    const controller = new AbortController();
+    assert.equal(await value.client.createResponse(
+      request(controller.signal), operation(controller.signal)
+    ), null);
+    assert.equal(value.fake.calls.length, 1);
+  }
+});
+
+test("adapter rejection token is opaque, one-read, and carries no provider body", async () => {
+  const value = created({ outcome: providerOutcome({ statusCode: 429 }) });
+  const developerPrompt = "Return concise coaching that respects deterministic safety.";
+  const responseSchema = Object.freeze({
+    type: "object", additionalProperties: false,
+    required: Object.freeze(["coaching"]),
+    properties: Object.freeze({
+      coaching: Object.freeze({ type: "string", maxLength: 800 }),
+    }),
+  });
+  const prepared = createDeterministicMemberConversationProviderRequest({
+    developerPromptSha256: digest(developerPrompt),
+    responseSchemaSha256: digest(JSON.stringify(responseSchema)),
+  });
+  const authority = createMemberConversationProviderResultAuthority({
+    request: prepared.request, terminalState: createTerminalState(),
+  });
+  const adapter = createMemberConversationOpenAIResponsesAdapter({
+    version: MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_VERSION,
+    client: value.client,
+    policy: {
+      model: "synthetic-model-1", developerPromptVersion: "synthetic-prompt-1",
+      developerPromptSha256: digest(developerPrompt), developerPrompt,
+      responseSchemaVersion: "synthetic-response-1",
+      responseSchemaSha256: digest(JSON.stringify(responseSchema)), responseSchema,
+      maxOutputTokens: 512, regionPolicy: "synthetic-region-1",
+      outputPolicyVersion: MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
+      finalizationReserveMilliseconds: 100, timeoutMilliseconds: 1000,
+    },
+  });
+  const controller = new AbortController();
+  const token = await adapter.execute({ authority, request: prepared.request },
+    operation(controller.signal));
+  assert.deepEqual(Object.keys(token), []);
+  assert.equal(JSON.stringify(token), "{}");
+  assert.deepEqual(readMemberConversationOpenAIResponsesRejection(token), {
+    providerRequestId: "req_synthetic_1", terminalCategory: "rate_limited",
+  });
+  assert.equal(readMemberConversationOpenAIResponsesRejection(token), null);
 });
 
 test("pre-aborted and expired operations perform no credential or HTTP call", async () => {

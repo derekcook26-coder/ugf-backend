@@ -171,6 +171,25 @@ test("one exact dispatch emits strict RESPONSE-2 and provider provenance", async
   assert.equal(created.fake.calls[0].clientRequestId, assignedAttempt);
 });
 
+test("definite provider rejection reaches the existing exact transport category", async () => {
+  for (const terminalCategory of [
+    "authentication_rejected", "rate_limited", "request_rejected",
+  ]) {
+    const created = setup({ result: {
+      classification: terminalCategory,
+      providerRequestId: "synthetic-openai-request-1",
+    } });
+    assert.deepEqual(await created.transport.dispatch(
+      dispatchRequest(created), operation().value
+    ), {
+      category: "rejected",
+      providerRequestId: "synthetic-openai-request-1",
+      terminalCategory,
+    });
+    assert.equal(created.fake.calls.length, 1);
+  }
+});
+
 test("turn binding and transport metadata drift fail before client contact", async () => {
   const created = setup();
   assert.equal(createMemberConversationOpenAIResponsesTransport({

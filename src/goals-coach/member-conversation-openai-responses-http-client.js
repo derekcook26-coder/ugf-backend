@@ -10,6 +10,7 @@ const {
 } = require("./member-conversation-openai-credential-resolver");
 const {
   executeMemberConversationOpenAIHTTPRequest,
+  memberConversationOpenAIHTTPClientMatchesOrigin,
   readMemberConversationOpenAIHTTPResponse,
   validMemberConversationOpenAIHTTPClient,
 } = require("./member-conversation-openai-http-client");
@@ -20,12 +21,16 @@ const {
 
 const MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_CLIENT_VERSION =
   "GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-HTTP-CLIENT-1";
-const FACTORY_KEYS = Object.freeze(["httpClient", "resolver", "version"]);
+const FACTORY_KEYS = Object.freeze([
+  "httpClient", "origin", "regionPolicy", "resolver", "version",
+]);
 const REQUEST_KEYS = Object.freeze([
   "body", "clientRequestId", "regionPolicy", "signal",
 ]);
 const OPERATION_KEYS = Object.freeze(["outerDeadlineNs", "signal"]);
 const PROVIDER_IDENTIFIER = /^[\x21-\x7e]{1,255}$/;
+const REGION_POLICY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DEFINITE_REQUEST_REJECTION = new Set([400, 404, 405, 413, 415, 422]);
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -37,8 +42,22 @@ function exactKeys(value, keys) {
 }
 
 function parseProviderResponse(response) {
-  if (!response || response.statusCode !== 200
-    || !PROVIDER_IDENTIFIER.test(response.providerRequestId || "")) return null;
+  if (!response || !PROVIDER_IDENTIFIER.test(response.providerRequestId || "")) {
+    return null;
+  }
+  if ([401, 403].includes(response.statusCode)) return Object.freeze({
+    classification: "authentication_rejected",
+    providerRequestId: response.providerRequestId,
+  });
+  if (response.statusCode === 429) return Object.freeze({
+    classification: "rate_limited",
+    providerRequestId: response.providerRequestId,
+  });
+  if (DEFINITE_REQUEST_REJECTION.has(response.statusCode)) return Object.freeze({
+    classification: "request_rejected",
+    providerRequestId: response.providerRequestId,
+  });
+  if (response.statusCode !== 200) return null;
   let value;
   try {
     value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.body));
@@ -75,9 +94,14 @@ function createMemberConversationOpenAIResponsesHTTPClient(value = {}) {
   if (!exactKeys(value, FACTORY_KEYS)
     || value.version !== MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_CLIENT_VERSION
     || !validMemberConversationOpenAICredentialResolver(value.resolver)
-    || !validMemberConversationOpenAIHTTPClient(value.httpClient)) return null;
+    || !validMemberConversationOpenAIHTTPClient(value.httpClient)
+    || !REGION_POLICY.test(value.regionPolicy || "")
+    || !memberConversationOpenAIHTTPClientMatchesOrigin(
+      value.httpClient, value.origin
+    )) return null;
   const resolver = value.resolver;
   const httpClient = value.httpClient;
+  const regionPolicy = value.regionPolicy;
   return createMemberConversationOpenAIResponsesClient({
     version: MEMBER_CONVERSATION_OPENAI_RESPONSES_CLIENT_VERSION,
     automaticRetries: false,
@@ -86,6 +110,7 @@ function createMemberConversationOpenAIResponsesHTTPClient(value = {}) {
       if (!exactKeys(request, REQUEST_KEYS)
         || !exactKeys(operation, OPERATION_KEYS)
         || request.signal !== operation.signal
+        || request.regionPolicy !== regionPolicy
         || !(operation.signal instanceof AbortSignal)
         || typeof operation.outerDeadlineNs !== "bigint") return null;
       const terminalState = createTerminalState();

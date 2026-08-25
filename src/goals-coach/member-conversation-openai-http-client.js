@@ -319,12 +319,19 @@ function readMemberConversationOpenAIHTTPResponse(value) {
   });
 }
 
+function memberConversationOpenAIHTTPClientMatchesOrigin(value, origin) {
+  const state = value && clients.get(value);
+  const normalized = normalizedOrigin(origin);
+  return Boolean(state && normalized && state.origin === normalized);
+}
+
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_BOUNDED_HTTP_INTERFACE_VERSION,
   MEMBER_CONVERSATION_OPENAI_HTTP_CLIENT_VERSION,
   createMemberConversationOpenAIBoundedHTTPInterface,
   createMemberConversationOpenAIHTTPClient,
   executeMemberConversationOpenAIHTTPRequest,
+  memberConversationOpenAIHTTPClientMatchesOrigin,
   readMemberConversationOpenAIHTTPResponse,
   validMemberConversationOpenAIBoundedHTTPInterface,
   validMemberConversationOpenAIHTTPCredentialConsumer,
