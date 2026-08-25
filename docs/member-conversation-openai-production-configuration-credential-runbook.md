@@ -54,7 +54,9 @@ exact-keyed approval record containing only non-secret policy identities:
 - `environmentName`;
 - `compositionVersion`;
 - `credentialResolverVersion`;
+- `boundedHttpInterfaceVersion`;
 - `httpClientVersion`;
+- `responsesHttpClientVersion`;
 - `responsesClientVersion`;
 - `adapterVersion`;
 - `transportVersion`;
@@ -79,6 +81,11 @@ exact-keyed approval record containing only non-secret policy identities:
 - `responseBodyBytes`;
 - `adapterTimeoutMilliseconds`;
 - `finalizationReserveMilliseconds`;
+- `monthlySpendCeilingUsdCents`;
+- `dailyWarningThresholdUsdCents`;
+- `providerBudgetEvidenceSha256`;
+- `spendingAlertEvidenceSha256`;
+- `costControlEvidenceObservedAt`;
 - `providerControlEvidenceSha256`;
 - `providerControlEvidenceObservedAt`;
 - `codeTreeSha`;
@@ -96,28 +103,70 @@ that approval exists, the corresponding production allowlist remains empty;
 placeholders such as `TBD`, `latest`, wildcard origins, default regions, or
 inferred account locations are invalid.
 
+The two HTTP-boundary fields must respectively equal the exact reviewed
+`GC-MEMBER-CONVERSATION-OPENAI-BOUNDED-HTTP-INTERFACE-1` and
+`GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-HTTP-CLIENT-1` identities. The spend
+ceiling and warning threshold are non-negative safe integers expressed in US
+dollar cents, with the daily warning not greater than the monthly ceiling.
+Budget and visible-alert evidence hashes must identify current, independently
+reviewed, privacy-safe evidence for the same abstract environment label.
+Missing, disabled, expired, or drifted cost controls invalidate the whole
+configuration.
+
 ### Credential provision record
 
 `GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-1` is a privacy-safe
 receipt envelope created only after a separately authorized operator
-provisions a secret. Its canonical payload may contain only:
+provisions a secret. Its canonical payload contains exactly these keys in this
+order and no others:
 
-- `version`;
-- `environmentName`;
-- a non-secret secret-manager namespace enum;
-- a non-secret secret-name identifier approved for this integration;
-- an opaque provider project-purpose label that is not a provider project ID;
-- `provisionedAt`;
-- `rotationDueAt`;
-- a bounded operator-role enum; and
-- a bounded outcome enum.
+1. `version`, exactly
+   `GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-PAYLOAD-1`;
+2. `environmentName`, an owner-approved abstract label matching
+   `^[a-z][a-z0-9_-]{0,63}$`, never a live service/project identifier;
+3. `configurationSha256`, the lowercase 64-hex digest of the exact approved
+   `GC-MEMBER-CONVERSATION-OPENAI-PRODUCTION-CONFIG-1` record;
+4. `secretManagerNamespace`, exactly `managed_environment_secret`;
+5. `secretNameIdentifier`, an NFC string matching
+   `^[A-Z][A-Z0-9_]{0,63}$` and approved separately for this integration;
+6. `providerProjectPurpose`, exactly `goals_coach_member_conversation` and not
+   a provider project identifier;
+7. `lifecycleSequence`, a safe integer from 1 through 2147483647;
+8. `previousReceiptSha256`, `null` for sequence 1 and otherwise the lowercase
+   64-hex digest of the immediately preceding current receipt;
+9. `provisionedAt`, a UTC timestamp in canonical
+   `YYYY-MM-DDTHH:mm:ss.sssZ` form;
+10. `rotationDueAt`, a later UTC timestamp in the same canonical form;
+11. `operatorRole`, exactly `production_secret_operator`; and
+12. `outcome`, exactly `provisioned` for sequence 1 or `rotated` otherwise.
 
-The exact outer envelope contains only `version`, `payload`, and
-`receiptSha256`. `receiptSha256` is
-`SHA-256(UTF-8(canonical JSON(payload)))`; the digest field is never part of
-the hashed payload. Payload key order and string normalization are fixed by the
-receipt contract. Parsing recomputes the payload digest and requires exact
+The exact outer envelope contains keys in order `version`, `payload`, and
+`receiptSha256`. Its `version` is exactly
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-1`.
+`receiptSha256` is `SHA-256(UTF-8(JSON.stringify(payload)))`; the digest field
+is never part of the hashed payload. Before serialization, every string must
+already be NFC and contain no unpaired surrogate or prohibited control; no
+normalization or coercion occurs during hashing. All numbers are JSON decimal
+safe integers with no exponent, fraction, sign prefix, or leading zero.
+Booleans and undefined values are not permitted. Timestamps and hashes are
+strings in the exact forms above. JSON uses the stated insertion order, no
+whitespace, and the standard JSON escapes emitted by `JSON.stringify`.
+Parsing reconstructs a fresh exact-order payload, requires every source value
+to equal its reconstructed value, recomputes the digest, and requires exact
 agreement before accepting the receipt.
+
+Receipt validity also requires an authoritative non-secret
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-CURRENT-1` record with
+exact keys `version`, `environmentName`, `configurationSha256`,
+`lifecycleSequence`, `currentReceiptSha256`, `previousCurrentReceiptSha256`,
+and `updatedAt`. It uses the same canonical strings, integers, timestamps, and
+configuration digest. A consumer accepts only the receipt whose digest and
+sequence equal the current record. Sequence must increase by exactly one and
+the new receipt and current record must both name the immediately preceding
+receipt digest. Missing, ambiguous, stale, forked, superseded, configuration-
+mismatched, or non-current evidence fails closed. Creating this currentness
+record is a future separately authorized evidence operation, never an
+environment or secret write.
 
 It must not contain the credential, a credential prefix or suffix, credential
 length, provider account/project/organization identifiers, authorization
@@ -128,6 +177,17 @@ Provisioning success means only that the authorized secret manager accepted a
 write. It does not prove the credential is correct, usable, scoped correctly,
 accepted by OpenAI, visible to a deployment, or safe to activate. Provisioning
 must not perform a provider test call.
+
+### Provider credential creation record
+
+Creating or rotating a credential in the provider console is provider contact
+and requires its own exact owner authorization before secret-manager
+provisioning. That authorization identifies only the intended abstract
+environment label, purpose, operator role, and bounded console action. It does
+not authorize an API request, credential test, project/configuration change,
+runtime wiring, deployment, activation, or member access. Console completion
+yields only a bounded outcome enum; no provider/account identifier, credential
+metadata, or authenticated console content enters repository evidence.
 
 ### Activation approval record
 
@@ -151,8 +211,9 @@ The configuration gate is document-only until a later owner authorization:
    authenticated console contents and provider/account identifiers.
 4. Select one immutable model identifier, HTTPS origin, `/v1/responses` path,
    region policy, prompt identity, schema identity, output bounds, HTTP bounds,
-   adapter timeout, and finalization reserve. No value is inferred from a
-   credential or provider account.
+   adapter timeout, finalization reserve, monthly spending ceiling, daily
+   warning threshold, and budget/visible-alert evidence identities. No value
+   is inferred from a credential or provider account.
 5. Verify every selected identity against the compiled implementation and the
    empty-to-exact allowlist change proposed for a later code/configuration gate.
 6. Verify required migration state using a separately authorized read-only
@@ -169,26 +230,32 @@ a fresh review.
 
 ## Credential provisioning procedure
 
-Credential provisioning is a later, separately authorized operation performed
-by a human operator with the minimum required secret-management permissions.
-The safe procedure is:
+Credential creation and secret-manager provisioning are two later, separately
+authorized operations performed by a human operator with the minimum required
+permissions. The safe procedure is:
 
 1. Confirm the exact environment and approved configuration-record hash using
    non-secret evidence. Stop on ambiguity.
 2. Confirm the destination secret-manager namespace and approved secret-name
    identifier without reading an existing secret value.
-3. Create or rotate the credential in the provider console using the narrowest
-   available project and operational scope. Do not copy it into chat, source,
-   tickets, terminals with command history, screenshots, logs, or clipboard
-   managers.
-4. Enter the credential directly into the authorized secret-manager value
+3. Stop and obtain exact owner authorization for the provider-console
+   credential creation or rotation action. Under only that authorization,
+   perform the bounded console action using the narrowest available project
+   and operational scope. Do not make a test API request or change provider
+   project controls. Do not copy the credential into chat, source, tickets,
+   terminals with command history, screenshots, logs, or clipboard managers.
+4. Stop again and obtain separate exact owner authorization for the named
+   secret-manager write. Only then enter the credential directly into the
+   authorized secret-manager value
    field. The agent must not type, paste, receive, display, or inspect it.
 5. Confirm only the secret manager's bounded success state. Do not reveal the
    stored value and do not test it against the provider.
-6. Create the canonical privacy-safe credential provision payload, compute its
-   digest over the payload only, and place both in the exact receipt envelope.
-   Do not hash the credential: a credential digest would remain sensitive
-   comparison material.
+6. Bind the canonical privacy-safe payload to the exact approved configuration
+   digest and immediately preceding current receipt, compute its digest over
+   the payload only, and place both in the exact receipt envelope. Under a
+   separate evidence-record authorization, advance the privacy-safe current
+   receipt record atomically or leave the old record current. Do not hash the
+   credential: a credential digest would remain sensitive comparison material.
 7. Verify that Railway remains branch-disconnected, production composition is
    still null/unwired, no deployment occurred, and no route or feature became
    available.
@@ -211,9 +278,11 @@ not enable runtime wiring, deployment, or activation.
   incident handling; do not first test the credential.
 - A failed or ambiguous secret-manager write leaves readiness unproven. Do not
   retry automatically or delete an existing value.
-- Rotation creates a new canonical payload and outer provision receipt, then
-  expires the old receipt without recording either credential or version
-  token.
+- Rotation creates a new canonical payload linked to the exact current receipt
+  and configuration. It becomes usable evidence only when the authoritative
+  current receipt record advances by one sequence and names its digest. The
+  prior receipt then remains immutable but is superseded and must be rejected,
+  without recording either credential or secret version token.
 - Rollback means restoring a previously approved disabled configuration state,
   not restoring an old credential value from logs or repository history.
 - Secret absence or access failure must remain concealed and fail closed at
@@ -235,6 +304,10 @@ Permitted evidence is limited to privacy-safe facts:
 - proof that no provider request, migration, or live member/database action
   occurred.
 
+Receipt evidence must include only the exact provision envelope and matching
+current receipt record. A receipt is never accepted merely because its digest
+is valid.
+
 Forbidden evidence includes credentials, environment values, secret resource
 paths, provider/account identifiers, member/provider payloads, authorization
 headers, raw errors, authenticated console exports, cookies, tokens, and
@@ -250,6 +323,10 @@ deterministic offline tests must prove:
 - exact-key parsing of the credential provision envelope, deterministic
   canonicalization of its payload excluding `receiptSha256`, and rejection of
   any payload/digest mismatch;
+- exact receipt field order, NFC/Unicode, timestamp, safe-integer, enum, null,
+  JSON escaping, and UTF-8 hash vectors across supported environments;
+- rejection of configuration-hash mismatch and every stale, forked,
+  superseded, skipped-sequence, or non-current receipt/current-record pair;
 - rejection of placeholders, moving aliases, wildcard origins, expired
   evidence, unknown keys, malformed bounds, and all identity drift;
 - credentials and credential metadata cannot appear in the configuration
@@ -276,17 +353,24 @@ The sequence after this document remains deliberately separate:
 
 1. independently review and publish this architecture/runbook;
 2. reverify current provider project/model/origin controls and approve one
-   exact non-secret configuration record;
-3. separately authorize human credential creation and secret-manager
-   provisioning without provider contact or activation;
-4. implement and review a disabled configuration loader and secret-manager
+   exact non-secret configuration record, including approved cost controls;
+3. separately authorize the exact human provider-console credential creation
+   or rotation action, with no API request or project-control change;
+4. separately authorize the exact secret-manager provision and privacy-safe
+   current-receipt evidence update, without provider contact or activation;
+5. implement and review a disabled configuration loader and secret-manager
    adapter with offline fakes while startup remains unwired;
-5. separately authorize production runtime wiring while external calls and the
+6. separately authorize production runtime wiring while external calls and the
    route remain disabled;
-6. separately authorize deployment and read-only verification;
-7. independently assess migration/runtime/provider readiness; and
-8. separately authorize activation and controlled live acceptance, if all
-   prior evidence remains current.
+7. separately authorize deployment and read-only verification;
+8. independently assess migration and runtime readiness;
+9. separately authorize bounded synthetic provider validation with no member
+   data while the member route and feature remain disabled;
+10. independently review the synthetic provider evidence and separately
+    authorize feature activation;
+11. separately authorize any real-member acceptance only after activation,
+    with exact member, operator, environment, scope, privacy, safety, rollback,
+    and observation boundaries.
 
 No gate authorizes a later gate. Any drift in code, provider controls,
 configuration, credential custody, migration state, runtime wiring, deployment,
