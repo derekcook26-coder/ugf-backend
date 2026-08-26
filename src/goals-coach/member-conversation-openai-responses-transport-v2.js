@@ -22,8 +22,16 @@ const PUBLIC_KEYS = Object.freeze([
   "promptCacheMode", "promptCachePolicyVersion", "provider", "providerFree",
   "requestDigestSha256", "responseSchemaVersion", "runtimeWired", "version",
 ]);
+const ABORT_SIGNAL_ABORTED = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype, "aborted"
+).get;
 const brandedTransports = new WeakSet();
 const transportState = new WeakMap();
+
+function validActiveAbortSignal(value) {
+  if (!value || typeof value !== "object" || isProxy(value)) return false;
+  try { return ABORT_SIGNAL_ABORTED.call(value) === false; } catch (_) { return false; }
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -86,7 +94,7 @@ function createMemberConversationOpenAIResponsesTransportV2(value = {}) {
         try {
           const current = transportState.get(responsesTransport);
           if (!current || !exactKeys(input, CREATE_KEYS)
-            || !(input.signal instanceof AbortSignal) || input.signal.aborted
+            || !validActiveAbortSignal(input.signal)
             || exactBinding(current.adapter, current.request, current.transport)
               !== current.requestDigestSha256) return null;
           return createMemberConversationOpenAIResponsesWireRequestV2(current.adapter, {

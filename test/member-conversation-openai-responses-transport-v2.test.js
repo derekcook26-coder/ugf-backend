@@ -108,6 +108,17 @@ test("aborted, malformed, accessor, and proxy inputs fail without observation", 
   assert.equal(value.transport.createWireRequest({ signal: new AbortController().signal,
     unknown: true }), null);
 
+  const forgedSignal = Object.create(AbortSignal.prototype);
+  Object.defineProperty(forgedSignal, "aborted", { enumerable: true, value: false });
+  assert.equal(value.transport.createWireRequest({ signal: forgedSignal }), null);
+
+  let signalTraps = 0;
+  const proxiedSignal = new Proxy(new AbortController().signal, {
+    get() { signalTraps += 1; return false; },
+  });
+  assert.equal(value.transport.createWireRequest({ signal: proxiedSignal }), null);
+  assert.equal(signalTraps, 0);
+
   let getterCalls = 0;
   const accessor = {};
   for (const [key, current] of Object.entries(value.options)) {
