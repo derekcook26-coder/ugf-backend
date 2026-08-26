@@ -7,6 +7,7 @@ const {
   validMemberConversationOpenAIPromptCachePolicy,
 } = require("./member-conversation-openai-prompt-cache-policy");
 const {
+  MEMBER_CONVERSATION_PROVIDER_OUTPUT_V2_MAXIMUM_TOKENS,
   memberConversationProviderRequestV2Digest,
   validMemberConversationProviderRequestV2,
 } = require("./member-conversation-provider-request-envelope-v2");
@@ -19,14 +20,15 @@ const MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_V2_VERSION =
 const PROVIDER_SCHEMA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const IMMUTABLE_GPT_56_MODEL = /^gpt-(?:[6-9]|5\.(?:[6-9]|[1-9][0-9]))[A-Za-z0-9._:-]*-\d{4}-\d{2}-\d{2}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const SURROGATE_CODE_UNIT = /[\uD800-\uDFFF]/u;
 const VERSIONED_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ADAPTER_KEYS = Object.freeze([
-  "developerPrompt", "developerPromptSha256", "developerPromptVersion", "model",
+  "developerPrompt", "developerPromptSha256", "developerPromptVersion", "maxOutputTokens", "model",
   "promptCachePolicy", "regionPolicy", "responseSchema", "responseSchemaSha256",
   "responseSchemaVersion", "version",
 ]);
 const PUBLIC_KEYS = Object.freeze([
-  "externalCallsPermitted", "model", "promptCacheBreakpointCount", "promptCacheMode",
+  "externalCallsPermitted", "maxOutputTokens", "model", "promptCacheBreakpointCount", "promptCacheMode",
   "promptCachePolicyVersion", "provider", "providerFree", "responseSchemaVersion",
   "runtimeWired", "version",
 ]);
@@ -112,6 +114,9 @@ function createMemberConversationOpenAIResponsesAdapterV2(value = {}) {
       || typeof value.regionPolicy !== "string" || !VERSIONED_IDENTIFIER.test(value.regionPolicy)
       || typeof value.developerPrompt !== "string" || value.developerPrompt.length === 0
       || value.developerPrompt !== value.developerPrompt.trim()
+      || SURROGATE_CODE_UNIT.test(value.developerPrompt)
+      || !Number.isSafeInteger(value.maxOutputTokens) || value.maxOutputTokens < 1
+      || value.maxOutputTokens > MEMBER_CONVERSATION_PROVIDER_OUTPUT_V2_MAXIMUM_TOKENS
       || typeof value.developerPromptSha256 !== "string"
       || !SHA256.test(value.developerPromptSha256)
       || sha256(value.developerPrompt) !== value.developerPromptSha256
@@ -128,6 +133,7 @@ function createMemberConversationOpenAIResponsesAdapterV2(value = {}) {
       developerPrompt: value.developerPrompt,
       developerPromptSha256: value.developerPromptSha256,
       developerPromptVersion: value.developerPromptVersion,
+      maxOutputTokens: value.maxOutputTokens,
       model: value.model,
       promptCachePolicy,
       regionPolicy: value.regionPolicy,
@@ -137,6 +143,7 @@ function createMemberConversationOpenAIResponsesAdapterV2(value = {}) {
     });
     const adapter = Object.freeze({
       externalCallsPermitted: false,
+      maxOutputTokens: state.maxOutputTokens,
       model: state.model,
       promptCachePolicyVersion: promptCachePolicy.version,
       promptCacheMode: promptCachePolicy.mode,
@@ -161,6 +168,7 @@ function validMemberConversationOpenAIResponsesAdapterV2(value) {
     && value.version === MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_V2_VERSION
     && value.externalCallsPermitted === false && value.providerFree === true
     && value.runtimeWired === false && value.provider === "openai"
+    && value.maxOutputTokens === state.maxOutputTokens
     && value.model === state.model
     && value.responseSchemaVersion === state.responseSchemaVersion
     && value.promptCachePolicyVersion === state.promptCachePolicy.version
@@ -184,6 +192,7 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
       || request.responseSchemaVersion !== state.responseSchemaVersion
       || request.responseSchemaSha256 !== state.responseSchemaSha256
       || request.regionPolicy !== state.regionPolicy
+      || request.controls.maxOutputTokens !== state.maxOutputTokens
       || policy.version !== state.promptCachePolicy.version
       || policy.mode !== state.promptCachePolicy.mode
       || policy.breakpointCount !== state.promptCachePolicy.breakpointCount
@@ -210,7 +219,7 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
             schema: state.responseSchema,
           }),
         }),
-        max_output_tokens: request.controls.maxOutputTokens,
+        max_output_tokens: state.maxOutputTokens,
         prompt_cache_options: Object.freeze({ mode: "explicit" }),
         store: false,
         background: false,

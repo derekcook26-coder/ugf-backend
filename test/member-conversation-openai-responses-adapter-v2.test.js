@@ -60,12 +60,13 @@ test("Adapter V2 is private, frozen, offline, and exposes exact cache identity",
   assert.equal(validMemberConversationOpenAIResponsesAdapterV2(adapter), true);
   assert.equal(Object.isFrozen(adapter), true);
   assert.deepEqual(Object.keys(adapter), [
-    "externalCallsPermitted", "model", "promptCachePolicyVersion", "promptCacheMode",
+    "externalCallsPermitted", "maxOutputTokens", "model", "promptCachePolicyVersion", "promptCacheMode",
     "promptCacheBreakpointCount", "provider", "providerFree", "responseSchemaVersion",
     "runtimeWired", "version",
   ]);
   assert.equal(adapter.promptCacheMode, "explicit");
   assert.equal(adapter.promptCacheBreakpointCount, 0);
+  assert.equal(adapter.maxOutputTokens, 512);
   assert.equal(adapter.externalCallsPermitted, false);
   assert.equal(adapter.providerFree, true);
   assert.equal(adapter.runtimeWired, false);
@@ -102,6 +103,22 @@ test("request, transport, policy, model, schema, region, and abort drift fail cl
   const nonOpenAI = createDeterministicMemberConversationProviderTransportV2({
     created: value.created,
   });
+  const outputDrift = createDeterministicMemberConversationProviderRequestV2({
+    developerPromptSha256: value.options.developerPromptSha256,
+    responseSchemaSha256: value.options.responseSchemaSha256,
+    controls: Object.freeze({
+      ...value.created.input.controls,
+      maxOutputTokens: 513,
+    }),
+  });
+  const outputDriftTransport = createMemberConversationProviderTransportV2({
+    version: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
+    provider: "openai",
+    model: outputDrift.request.model,
+    responseSchemaVersion: outputDrift.request.responseSchemaVersion,
+    request: outputDrift.request,
+    async dispatch() { throw new Error("must not dispatch"); },
+  });
   const variants = [
     { request: Object.freeze({ ...value.created.request }) },
     { request: createDeterministicMemberConversationProviderRequestV2({
@@ -112,6 +129,7 @@ test("request, transport, policy, model, schema, region, and abort drift fail cl
     }).request },
     { transport: Object.freeze({ ...value.transport.transport }) },
     { transport: nonOpenAI.transport },
+    { request: outputDrift.request, transport: outputDriftTransport },
   ];
   for (const variant of variants) {
     assert.equal(createMemberConversationOpenAIResponsesWireRequestV2(value.adapter, {
@@ -136,6 +154,18 @@ test("factory rejects unknown, moving, pre-5.6, forged, accessor, and proxy inpu
     { ...base, unknown: true },
     { ...base, model: "gpt-5.6-terra" },
     { ...base, model: "gpt-5.4-mini-2099-01-01" },
+    { ...base, maxOutputTokens: 0 },
+    { ...base, maxOutputTokens: 4097 },
+    {
+      ...base,
+      developerPrompt: "Synthetic \uD800 prompt.",
+      developerPromptSha256: digest("Synthetic \uD800 prompt."),
+    },
+    {
+      ...base,
+      developerPrompt: "Synthetic \uDC00 prompt.",
+      developerPromptSha256: digest("Synthetic \uDC00 prompt."),
+    },
     { ...base, promptCachePolicy: Object.freeze({ ...base.promptCachePolicy }) },
     { ...base, responseSchema: { ...base.responseSchema, additionalProperties: true } },
   ]) assert.equal(createMemberConversationOpenAIResponsesAdapterV2(invalid), null);

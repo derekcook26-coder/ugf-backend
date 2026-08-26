@@ -27,6 +27,7 @@ function deterministicMemberConversationOpenAIResponsesAdapterV2Options(override
     developerPromptVersion: "synthetic-prompt-2",
     developerPromptSha256: digest("Synthetic prompt."),
     developerPrompt: "Synthetic prompt.",
+    maxOutputTokens: 512,
     responseSchemaVersion: "synthetic_response_2",
     responseSchemaSha256: digest(JSON.stringify(responseSchema)),
     responseSchema,
