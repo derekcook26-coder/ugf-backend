@@ -37,8 +37,16 @@ const SCHEMA_KEYS = Object.freeze([
   "additionalProperties", "properties", "required", "type",
 ]);
 const COACHING_MAXIMUM_CHARACTERS = 800;
+const ABORT_SIGNAL_ABORTED = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype, "aborted"
+).get;
 const brandedAdapters = new WeakSet();
 const adapterState = new WeakMap();
+
+function validActiveAbortSignal(value) {
+  if (!value || typeof value !== "object" || isProxy(value)) return false;
+  try { return ABORT_SIGNAL_ABORTED.call(value) === false; } catch (_) { return false; }
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -181,7 +189,7 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
     const state = adapter && adapterState.get(adapter);
     if (!state || !validMemberConversationOpenAIResponsesAdapterV2(adapter)
       || !exactKeys(input, WIRE_INPUT_KEYS)
-      || !(input.signal instanceof AbortSignal) || input.signal.aborted
+      || !validActiveAbortSignal(input.signal)
       || !validMemberConversationProviderRequestV2(input.request)
       || !validMemberConversationProviderTransportV2(input.transport)) return null;
     const request = input.request;

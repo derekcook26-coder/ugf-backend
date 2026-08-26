@@ -146,6 +146,26 @@ test("request, transport, policy, model, schema, region, and abort drift fail cl
     signal: value.controller.signal,
     transport: value.transport.transport,
   }), null);
+
+  const forgedSignal = Object.create(AbortSignal.prototype);
+  Object.defineProperty(forgedSignal, "aborted", { enumerable: true, value: false });
+  assert.equal(createMemberConversationOpenAIResponsesWireRequestV2(value.adapter, {
+    request: value.created.request,
+    signal: forgedSignal,
+    transport: value.transport.transport,
+  }), null);
+
+  let signalTraps = 0;
+  const proxiedSignal = new Proxy(new AbortController().signal, {
+    get() { signalTraps += 1; return false; },
+  });
+  assert.equal(createMemberConversationOpenAIResponsesWireRequestV2(value.adapter, {
+    request: value.created.request,
+    signal: proxiedSignal,
+    transport: value.transport.transport,
+  }), null);
+  assert.equal(signalTraps, 0);
+  assert.equal(value.transport.calls.length, 0);
 });
 
 test("factory rejects unknown, moving, pre-5.6, forged, accessor, and proxy input unobserved", () => {
