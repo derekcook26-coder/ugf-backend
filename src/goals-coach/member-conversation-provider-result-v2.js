@@ -60,11 +60,34 @@ function activeAuthority(token, requireContacted = false) {
     && state.terminalState.isTerminal() === false ? state : null;
 }
 
+function releaseTerminalSubscription(state) {
+  if (state.children.size || typeof state.unsubscribeTerminal !== "function") return;
+  const unsubscribe = state.unsubscribeTerminal;
+  state.unsubscribeTerminal = null;
+  unsubscribe();
+}
+
+function deleteChild(state, token, records) {
+  records.delete(token);
+  state.children.delete(token);
+  releaseTerminalSubscription(state);
+}
+
+function deleteChildren(state) {
+  for (const token of state.children) {
+    successes.delete(token);
+    rejections.delete(token);
+  }
+  state.children.clear();
+  releaseTerminalSubscription(state);
+}
+
 function revokeState(state) {
   if (!state || state.revoked) return false;
   state.revoked = true;
   state.consumed = true;
   state.generation += 1;
+  deleteChildren(state);
   return true;
 }
 
@@ -97,15 +120,19 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
     const digest = memberConversationProviderRequestV2Digest(value.request);
     if (!digest) return null;
     const token = opaqueToken();
-    authorities.set(token, {
+    const state = {
       attemptId: value.request.attemptId,
+      children: new Set(),
       consumed: false,
       contacted: false,
       generation: 1,
       requestDigestSha256: digest,
       revoked: false,
       terminalState: value.terminalState,
-    });
+      unsubscribeTerminal: null,
+    };
+    authorities.set(token, state);
+    state.unsubscribeTerminal = value.terminalState.subscribe(() => revokeState(state));
     return token;
   } catch (_) { return null; }
 }
@@ -158,6 +185,7 @@ function createMemberConversationProviderResultV2(authority, value = {}) {
       providerResultDigestSha256: createHash("sha256")
         .update(JSON.stringify(canonical), "utf8").digest("hex"),
     });
+    state.children.add(token);
     return token;
   } catch (_) { revokeState(state); return null; }
 }
@@ -168,8 +196,7 @@ function readMemberConversationProviderResultV2(token, authority) {
   if (!state || !result || result.consumed || result.authority !== state
     || result.generation !== state.generation || state.revoked
     || state.terminalState.isTerminal()) return null;
-  result.consumed = true;
-  return Object.freeze({
+  const output = Object.freeze({
     attemptId: state.attemptId,
     coaching: result.coaching,
     providerRequestId: result.providerRequestId,
@@ -178,6 +205,9 @@ function readMemberConversationProviderResultV2(token, authority) {
     requestEnvelopeDigestSha256: state.requestDigestSha256,
     version: MEMBER_CONVERSATION_PROVIDER_RESULT_V2_VERSION,
   });
+  result.consumed = true;
+  deleteChild(state, token, successes);
+  return output;
 }
 
 function createMemberConversationProviderRejectionV2(authority, value = {}) {
@@ -199,6 +229,7 @@ function createMemberConversationProviderRejectionV2(authority, value = {}) {
       providerRequestId,
       terminalCategory: value.terminalCategory,
     });
+    state.children.add(token);
     return token;
   } catch (_) { revokeState(state); return null; }
 }
@@ -209,14 +240,16 @@ function readMemberConversationProviderRejectionV2(token, authority) {
   if (!state || !rejection || rejection.consumed || rejection.authority !== state
     || rejection.generation !== state.generation || state.revoked
     || state.terminalState.isTerminal()) return null;
-  rejection.consumed = true;
-  return Object.freeze({
+  const output = Object.freeze({
     attemptId: state.attemptId,
     providerRequestId: rejection.providerRequestId,
     requestEnvelopeDigestSha256: state.requestDigestSha256,
     terminalCategory: rejection.terminalCategory,
     version: MEMBER_CONVERSATION_PROVIDER_REJECTION_V2_VERSION,
   });
+  rejection.consumed = true;
+  deleteChild(state, token, rejections);
+  return output;
 }
 
 module.exports = {

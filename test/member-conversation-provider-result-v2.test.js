@@ -217,6 +217,9 @@ test("explicit revocation and terminal transition invalidate unread child tokens
   assert.equal(readMemberConversationProviderResultV2(
     successToken, revoked.authority
   ), null);
+  assert.equal(readMemberConversationProviderResultV2(
+    successToken, revoked.authority
+  ), null);
 
   const terminal = fixture();
   markMemberConversationProviderResultAuthorityV2Contacted(terminal.authority);
@@ -230,6 +233,46 @@ test("explicit revocation and terminal transition invalidate unread child tokens
   terminal.terminalState.terminate("synthetic");
   assert.equal(readMemberConversationProviderRejectionV2(
     rejectionToken, terminal.authority
+  ), null);
+  assert.equal(readMemberConversationProviderRejectionV2(
+    rejectionToken, terminal.authority
+  ), null);
+});
+
+test("successful one-read deletes child records without foreign-read mutation", () => {
+  const successOwner = fixture();
+  const foreign = fixture();
+  markMemberConversationProviderResultAuthorityV2Contacted(successOwner.authority);
+  const successToken = createMemberConversationProviderResultV2(
+    successOwner.authority, success()
+  );
+  assert.equal(readMemberConversationProviderResultV2(
+    successToken, foreign.authority
+  ), null);
+  assert.ok(readMemberConversationProviderResultV2(
+    successToken, successOwner.authority
+  ));
+  assert.equal(readMemberConversationProviderResultV2(
+    successToken, successOwner.authority
+  ), null);
+
+  const rejectionOwner = fixture();
+  markMemberConversationProviderResultAuthorityV2Contacted(rejectionOwner.authority);
+  const rejectionToken = createMemberConversationProviderRejectionV2(
+    rejectionOwner.authority, {
+      providerRequestId: "req_cleanup",
+      terminalCategory: "request_rejected",
+      version: MEMBER_CONVERSATION_PROVIDER_REJECTION_V2_VERSION,
+    }
+  );
+  assert.equal(readMemberConversationProviderRejectionV2(
+    rejectionToken, foreign.authority
+  ), null);
+  assert.ok(readMemberConversationProviderRejectionV2(
+    rejectionToken, rejectionOwner.authority
+  ));
+  assert.equal(readMemberConversationProviderRejectionV2(
+    rejectionToken, rejectionOwner.authority
   ), null);
 });
 
