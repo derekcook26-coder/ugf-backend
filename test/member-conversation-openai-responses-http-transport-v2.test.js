@@ -18,7 +18,10 @@ const {
 } = require("../src/goals-coach/member-conversation-openai-http-client");
 const {
   MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+  bindMemberConversationProviderResultAuthorityV2Operation,
   createMemberConversationProviderResultAuthorityV2,
+  createMemberConversationProviderResultV2,
+  revokeMemberConversationProviderResultAuthorityV2,
   validMemberConversationProviderResultAuthorityV2,
 } = require("../src/goals-coach/member-conversation-provider-result-v2");
 const {
@@ -27,6 +30,7 @@ const {
 } = require("../src/goals-coach/member-conversation-provider-result-v2");
 const {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_TRANSPORT_V2_VERSION,
+  createMemberConversationOpenAIResponsesHTTPTransportV2Execution,
   createMemberConversationOpenAIResponsesHTTPTransportV2,
   validMemberConversationOpenAIResponsesHTTPTransportV2,
 } = require("../src/goals-coach/member-conversation-openai-responses-http-transport-v2");
@@ -82,6 +86,138 @@ function response(statusCode = 200, body) {
     statusCode,
   });
 }
+
+async function directContext(options = {}) {
+  const fixture = options.fixture || createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response() },
+  });
+  const signal = options.signal || new AbortController().signal;
+  const leaseSignal = options.leaseSignal || signal;
+  const outerDeadlineNs = deadlineAfter(monotonicNow(), 1000);
+  const terminalState = options.terminalState || createTerminalState();
+  const credentialAuthority = createMemberConversationOpenAICredentialAuthority({
+    version: MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+    attemptId: fixture.created.request.attemptId,
+    terminalState: options.credentialTerminalState || terminalState,
+  });
+  const credentialLease = await resolveMemberConversationOpenAICredential(
+    fixture.resolver.resolver,
+    Object.freeze({ authority: credentialAuthority, outerDeadlineNs, signal: leaseSignal })
+  );
+  const resultAuthority = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: fixture.created.request,
+    terminalState: options.resultTerminalState || terminalState,
+  });
+  assert.equal(bindMemberConversationProviderResultAuthorityV2Operation(
+    resultAuthority, signal, outerDeadlineNs
+  ), true);
+  const wireRequest = fixture.input.responsesTransport.createWireRequest({ signal });
+  const executionBinding = createMemberConversationOpenAIResponsesHTTPTransportV2Execution(
+    fixture.transport, { authority: credentialAuthority, credentialLease,
+      outerDeadlineNs, request: fixture.created.request, resultAuthority,
+      signal, terminalState, wireRequest }
+  );
+  return { credentialAuthority, credentialLease, executionBinding, fixture,
+    outerDeadlineNs, resultAuthority, signal, terminalState, wireRequest };
+}
+
+test("HTTP V2 binds lease, terminal state, operation snapshot, and approved origin", async () => {
+  const leaseController = new AbortController();
+  const operationController = new AbortController();
+  const mismatchedLease = await directContext({
+    leaseSignal: leaseController.signal, signal: operationController.signal,
+  });
+  let result = await executeMemberConversationOpenAIHTTPRequestV2(
+    mismatchedLease.fixture.httpClient,
+    Object.freeze({ body: mismatchedLease.wireRequest.body,
+      clientRequestId: mismatchedLease.wireRequest.clientRequestId }),
+    Object.freeze({ authority: mismatchedLease.credentialAuthority,
+      credentialLease: mismatchedLease.credentialLease,
+      executionBinding: mismatchedLease.executionBinding,
+      outerDeadlineNs: mismatchedLease.outerDeadlineNs,
+      request: mismatchedLease.fixture.created.request,
+      resultAuthority: mismatchedLease.resultAuthority,
+      signal: mismatchedLease.signal, terminalState: mismatchedLease.terminalState,
+      wireRequest: mismatchedLease.wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(mismatchedLease.fixture.http.calls.length, 0);
+
+  const credentialTerminalState = createTerminalState();
+  const resultTerminalState = createTerminalState();
+  const mismatchedTerminal = await directContext({
+    credentialTerminalState, resultTerminalState, terminalState: resultTerminalState,
+  });
+  result = await executeMemberConversationOpenAIHTTPRequestV2(
+    mismatchedTerminal.fixture.httpClient,
+    Object.freeze({ body: mismatchedTerminal.wireRequest.body,
+      clientRequestId: mismatchedTerminal.wireRequest.clientRequestId }),
+    Object.freeze({ authority: mismatchedTerminal.credentialAuthority,
+      credentialLease: mismatchedTerminal.credentialLease,
+      executionBinding: mismatchedTerminal.executionBinding,
+      outerDeadlineNs: mismatchedTerminal.outerDeadlineNs,
+      request: mismatchedTerminal.fixture.created.request,
+      resultAuthority: mismatchedTerminal.resultAuthority,
+      signal: mismatchedTerminal.signal, terminalState: resultTerminalState,
+      wireRequest: mismatchedTerminal.wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(mismatchedTerminal.fixture.http.calls.length, 0);
+
+  const exact = await directContext();
+  const substitute = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: exact.fixture.created.request, terminalState: exact.terminalState,
+  });
+  assert.equal(bindMemberConversationProviderResultAuthorityV2Operation(
+    substitute, exact.signal, exact.outerDeadlineNs
+  ), true);
+  const mutableOperation = { authority: exact.credentialAuthority,
+    credentialLease: exact.credentialLease, executionBinding: exact.executionBinding,
+    outerDeadlineNs: exact.outerDeadlineNs,
+    request: exact.fixture.created.request, resultAuthority: exact.resultAuthority,
+    signal: exact.signal, terminalState: exact.terminalState,
+    wireRequest: exact.wireRequest };
+  const pending = executeMemberConversationOpenAIHTTPRequestV2(
+    exact.fixture.httpClient,
+    Object.freeze({ body: exact.wireRequest.body,
+      clientRequestId: exact.wireRequest.clientRequestId }), mutableOperation
+  );
+  queueMicrotask(() => { mutableOperation.resultAuthority = substitute; });
+  result = await pending;
+  assert.equal(result.classification, "complete");
+  assert.equal(exact.fixture.http.calls.length, 1);
+  assert.ok(createMemberConversationProviderResultV2(exact.resultAuthority, {
+    version: "GC-MEMBER-CONVERSATION-PROVIDER-RESULT-2", coaching: "Begin gently.",
+    providerRequestId: "req_exact", providerResponseId: "resp_exact",
+  }));
+  assert.equal(createMemberConversationProviderResultV2(substitute, {
+    version: "GC-MEMBER-CONVERSATION-PROVIDER-RESULT-2", coaching: "Begin gently.",
+    providerRequestId: "req_substitute", providerResponseId: "resp_substitute",
+  }), null);
+  revokeMemberConversationProviderResultAuthorityV2(substitute);
+
+  const drift = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    origin: "https://different.openai.test",
+  });
+  assert.ok(drift.transport);
+  const originBound = await directContext();
+  const alternate = await executeMemberConversationOpenAIHTTPRequestV2(
+    drift.httpClient,
+    Object.freeze({ body: originBound.wireRequest.body,
+      clientRequestId: originBound.wireRequest.clientRequestId }),
+    Object.freeze({ authority: originBound.credentialAuthority,
+      credentialLease: originBound.credentialLease,
+      executionBinding: originBound.executionBinding,
+      outerDeadlineNs: originBound.outerDeadlineNs,
+      request: originBound.fixture.created.request,
+      resultAuthority: originBound.resultAuthority, signal: originBound.signal,
+      terminalState: originBound.terminalState, wireRequest: originBound.wireRequest })
+  );
+  assert.equal(alternate.classification, "not_contacted");
+  assert.equal(drift.http.calls.length, 0);
+});
 
 test("constructs a genuine frozen HTTP transport V2 with exact cache identity", () => {
   const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2();
@@ -559,7 +695,8 @@ test("production startup remains import-free and migrations remain outside this 
   const path = require("node:path");
   const production = ["server.js", ...fs.readdirSync(path.join(__dirname, "../src"), { recursive: true })
     .filter((name) => typeof name === "string" && name.endsWith(".js"))]
-    .filter((name) => !name.includes("member-conversation-openai-responses-http-transport-v2.js"));
+    .filter((name) => !name.includes("member-conversation-openai-responses-http-transport-v2.js")
+      && !name.includes("member-conversation-openai-http-client.js"));
   for (const name of production) {
     const full = name === "server.js" ? path.join(__dirname, "../server.js") : path.join(__dirname, "../src", name);
     if (fs.existsSync(full)) assert.doesNotMatch(fs.readFileSync(full, "utf8"), /openai-responses-http-transport-v2/);

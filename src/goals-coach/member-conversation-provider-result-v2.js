@@ -206,6 +206,13 @@ function memberConversationProviderResultAuthorityV2MatchesOperation(
   return true;
 }
 
+function memberConversationProviderResultAuthorityV2MatchesTerminalState(
+  authority, terminalState
+) {
+  const state = activeAuthority(authority);
+  return Boolean(state && state.terminalState === terminalState);
+}
+
 function activeOperation(state) {
   if (state.operationSignal === null && state.operationDeadlineNs === null) return true;
   if (state.operationSignal === null || state.operationDeadlineNs === null
@@ -343,6 +350,7 @@ module.exports = {
   markMemberConversationProviderResultAuthorityV2Contacted,
   memberConversationProviderResultAuthorityV2MatchesOperation,
   memberConversationProviderResultAuthorityV2MatchesRequest,
+  memberConversationProviderResultAuthorityV2MatchesTerminalState,
   readMemberConversationProviderRejectionV2,
   readMemberConversationProviderResultV2,
   revokeMemberConversationProviderResultAuthorityV2,

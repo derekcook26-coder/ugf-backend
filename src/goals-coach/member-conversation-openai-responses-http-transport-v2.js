@@ -64,6 +64,7 @@ const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
 const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
 const states = new WeakMap();
 const brands = new WeakSet();
+const executions = new WeakMap();
 
 function aborted(signal) {
   try { return ABORTED.call(signal); } catch { return true; }
@@ -169,6 +170,37 @@ function failure(classification) {
   return Object.freeze({ authority: null, classification, outcome: null });
 }
 
+function createMemberConversationOpenAIResponsesHTTPTransportV2Execution(
+  transport, values
+) {
+  const current = transport && states.get(transport);
+  if (!current || !exactKeys(values, ["authority", "credentialLease",
+    "outerDeadlineNs", "request", "resultAuthority", "signal",
+    "terminalState", "wireRequest"])
+    || values.request !== current.request) return null;
+  const token = Object.freeze(Object.create(null));
+  executions.set(token, Object.freeze({ ...values, client: current.httpClient,
+    origin: current.origin, transport }));
+  return token;
+}
+
+function memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution(
+  token, client, operation
+) {
+  const state = token && executions.get(token);
+  return Boolean(state && state.client === client
+    && memberConversationOpenAIHTTPClientMatchesOrigin(client, state.origin)
+    && state.transport && states.has(state.transport)
+    && state.authority === operation.authority
+    && state.credentialLease === operation.credentialLease
+    && state.outerDeadlineNs === operation.outerDeadlineNs
+    && state.request === operation.request
+    && state.resultAuthority === operation.resultAuthority
+    && state.signal === operation.signal
+    && state.terminalState === operation.terminalState
+    && state.wireRequest === operation.wireRequest);
+}
+
 function activeResult(operation, authority, request) {
   return Boolean(!aborted(operation.signal) && !operation.terminalState.isTerminal()
     && positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) !== null
@@ -239,12 +271,21 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
             if (!lease || !activeResult(operation, resultAuthority, request)) {
               return failure("not_contacted");
             }
+            const executionBinding =
+              createMemberConversationOpenAIResponsesHTTPTransportV2Execution(
+                transport, { authority: credentialAuthority, credentialLease: lease,
+                  outerDeadlineNs: operation.outerDeadlineNs, request, resultAuthority,
+                  signal: operation.signal, terminalState: operation.terminalState,
+                  wireRequest: wire }
+              );
+            if (!executionBinding) return failure("not_contacted");
             const result = await executeMemberConversationOpenAIHTTPRequestV2(
               current.httpClient,
               Object.freeze({ body: wire.body, clientRequestId: wire.clientRequestId }),
               Object.freeze({ authority: credentialAuthority, credentialLease: lease,
-                outerDeadlineNs: operation.outerDeadlineNs, request,
-                resultAuthority, signal: operation.signal, wireRequest: wire })
+                executionBinding, outerDeadlineNs: operation.outerDeadlineNs, request,
+                resultAuthority, signal: operation.signal,
+                terminalState: operation.terminalState, wireRequest: wire })
             );
             if (result && result.classification === "not_contacted") return failure("not_contacted");
             if (!result || result.classification !== "complete" || !result.response
@@ -324,6 +365,8 @@ function validMemberConversationOpenAIResponsesHTTPTransportV2(value) {
 
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_TRANSPORT_V2_VERSION,
+  createMemberConversationOpenAIResponsesHTTPTransportV2Execution,
   createMemberConversationOpenAIResponsesHTTPTransportV2,
+  memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution,
   validMemberConversationOpenAIResponsesHTTPTransportV2,
 };

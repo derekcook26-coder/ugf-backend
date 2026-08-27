@@ -116,6 +116,13 @@ function memberConversationOpenAICredentialAuthorityMatchesAttempt(
   return Boolean(state && state.attemptId === attemptId);
 }
 
+function memberConversationOpenAICredentialAuthorityMatchesTerminalState(
+  value, terminalState
+) {
+  const state = activeAuthority(value);
+  return Boolean(state && state.terminalState === terminalState);
+}
+
 function revokeMemberConversationOpenAICredentialAuthority(value) {
   const state = value && authorities.get(value);
   if (!state || state.revoked) return false;
@@ -246,6 +253,14 @@ function validMemberConversationOpenAICredentialLease(lease, authorityToken) {
   return true;
 }
 
+function memberConversationOpenAICredentialLeaseMatchesOperation(
+  lease, authorityToken, signal, outerDeadlineNs
+) {
+  const state = lease && leases.get(lease);
+  return Boolean(validMemberConversationOpenAICredentialLease(lease, authorityToken)
+    && state.signal === signal && state.outerDeadlineNs === outerDeadlineNs);
+}
+
 function revokeMemberConversationOpenAICredentialLease(value) {
   const state = value && leases.get(value);
   return revokeLeaseState(state);
@@ -294,6 +309,8 @@ module.exports = {
   createMemberConversationOpenAICredentialResolver,
   consumeMemberConversationOpenAICredentialLease,
   memberConversationOpenAICredentialAuthorityMatchesAttempt,
+  memberConversationOpenAICredentialAuthorityMatchesTerminalState,
+  memberConversationOpenAICredentialLeaseMatchesOperation,
   resolveMemberConversationOpenAICredential,
   revokeMemberConversationOpenAICredentialAuthority,
   revokeMemberConversationOpenAICredentialLease,

@@ -9,6 +9,8 @@ const {
 const {
   consumeMemberConversationOpenAICredentialLease,
   memberConversationOpenAICredentialAuthorityMatchesAttempt,
+  memberConversationOpenAICredentialAuthorityMatchesTerminalState,
+  memberConversationOpenAICredentialLeaseMatchesOperation,
   revokeMemberConversationOpenAICredentialLease,
   subscribeMemberConversationOpenAICredentialAuthority,
   validMemberConversationOpenAICredentialAuthority,
@@ -31,8 +33,8 @@ const OPERATION_KEYS = Object.freeze([
   "authority", "credentialLease", "outerDeadlineNs", "signal",
 ]);
 const V2_OPERATION_KEYS = Object.freeze([
-  "authority", "credentialLease", "outerDeadlineNs", "request",
-  "resultAuthority", "signal", "wireRequest",
+  "authority", "credentialLease", "executionBinding", "outerDeadlineNs",
+  "request", "resultAuthority", "signal", "terminalState", "wireRequest",
 ]);
 const OUTCOME_KEYS = Object.freeze([
   "body", "complete", "contacted", "decompressedBytes", "headers",
@@ -346,7 +348,10 @@ function exactDataKeys(value, keys) {
 function executeMemberConversationOpenAIHTTPRequestV2(
   client, request = {}, operation = {}
 ) {
-  if (!exactKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
+  if (!exactDataKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
+  const snapshot = Object.freeze(Object.fromEntries(V2_OPERATION_KEYS.map(
+    (key) => [key, Object.getOwnPropertyDescriptor(operation, key).value]
+  )));
   const {
     memberConversationOpenAIResponsesWireRequestV2HTTPBinding,
     memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
@@ -355,26 +360,42 @@ function executeMemberConversationOpenAIHTTPRequestV2(
     markMemberConversationProviderResultAuthorityV2Contacted,
     memberConversationProviderResultAuthorityV2MatchesOperation,
     memberConversationProviderResultAuthorityV2MatchesRequest,
+    memberConversationProviderResultAuthorityV2MatchesTerminalState,
   } = require("./member-conversation-provider-result-v2");
+  const {
+    memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution,
+  } = require("./member-conversation-openai-responses-http-transport-v2");
   const binding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
-    operation.wireRequest, operation.request, operation.signal
+    snapshot.wireRequest, snapshot.request, snapshot.signal
   );
   if (!binding || !exactDataKeys(request, REQUEST_KEYS)
+    || !memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution(
+      snapshot.executionBinding, client, snapshot
+    )
+    || !memberConversationOpenAICredentialLeaseMatchesOperation(
+      snapshot.credentialLease, snapshot.authority,
+      snapshot.signal, snapshot.outerDeadlineNs
+    )
+    || !memberConversationOpenAICredentialAuthorityMatchesTerminalState(
+      snapshot.authority, snapshot.terminalState
+    )
     || !memberConversationProviderResultAuthorityV2MatchesRequest(
-    operation.resultAuthority, operation.request
+    snapshot.resultAuthority, snapshot.request
   ) || !memberConversationProviderResultAuthorityV2MatchesOperation(
-    operation.resultAuthority, operation.signal, operation.outerDeadlineNs
+    snapshot.resultAuthority, snapshot.signal, snapshot.outerDeadlineNs
+  ) || !memberConversationProviderResultAuthorityV2MatchesTerminalState(
+    snapshot.resultAuthority, snapshot.terminalState
   ) || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
-    operation.wireRequest, operation.request
+    snapshot.wireRequest, snapshot.request
   ) || request.body !== binding.body
     || request.clientRequestId !== binding.clientRequestId) {
     return publicFailure("not_contacted");
   }
   const credentialOperation = Object.freeze({
-    authority: operation.authority,
-    credentialLease: operation.credentialLease,
-    outerDeadlineNs: operation.outerDeadlineNs,
-    signal: operation.signal,
+    authority: snapshot.authority,
+    credentialLease: snapshot.credentialLease,
+    outerDeadlineNs: snapshot.outerDeadlineNs,
+    signal: snapshot.signal,
   });
   return executeMemberConversationOpenAIHTTPRequest(
     client,
@@ -382,19 +403,22 @@ function executeMemberConversationOpenAIHTTPRequestV2(
     credentialOperation,
     () => {
       const currentBinding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
-        operation.wireRequest, operation.request, operation.signal
+        snapshot.wireRequest, snapshot.request, snapshot.signal
       );
       return Boolean(currentBinding
         && currentBinding.body === binding.body
         && currentBinding.clientRequestId === binding.clientRequestId
         && memberConversationProviderResultAuthorityV2MatchesRequest(
-          operation.resultAuthority, operation.request
+          snapshot.resultAuthority, snapshot.request
         )
         && memberConversationProviderResultAuthorityV2MatchesOperation(
-          operation.resultAuthority, operation.signal, operation.outerDeadlineNs
+          snapshot.resultAuthority, snapshot.signal, snapshot.outerDeadlineNs
+        )
+        && memberConversationProviderResultAuthorityV2MatchesTerminalState(
+          snapshot.resultAuthority, snapshot.terminalState
         )
         && markMemberConversationProviderResultAuthorityV2Contacted(
-          operation.resultAuthority
+          snapshot.resultAuthority
         ));
     }
   );
