@@ -28,6 +28,10 @@ const REQUEST_KEYS = Object.freeze(["body", "clientRequestId"]);
 const OPERATION_KEYS = Object.freeze([
   "authority", "credentialLease", "outerDeadlineNs", "signal",
 ]);
+const V2_OPERATION_KEYS = Object.freeze([
+  "authority", "credentialLease", "outerDeadlineNs", "request",
+  "resultAuthority", "signal",
+]);
 const OUTCOME_KEYS = Object.freeze([
   "body", "complete", "contacted", "decompressedBytes", "headers",
   "kind", "redirected", "statusCode",
@@ -181,7 +185,7 @@ function parsedOutcome(value, state) {
 }
 
 async function executeMemberConversationOpenAIHTTPRequest(
-  client, request = {}, operation = {}
+  client, request = {}, operation = {}, beforeContact = null
 ) {
   const state = client && clients.get(client);
   if (!state || !exactKeys(request, REQUEST_KEYS)
@@ -263,7 +267,9 @@ async function executeMemberConversationOpenAIHTTPRequest(
           || !validMemberConversationOpenAICredentialAuthority(operation.authority)
           || positiveRemainingMilliseconds(
             operation.outerDeadlineNs, monotonicNow()
-          ) === null) return cancelledBeforeContact;
+          ) === null || (beforeContact && beforeContact() !== true)) {
+          return cancelledBeforeContact;
+        }
         // This transition and invocation share one synchronous callback boundary.
         contacted = true;
         return interfaces.get(state.http).request(boundary);
@@ -307,6 +313,35 @@ async function executeMemberConversationOpenAIHTTPRequest(
   }
 }
 
+function executeMemberConversationOpenAIHTTPRequestV2(
+  client, request = {}, operation = {}
+) {
+  if (!exactKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
+  const {
+    markMemberConversationProviderResultAuthorityV2Contacted,
+    memberConversationProviderResultAuthorityV2MatchesRequest,
+  } = require("./member-conversation-provider-result-v2");
+  if (!memberConversationProviderResultAuthorityV2MatchesRequest(
+    operation.resultAuthority, operation.request
+  )) return publicFailure("not_contacted");
+  const credentialOperation = Object.freeze({
+    authority: operation.authority,
+    credentialLease: operation.credentialLease,
+    outerDeadlineNs: operation.outerDeadlineNs,
+    signal: operation.signal,
+  });
+  return executeMemberConversationOpenAIHTTPRequest(
+    client,
+    request,
+    credentialOperation,
+    () => memberConversationProviderResultAuthorityV2MatchesRequest(
+      operation.resultAuthority, operation.request
+    ) && markMemberConversationProviderResultAuthorityV2Contacted(
+      operation.resultAuthority
+    )
+  );
+}
+
 function readMemberConversationOpenAIHTTPResponse(value) {
   const state = value && responses.get(value);
   if (!state) return null;
@@ -331,6 +366,7 @@ module.exports = {
   createMemberConversationOpenAIBoundedHTTPInterface,
   createMemberConversationOpenAIHTTPClient,
   executeMemberConversationOpenAIHTTPRequest,
+  executeMemberConversationOpenAIHTTPRequestV2,
   memberConversationOpenAIHTTPClientMatchesOrigin,
   readMemberConversationOpenAIHTTPResponse,
   validMemberConversationOpenAIBoundedHTTPInterface,
