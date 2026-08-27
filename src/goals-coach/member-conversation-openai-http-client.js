@@ -1,5 +1,7 @@
 "use strict";
 
+const { types: { isProxy } } = require("node:util");
+
 const {
   monotonicNow,
   positiveRemainingMilliseconds,
@@ -326,23 +328,43 @@ async function executeMemberConversationOpenAIHTTPRequest(
   }
 }
 
+function exactDataKeys(value, keys) {
+  if (!exactObject(value) || isProxy(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")
+    || ownKeys.slice().sort().join("\0") !== keys.slice().sort().join("\0")) {
+    return false;
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return keys.every((key) => descriptors[key] && descriptors[key].enumerable
+    && Object.prototype.hasOwnProperty.call(descriptors[key], "value")
+    && !Object.prototype.hasOwnProperty.call(descriptors[key], "get")
+    && !Object.prototype.hasOwnProperty.call(descriptors[key], "set"));
+}
+
 function executeMemberConversationOpenAIHTTPRequestV2(
   client, request = {}, operation = {}
 ) {
   if (!exactKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
   const {
+    memberConversationOpenAIResponsesWireRequestV2HTTPBinding,
     memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
   } = require("./member-conversation-openai-responses-adapter-v2");
   const {
     markMemberConversationProviderResultAuthorityV2Contacted,
     memberConversationProviderResultAuthorityV2MatchesRequest,
   } = require("./member-conversation-provider-result-v2");
-  if (!memberConversationProviderResultAuthorityV2MatchesRequest(
+  const binding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+    operation.wireRequest, operation.request, operation.signal
+  );
+  if (!binding || !exactDataKeys(request, REQUEST_KEYS)
+    || !memberConversationProviderResultAuthorityV2MatchesRequest(
     operation.resultAuthority, operation.request
   ) || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
     operation.wireRequest, operation.request
-  ) || request.body !== operation.wireRequest.body
-    || request.clientRequestId !== operation.wireRequest.clientRequestId) {
+  ) || request.body !== binding.body
+    || request.clientRequestId !== binding.clientRequestId) {
     return publicFailure("not_contacted");
   }
   const credentialOperation = Object.freeze({
@@ -353,17 +375,22 @@ function executeMemberConversationOpenAIHTTPRequestV2(
   });
   return executeMemberConversationOpenAIHTTPRequest(
     client,
-    request,
+    binding,
     credentialOperation,
-    () => memberConversationProviderResultAuthorityV2MatchesRequest(
-      operation.resultAuthority, operation.request
-    ) && memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
-      operation.wireRequest, operation.request
-    ) && request.body === operation.wireRequest.body
-      && request.clientRequestId === operation.wireRequest.clientRequestId
-      && markMemberConversationProviderResultAuthorityV2Contacted(
-      operation.resultAuthority
-    )
+    () => {
+      const currentBinding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+        operation.wireRequest, operation.request, operation.signal
+      );
+      return Boolean(currentBinding
+        && currentBinding.body === binding.body
+        && currentBinding.clientRequestId === binding.clientRequestId
+        && memberConversationProviderResultAuthorityV2MatchesRequest(
+          operation.resultAuthority, operation.request
+        )
+        && markMemberConversationProviderResultAuthorityV2Contacted(
+          operation.resultAuthority
+        ));
+    }
   );
 }
 

@@ -29,9 +29,14 @@ const {
 } = require("./member-conversation-provider-request-envelope-v2");
 const { validMemberConversationProviderTransportV2 } = require("./member-conversation-provider-transport-v2");
 const {
+  MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
+  parseMemberConversationProviderOutput,
+} = require("./member-conversation-provider-output-policy");
+const {
   MEMBER_CONVERSATION_PROVIDER_REJECTION_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_V2_VERSION,
+  bindMemberConversationProviderResultAuthorityV2Operation,
   createMemberConversationProviderRejectionV2,
   createMemberConversationProviderResultAuthorityV2,
   createMemberConversationProviderResultV2,
@@ -209,6 +214,13 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
             if (credentialAuthority) revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
             return failure("not_contacted");
           }
+          if (!bindMemberConversationProviderResultAuthorityV2Operation(
+            resultAuthority, operation.signal, operation.outerDeadlineNs
+          )) {
+            revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+            revokeMemberConversationProviderResultAuthorityV2(resultAuthority);
+            return failure("not_contacted");
+          }
           const terminate = () => operation.terminalState.terminate("operation_aborted", { responseAllowed: false });
           addAbortListener(operation.signal, terminate);
           let retainResultAuthority = false;
@@ -256,9 +268,16 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
               return Object.freeze({ authority: resultAuthority, classification: "rejected", outcome });
             }
             if (!activeResult(operation, resultAuthority, request)) return failure("indeterminate");
+            const approved = parseMemberConversationProviderOutput({
+              version: MEMBER_CONVERSATION_PROVIDER_OUTPUT_POLICY_VERSION,
+              coaching: parsed.coaching,
+            });
+            if (!approved || !activeResult(operation, resultAuthority, request)) {
+              return failure("indeterminate");
+            }
             const outcome = createMemberConversationProviderResultV2(resultAuthority, {
               version: MEMBER_CONVERSATION_PROVIDER_RESULT_V2_VERSION,
-              coaching: parsed.coaching,
+              coaching: approved.coaching,
               providerRequestId: parsed.providerRequestId,
               providerResponseId: parsed.providerResponseId,
             });

@@ -282,6 +282,87 @@ test("HTTP V2 contact rejects cross-bound wire and result request authority", as
   revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
 });
 
+test("HTTP V2 rejects accessor body substitution without observation or contact", async () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response() },
+  });
+  const terminalState = createTerminalState();
+  const signal = new AbortController().signal;
+  const outerDeadlineNs = deadlineAfter(monotonicNow(), 1000);
+  const credentialAuthority = createMemberConversationOpenAICredentialAuthority({
+    version: MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+    attemptId: fixture.created.request.attemptId,
+    terminalState,
+  });
+  const credentialLease = await resolveMemberConversationOpenAICredential(
+    fixture.resolver.resolver,
+    Object.freeze({ authority: credentialAuthority, outerDeadlineNs, signal })
+  );
+  const resultAuthority = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: fixture.created.request,
+    terminalState,
+  });
+  const wireRequest = fixture.input.responsesTransport.createWireRequest({ signal });
+  let observations = 0;
+  const request = { clientRequestId: wireRequest.clientRequestId };
+  Object.defineProperty(request, "body", {
+    enumerable: true,
+    get() {
+      observations += 1;
+      return observations === 1 ? wireRequest.body : { model: "attacker-controlled" };
+    },
+  });
+  const result = await executeMemberConversationOpenAIHTTPRequestV2(
+    fixture.httpClient, request,
+    Object.freeze({ authority: credentialAuthority, credentialLease, outerDeadlineNs,
+      request: fixture.created.request, resultAuthority, signal, wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(observations, 0);
+  assert.equal(fixture.http.calls.length, 0);
+  revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+});
+
+test("HTTP V2 binds the branded wire to the exact operation signal", async () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response() },
+  });
+  const terminalState = createTerminalState();
+  const wireController = new AbortController();
+  const operationController = new AbortController();
+  const outerDeadlineNs = deadlineAfter(monotonicNow(), 1000);
+  const credentialAuthority = createMemberConversationOpenAICredentialAuthority({
+    version: MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+    attemptId: fixture.created.request.attemptId,
+    terminalState,
+  });
+  const credentialLease = await resolveMemberConversationOpenAICredential(
+    fixture.resolver.resolver,
+    Object.freeze({ authority: credentialAuthority, outerDeadlineNs,
+      signal: operationController.signal })
+  );
+  const resultAuthority = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: fixture.created.request,
+    terminalState,
+  });
+  const wireRequest = fixture.input.responsesTransport.createWireRequest({
+    signal: wireController.signal,
+  });
+  wireController.abort();
+  const result = await executeMemberConversationOpenAIHTTPRequestV2(
+    fixture.httpClient,
+    Object.freeze({ body: wireRequest.body, clientRequestId: wireRequest.clientRequestId }),
+    Object.freeze({ authority: credentialAuthority, credentialLease, outerDeadlineNs,
+      request: fixture.created.request, resultAuthority,
+      signal: operationController.signal, wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(fixture.http.calls.length, 0);
+  revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+});
+
 test("overridden prototype and own AbortSignal operations fail before dependencies", async () => {
   for (const mutate of [
     (signal) => Object.setPrototypeOf(signal, Object.create(AbortSignal.prototype)),
@@ -344,6 +425,40 @@ test("malformed and ambiguous post-contact outcomes are indeterminate", async ()
     const result = await fixture.transport.dispatch(fixture.created.request, operation());
     assert.equal(result.classification, "indeterminate");
     assert.equal(fixture.http.calls.length, 1);
+  }
+});
+
+test("deterministic output safety policy rejects prohibited coaching", async () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response(200, {
+      id: "resp_synthetic_unsafe", object: "response", status: "completed",
+      error: null, incomplete_details: null,
+      output: [{ type: "message", status: "completed", role: "assistant",
+        content: [{ type: "output_text", annotations: [],
+          text: JSON.stringify({ coaching: "Continue through pain." }) }] }],
+    }) },
+  });
+  const result = await fixture.transport.dispatch(fixture.created.request, operation());
+  assert.equal(result.classification, "indeterminate");
+  assert.equal(result.authority, null);
+  assert.equal(result.outcome, null);
+  assert.equal(fixture.http.calls.length, 1);
+});
+
+test("abort after dispatch revokes unconsumed success and rejection capabilities", async () => {
+  for (const outcome of [response(), response(429, {})]) {
+    const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+      httpOptions: { outcome },
+    });
+    const controller = new AbortController();
+    const result = await fixture.transport.dispatch(
+      fixture.created.request, operation({ signal: controller.signal })
+    );
+    assert.ok(["succeeded", "rejected"].includes(result.classification));
+    controller.abort();
+    assert.equal(result.classification === "succeeded"
+      ? readMemberConversationProviderResultV2(result.outcome, result.authority)
+      : readMemberConversationProviderRejectionV2(result.outcome, result.authority), null);
   }
 });
 

@@ -2,7 +2,11 @@
 
 const { createHash } = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
-const { validTerminalState } = require("./bounded-postgres-transaction");
+const {
+  monotonicNow,
+  positiveRemainingMilliseconds,
+  validTerminalState,
+} = require("./bounded-postgres-transaction");
 const {
   memberConversationProviderRequestV2Digest,
   validMemberConversationProviderRequestV2,
@@ -30,6 +34,13 @@ const REJECTION_CATEGORIES = new Set([
 const authorities = new WeakMap();
 const successes = new WeakMap();
 const rejections = new WeakMap();
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -67,9 +78,17 @@ function releaseTerminalSubscription(state) {
   unsubscribe();
 }
 
+function releaseOperationBinding(state) {
+  if (typeof state.releaseOperation !== "function") return;
+  const release = state.releaseOperation;
+  state.releaseOperation = null;
+  release();
+}
+
 function deleteChild(state, token, records) {
   records.delete(token);
   state.children.delete(token);
+  if (!state.children.size) releaseOperationBinding(state);
   releaseTerminalSubscription(state);
 }
 
@@ -79,6 +98,7 @@ function deleteChildren(state) {
     rejections.delete(token);
   }
   state.children.clear();
+  releaseOperationBinding(state);
   releaseTerminalSubscription(state);
 }
 
@@ -127,6 +147,7 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
       contacted: false,
       generation: 1,
       requestDigestSha256: digest,
+      releaseOperation: null,
       revoked: false,
       terminalState: value.terminalState,
       unsubscribeTerminal: null,
@@ -135,6 +156,35 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
     state.unsubscribeTerminal = value.terminalState.subscribe(() => revokeState(state));
     return token;
   } catch (_) { return null; }
+}
+
+function bindMemberConversationProviderResultAuthorityV2Operation(
+  authority, signal, outerDeadlineNs
+) {
+  const state = activeAuthority(authority);
+  if (!state || state.releaseOperation !== null
+    || !(signal instanceof AbortSignal) || typeof outerDeadlineNs !== "bigint") {
+    return false;
+  }
+  const remaining = positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow());
+  if (aborted(signal) || remaining === null) {
+    revokeState(state);
+    return false;
+  }
+  const revoke = () => revokeState(state);
+  ADD_EVENT_LISTENER.call(signal, "abort", revoke, { once: true });
+  const timer = setTimeout(revoke, remaining);
+  if (typeof timer.unref === "function") timer.unref();
+  state.releaseOperation = () => {
+    clearTimeout(timer);
+    try { REMOVE_EVENT_LISTENER.call(signal, "abort", revoke); } catch {}
+  };
+  if (aborted(signal)
+    || positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow()) === null) {
+    revokeState(state);
+    return false;
+  }
+  return true;
 }
 
 function validMemberConversationProviderResultAuthorityV2(value) {
@@ -256,6 +306,7 @@ module.exports = {
   MEMBER_CONVERSATION_PROVIDER_REJECTION_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_V2_VERSION,
+  bindMemberConversationProviderResultAuthorityV2Operation,
   createMemberConversationProviderRejectionV2,
   createMemberConversationProviderResultAuthorityV2,
   createMemberConversationProviderResultV2,

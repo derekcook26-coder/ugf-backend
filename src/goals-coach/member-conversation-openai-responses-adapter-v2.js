@@ -241,8 +241,11 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
       signal: input.signal,
     });
     wireState.set(wireRequest, Object.freeze({
+      body: wireRequest.body,
+      clientRequestId: wireRequest.clientRequestId,
       request: input.request,
       requestDigestSha256: memberConversationProviderRequestV2Digest(input.request),
+      signal: input.signal,
     }));
     return wireRequest;
   } catch (_) { return null; }
@@ -254,13 +257,28 @@ function memberConversationOpenAIResponsesWireRequestV2MatchesRequest(wireReques
     && validMemberConversationProviderRequestV2(request)
     && state.request === request
     && state.requestDigestSha256 === memberConversationProviderRequestV2Digest(request)
-    && wireRequest.clientRequestId === request.attemptId);
+    && state.clientRequestId === request.attemptId);
+}
+
+function memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+  wireRequest, request, signal
+) {
+  const state = wireRequest && wireState.get(wireRequest);
+  if (!state || state.signal !== signal || !validActiveAbortSignal(signal)
+    || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
+      wireRequest, request
+    )) return null;
+  return Object.freeze({
+    body: state.body,
+    clientRequestId: state.clientRequestId,
+  });
 }
 
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_V2_VERSION,
   createMemberConversationOpenAIResponsesAdapterV2,
   createMemberConversationOpenAIResponsesWireRequestV2,
+  memberConversationOpenAIResponsesWireRequestV2HTTPBinding,
   memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
   validMemberConversationOpenAIResponsesAdapterV2,
 };
