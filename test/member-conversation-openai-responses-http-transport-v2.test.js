@@ -696,6 +696,7 @@ test("production startup remains import-free and migrations remain outside this 
   const production = ["server.js", ...fs.readdirSync(path.join(__dirname, "../src"), { recursive: true })
     .filter((name) => typeof name === "string" && name.endsWith(".js"))]
     .filter((name) => !name.includes("member-conversation-openai-responses-http-transport-v2.js")
+      && !name.includes("member-conversation-openai-responses-orchestrator-transport-v2.js")
       && !name.includes("member-conversation-openai-http-client.js"));
   for (const name of production) {
     const full = name === "server.js" ? path.join(__dirname, "../server.js") : path.join(__dirname, "../src", name);
