@@ -22,6 +22,7 @@ const {
 } = require("./member-conversation-openai-credential-resolver");
 const {
   validMemberConversationOpenAIHTTPClient,
+  memberConversationOpenAIHTTPClientMatchesOrigin,
 } = require("./member-conversation-openai-http-client");
 const {
   validMemberConversationOpenAIPromptCachePolicy,
@@ -90,6 +91,7 @@ function exactKeys(value, keys) {
 }
 
 function safeData(value, seen = new Set()) {
+  if (typeof value === "function") return false;
   if (value === null || typeof value !== "object") return true;
   if (isProxy(value) || seen.has(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -158,6 +160,58 @@ function exactDispatch(value, turnRequest, turnResponse, adapter) {
     && value.transportVersion === MEMBER_CONVERSATION_PROVIDER_TRANSPORT_VERSION;
 }
 
+function createBoundV2Chain(state, attemptId) {
+  const request = createMemberConversationProviderRequestV2({
+    version: MEMBER_CONVERSATION_PROVIDER_REQUEST_V2_VERSION,
+    transportVersion: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
+    attemptId,
+    model: state.adapter.model,
+    developerPromptVersion: state.requestConfig.developerPromptVersion,
+    developerPromptSha256: state.requestConfig.developerPromptSha256,
+    responseSchemaVersion: state.requestConfig.responseSchemaVersion,
+    responseSchemaSha256: state.requestConfig.responseSchemaSha256,
+    promptCachePolicy: state.promptCachePolicy,
+    turnRequest: state.turnRequest,
+    turnResponse: state.turnResponse,
+    controls: {
+      background: false, conversation: null,
+      maxOutputTokens: state.adapter.maxOutputTokens, metadata: null,
+      previousResponseId: null, store: false, stream: false, tools: [],
+      truncation: "disabled",
+    },
+    regionPolicy: state.requestConfig.regionPolicy,
+  });
+  if (!request) return null;
+  let httpTransport = null;
+  const providerTransport = createMemberConversationProviderTransportV2({
+    version: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
+    request,
+    provider: "openai",
+    model: request.model,
+    responseSchemaVersion: request.responseSchemaVersion,
+    dispatch: (boundRequest, boundOperation) => httpTransport
+      ? httpTransport.dispatch(boundRequest, boundOperation) : notContacted(),
+  });
+  const responsesTransport = providerTransport
+    && createMemberConversationOpenAIResponsesTransportV2({
+      version: MEMBER_CONVERSATION_OPENAI_RESPONSES_TRANSPORT_V2_VERSION,
+      adapter: state.adapter, request, transport: providerTransport,
+    });
+  httpTransport = responsesTransport
+    && createMemberConversationOpenAIResponsesHTTPTransportV2({
+      version: MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_TRANSPORT_V2_VERSION,
+      adapter: state.adapter,
+      httpClient: state.httpClient,
+      origin: state.origin,
+      providerTransport,
+      regionPolicy: state.requestConfig.regionPolicy,
+      request,
+      resolver: state.resolver,
+      responsesTransport,
+    });
+  return httpTransport ? Object.freeze({ request, providerTransport }) : null;
+}
+
 function createMemberConversationOpenAIResponsesOrchestratorTransportV2(value = {}) {
   try {
     if (!exactKeys(value, FACTORY_KEYS)
@@ -167,7 +221,10 @@ function createMemberConversationOpenAIResponsesOrchestratorTransportV2(value = 
       || !validMemberConversationOpenAIHTTPClient(value.httpClient)
       || !validMemberConversationOpenAIPromptCachePolicy(value.promptCachePolicy)
       || !exactKeys(value.requestConfig, REQUEST_CONFIG_KEYS)
-      || typeof value.origin !== "string" || !safeData(value.turnRequest)
+      || !REQUEST_CONFIG_KEYS.every((key) => typeof value.requestConfig[key] === "string")
+      || typeof value.origin !== "string"
+      || !memberConversationOpenAIHTTPClientMatchesOrigin(value.httpClient, value.origin)
+      || !safeData(value.turnRequest)
       || !safeData(value.turnResponse)) return null;
     let turnRequest;
     let turnResponse;
@@ -191,6 +248,9 @@ function createMemberConversationOpenAIResponsesOrchestratorTransportV2(value = 
       turnRequest,
       turnResponse,
     });
+    if (!createBoundV2Chain(state, "00000000-0000-4000-8000-000000000000")) {
+      return null;
+    }
     let consumed = false;
     return createMemberConversationProviderTransport({
       version: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_VERSION,
@@ -203,55 +263,9 @@ function createMemberConversationOpenAIResponsesOrchestratorTransportV2(value = 
         if (consumed) return indeterminate();
         consumed = true;
         if (!active(operation)) return notContacted();
-        const request = createMemberConversationProviderRequestV2({
-          version: MEMBER_CONVERSATION_PROVIDER_REQUEST_V2_VERSION,
-          transportVersion: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
-          attemptId: dispatchRequest.attemptId,
-          model: state.adapter.model,
-          developerPromptVersion: state.requestConfig.developerPromptVersion,
-          developerPromptSha256: state.requestConfig.developerPromptSha256,
-          responseSchemaVersion: state.requestConfig.responseSchemaVersion,
-          responseSchemaSha256: state.requestConfig.responseSchemaSha256,
-          promptCachePolicy: state.promptCachePolicy,
-          turnRequest: state.turnRequest,
-          turnResponse: state.turnResponse,
-          controls: {
-            background: false, conversation: null,
-            maxOutputTokens: state.adapter.maxOutputTokens, metadata: null,
-            previousResponseId: null, store: false, stream: false, tools: [],
-            truncation: "disabled",
-          },
-          regionPolicy: state.requestConfig.regionPolicy,
-        });
-        if (!request || !active(operation)) return notContacted();
-        let httpTransport = null;
-        const providerTransport = createMemberConversationProviderTransportV2({
-          version: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
-          request,
-          provider: "openai",
-          model: request.model,
-          responseSchemaVersion: request.responseSchemaVersion,
-          dispatch: (boundRequest, boundOperation) => httpTransport
-            ? httpTransport.dispatch(boundRequest, boundOperation) : notContacted(),
-        });
-        const responsesTransport = providerTransport
-          && createMemberConversationOpenAIResponsesTransportV2({
-            version: MEMBER_CONVERSATION_OPENAI_RESPONSES_TRANSPORT_V2_VERSION,
-            adapter: state.adapter, request, transport: providerTransport,
-          });
-        httpTransport = responsesTransport
-          && createMemberConversationOpenAIResponsesHTTPTransportV2({
-            version: MEMBER_CONVERSATION_OPENAI_RESPONSES_HTTP_TRANSPORT_V2_VERSION,
-            adapter: state.adapter,
-            httpClient: state.httpClient,
-            origin: state.origin,
-            providerTransport,
-            regionPolicy: state.requestConfig.regionPolicy,
-            request,
-            resolver: state.resolver,
-            responsesTransport,
-          });
-        if (!httpTransport || !active(operation)) return notContacted();
+        const chain = createBoundV2Chain(state, dispatchRequest.attemptId);
+        if (!chain || !active(operation)) return notContacted();
+        const { request, providerTransport } = chain;
         let returned;
         try { returned = await providerTransport.dispatch(request, operation); }
         catch (_) { return indeterminate(); }
