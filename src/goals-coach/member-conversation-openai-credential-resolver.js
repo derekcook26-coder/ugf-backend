@@ -13,11 +13,26 @@ const MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION =
 const RESOLVER_KEYS = Object.freeze(["resolve", "version"]);
 const AUTHORITY_KEYS = Object.freeze(["attemptId", "terminalState", "version"]);
 const RESOLUTION_KEYS = Object.freeze(["authority", "outerDeadlineNs", "signal"]);
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CREDENTIAL = /^[\x21-\x7e]{1,512}$/;
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
 const resolvers = new WeakMap();
 const authorities = new WeakMap();
 const leases = new WeakMap();
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
+
+function addAbortListener(signal, listener) {
+  ADD_EVENT_LISTENER.call(signal, "abort", listener, { once: true });
+}
+
+function removeAbortListener(signal, listener) {
+  try { REMOVE_EVENT_LISTENER.call(signal, "abort", listener); } catch {}
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -46,7 +61,7 @@ function revokeLeaseState(state) {
   state.timer = null;
   state.unsubscribe();
   state.unsubscribe = () => {};
-  state.signal.removeEventListener("abort", state.abort);
+  removeAbortListener(state.signal, state.abort);
   state.authority.leases.delete(state);
   return true;
 }
@@ -101,6 +116,13 @@ function memberConversationOpenAICredentialAuthorityMatchesAttempt(
   return Boolean(state && state.attemptId === attemptId);
 }
 
+function memberConversationOpenAICredentialAuthorityMatchesTerminalState(
+  value, terminalState
+) {
+  const state = activeAuthority(value);
+  return Boolean(state && state.terminalState === terminalState);
+}
+
 function revokeMemberConversationOpenAICredentialAuthority(value) {
   const state = value && authorities.get(value);
   if (!state || state.revoked) return false;
@@ -127,7 +149,7 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
 
   // Consumed synchronously before any resolver, timer, or promise boundary.
   authority.consumed = true;
-  if (value.signal.aborted
+  if (aborted(value.signal)
     || positiveRemainingMilliseconds(value.outerDeadlineNs, monotonicNow()) === null) {
     return null;
   }
@@ -137,8 +159,8 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
   authority.resolutions.add(controller);
   const abort = () => controller.abort();
   let unsubscribe = authority.terminalState.subscribe(abort);
-  value.signal.addEventListener("abort", abort, { once: true });
-  if (value.signal.aborted || authority.terminalState.isTerminal()) abort();
+  addAbortListener(value.signal, abort);
+  if (aborted(value.signal) || authority.terminalState.isTerminal()) abort();
 
   let timer;
   const remaining = positiveRemainingMilliseconds(value.outerDeadlineNs, monotonicNow());
@@ -154,7 +176,7 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
     const resolved = await Promise.race([
       Promise.resolve().then(() => {
         const current = activeAuthority(value.authority);
-        if (controller.signal.aborted || !current || current !== authority
+        if (aborted(controller.signal) || !current || current !== authority
           || current.generation !== generation
           || positiveRemainingMilliseconds(
             value.outerDeadlineNs, monotonicNow()
@@ -168,18 +190,16 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
         () => ({ failed: true })
       ),
       new Promise((resolve) => {
-        if (controller.signal.aborted) return resolve({ aborted: true });
+        if (aborted(controller.signal)) return resolve({ aborted: true });
         internalAbortListener = () => resolve({ aborted: true });
-        controller.signal.addEventListener("abort", internalAbortListener, {
-          once: true,
-        });
+        addAbortListener(controller.signal, internalAbortListener);
       }),
     ]);
     const current = activeAuthority(value.authority);
     if (resolved.failed || resolved.aborted
       || resolved.credential === cancelledBeforeResolver
       || !current || current !== authority
-      || current.generation !== generation || value.signal.aborted
+      || current.generation !== generation || aborted(value.signal)
       || positiveRemainingMilliseconds(value.outerDeadlineNs, monotonicNow()) === null
       || typeof resolved.credential !== "string"
       || !CREDENTIAL.test(resolved.credential)) return null;
@@ -198,11 +218,11 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
     leases.set(lease, leaseState);
     authority.leases.add(leaseState);
     leaseState.unsubscribe = authority.terminalState.subscribe(leaseState.abort);
-    value.signal.addEventListener("abort", leaseState.abort, { once: true });
+    addAbortListener(value.signal, leaseState.abort);
     const leaseRemaining = positiveRemainingMilliseconds(
       value.outerDeadlineNs, monotonicNow()
     );
-    if (leaseRemaining === null || value.signal.aborted
+    if (leaseRemaining === null || aborted(value.signal)
       || authority.terminalState.isTerminal()) revokeLeaseState(leaseState);
     else {
       leaseState.timer = setTimeout(leaseState.abort, leaseRemaining);
@@ -215,8 +235,8 @@ async function resolveMemberConversationOpenAICredential(resolver, value = {}) {
     if (timer) clearTimeout(timer);
     unsubscribe();
     unsubscribe = () => {};
-    value.signal.removeEventListener("abort", abort);
-    controller.signal.removeEventListener("abort", internalAbortListener);
+    removeAbortListener(value.signal, abort);
+    removeAbortListener(controller.signal, internalAbortListener);
   }
 }
 
@@ -225,12 +245,20 @@ function validMemberConversationOpenAICredentialLease(lease, authorityToken) {
   const state = lease && leases.get(lease);
   if (!authority || !state || state.revoked || state.authority !== authority
     || state.generation !== authority.generation) return false;
-  if (state.signal.aborted
+  if (aborted(state.signal)
     || positiveRemainingMilliseconds(state.outerDeadlineNs, monotonicNow()) === null) {
     revokeLeaseState(state);
     return false;
   }
   return true;
+}
+
+function memberConversationOpenAICredentialLeaseMatchesOperation(
+  lease, authorityToken, signal, outerDeadlineNs
+) {
+  const state = lease && leases.get(lease);
+  return Boolean(validMemberConversationOpenAICredentialLease(lease, authorityToken)
+    && state.signal === signal && state.outerDeadlineNs === outerDeadlineNs);
 }
 
 function revokeMemberConversationOpenAICredentialLease(value) {
@@ -281,6 +309,8 @@ module.exports = {
   createMemberConversationOpenAICredentialResolver,
   consumeMemberConversationOpenAICredentialLease,
   memberConversationOpenAICredentialAuthorityMatchesAttempt,
+  memberConversationOpenAICredentialAuthorityMatchesTerminalState,
+  memberConversationOpenAICredentialLeaseMatchesOperation,
   resolveMemberConversationOpenAICredential,
   revokeMemberConversationOpenAICredentialAuthority,
   revokeMemberConversationOpenAICredentialLease,

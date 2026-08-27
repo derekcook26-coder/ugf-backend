@@ -1,5 +1,7 @@
 "use strict";
 
+const { types: { isProxy } } = require("node:util");
+
 const {
   monotonicNow,
   positiveRemainingMilliseconds,
@@ -7,6 +9,8 @@ const {
 const {
   consumeMemberConversationOpenAICredentialLease,
   memberConversationOpenAICredentialAuthorityMatchesAttempt,
+  memberConversationOpenAICredentialAuthorityMatchesTerminalState,
+  memberConversationOpenAICredentialLeaseMatchesOperation,
   revokeMemberConversationOpenAICredentialLease,
   subscribeMemberConversationOpenAICredentialAuthority,
   validMemberConversationOpenAICredentialAuthority,
@@ -28,11 +32,18 @@ const REQUEST_KEYS = Object.freeze(["body", "clientRequestId"]);
 const OPERATION_KEYS = Object.freeze([
   "authority", "credentialLease", "outerDeadlineNs", "signal",
 ]);
+const V2_OPERATION_KEYS = Object.freeze([
+  "authority", "credentialLease", "executionBinding", "outerDeadlineNs",
+  "request", "resultAuthority", "signal", "terminalState", "wireRequest",
+]);
 const OUTCOME_KEYS = Object.freeze([
   "body", "complete", "contacted", "decompressedBytes", "headers",
   "kind", "redirected", "statusCode",
 ]);
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
 const clients = new WeakMap();
 const interfaces = new WeakMap();
 const responses = new WeakMap();
@@ -40,6 +51,18 @@ const consumedAuthorities = new WeakSet();
 const credentialConsumers = new WeakSet();
 const credentialConsumer = Object.freeze(Object.create(null));
 credentialConsumers.add(credentialConsumer);
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
+
+function addAbortListener(signal, listener) {
+  ADD_EVENT_LISTENER.call(signal, "abort", listener, { once: true });
+}
+
+function removeAbortListener(signal, listener) {
+  try { REMOVE_EVENT_LISTENER.call(signal, "abort", listener); } catch {}
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -181,7 +204,7 @@ function parsedOutcome(value, state) {
 }
 
 async function executeMemberConversationOpenAIHTTPRequest(
-  client, request = {}, operation = {}
+  client, request = {}, operation = {}, beforeContact = null
 ) {
   const state = client && clients.get(client);
   if (!state || !exactKeys(request, REQUEST_KEYS)
@@ -203,7 +226,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     operation.outerDeadlineNs, monotonicNow()
   );
   if (!serialized || byteLength(serialized) > state.requestBodyMaximumBytes
-    || operation.signal.aborted || shared === null
+    || aborted(operation.signal) || shared === null
     || shared <= state.finalizationReserveMilliseconds) {
     revokeMemberConversationOpenAICredentialLease(operation.credentialLease);
     return publicFailure("not_contacted");
@@ -221,7 +244,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     revokeMemberConversationOpenAICredentialLease(operation.credentialLease);
     return publicFailure("not_contacted");
   }
-  operation.signal.addEventListener("abort", abort, { once: true });
+  addAbortListener(operation.signal, abort);
   let timer = setTimeout(abort, remaining);
   if (typeof timer.unref === "function") timer.unref();
   let contacted = false;
@@ -230,7 +253,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     const credential = consumeMemberConversationOpenAICredentialLease(
       operation.credentialLease, operation.authority, credentialConsumer
     );
-    if (!credential || operation.signal.aborted || controller.signal.aborted
+    if (!credential || aborted(operation.signal) || aborted(controller.signal)
       || !validMemberConversationOpenAICredentialAuthority(operation.authority)
       || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
       return publicFailure("not_contacted");
@@ -259,11 +282,13 @@ async function executeMemberConversationOpenAIHTTPRequest(
     const cancelledBeforeContact = Symbol("openai_http_cancelled_before_contact");
     const pending = Promise.resolve()
       .then(() => {
-        if (operation.signal.aborted || controller.signal.aborted
+        if (aborted(operation.signal) || aborted(controller.signal)
           || !validMemberConversationOpenAICredentialAuthority(operation.authority)
           || positiveRemainingMilliseconds(
             operation.outerDeadlineNs, monotonicNow()
-          ) === null) return cancelledBeforeContact;
+          ) === null || (beforeContact && beforeContact() !== true)) {
+          return cancelledBeforeContact;
+        }
         // This transition and invocation share one synchronous callback boundary.
         contacted = true;
         return interfaces.get(state.http).request(boundary);
@@ -271,12 +296,10 @@ async function executeMemberConversationOpenAIHTTPRequest(
       .then((outcome) => outcome === cancelledBeforeContact
         ? { notContacted: true } : { outcome }, () => ({ failed: true }));
     const cancelled = new Promise((resolve) => {
-      if (controller.signal.aborted) return resolve({ cancelled: true });
+      if (aborted(controller.signal)) return resolve({ cancelled: true });
       const listener = () => resolve({ cancelled: true });
-      controller.signal.addEventListener("abort", listener, { once: true });
-      removeInternalAbort = () => controller.signal.removeEventListener(
-        "abort", listener
-      );
+      addAbortListener(controller.signal, listener);
+      removeInternalAbort = () => removeAbortListener(controller.signal, listener);
     });
     const settled = await Promise.race([pending, cancelled]);
     if (settled.cancelled) {
@@ -286,7 +309,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     if (settled.notContacted) return publicFailure("not_contacted");
     if (settled.failed) return publicFailure("indeterminate");
     const outcome = settled.outcome;
-    if (operation.signal.aborted || controller.signal.aborted
+    if (aborted(operation.signal) || aborted(controller.signal)
       || !validMemberConversationOpenAICredentialAuthority(operation.authority)
       || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
       return publicFailure("indeterminate");
@@ -301,10 +324,104 @@ async function executeMemberConversationOpenAIHTTPRequest(
   } finally {
     clearTimeout(timer);
     timer = null;
-    operation.signal.removeEventListener("abort", abort);
+    removeAbortListener(operation.signal, abort);
     removeInternalAbort();
     unsubscribeAuthority();
   }
+}
+
+function exactDataKeys(value, keys) {
+  if (!exactObject(value) || isProxy(value)
+    || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")
+    || ownKeys.slice().sort().join("\0") !== keys.slice().sort().join("\0")) {
+    return false;
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return keys.every((key) => descriptors[key] && descriptors[key].enumerable
+    && Object.prototype.hasOwnProperty.call(descriptors[key], "value")
+    && !Object.prototype.hasOwnProperty.call(descriptors[key], "get")
+    && !Object.prototype.hasOwnProperty.call(descriptors[key], "set"));
+}
+
+function executeMemberConversationOpenAIHTTPRequestV2(
+  client, request = {}, operation = {}
+) {
+  if (!exactDataKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
+  const snapshot = Object.freeze(Object.fromEntries(V2_OPERATION_KEYS.map(
+    (key) => [key, Object.getOwnPropertyDescriptor(operation, key).value]
+  )));
+  const {
+    memberConversationOpenAIResponsesWireRequestV2HTTPBinding,
+    memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
+  } = require("./member-conversation-openai-responses-adapter-v2");
+  const {
+    markMemberConversationProviderResultAuthorityV2Contacted,
+    memberConversationProviderResultAuthorityV2MatchesOperation,
+    memberConversationProviderResultAuthorityV2MatchesRequest,
+    memberConversationProviderResultAuthorityV2MatchesTerminalState,
+  } = require("./member-conversation-provider-result-v2");
+  const {
+    memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution,
+  } = require("./member-conversation-openai-responses-http-transport-v2");
+  const binding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+    snapshot.wireRequest, snapshot.request, snapshot.signal
+  );
+  if (!binding || !exactDataKeys(request, REQUEST_KEYS)
+    || !memberConversationOpenAIResponsesHTTPTransportV2MatchesExecution(
+      snapshot.executionBinding, client, snapshot
+    )
+    || !memberConversationOpenAICredentialLeaseMatchesOperation(
+      snapshot.credentialLease, snapshot.authority,
+      snapshot.signal, snapshot.outerDeadlineNs
+    )
+    || !memberConversationOpenAICredentialAuthorityMatchesTerminalState(
+      snapshot.authority, snapshot.terminalState
+    )
+    || !memberConversationProviderResultAuthorityV2MatchesRequest(
+    snapshot.resultAuthority, snapshot.request
+  ) || !memberConversationProviderResultAuthorityV2MatchesOperation(
+    snapshot.resultAuthority, snapshot.signal, snapshot.outerDeadlineNs
+  ) || !memberConversationProviderResultAuthorityV2MatchesTerminalState(
+    snapshot.resultAuthority, snapshot.terminalState
+  ) || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
+    snapshot.wireRequest, snapshot.request
+  ) || request.body !== binding.body
+    || request.clientRequestId !== binding.clientRequestId) {
+    return publicFailure("not_contacted");
+  }
+  const credentialOperation = Object.freeze({
+    authority: snapshot.authority,
+    credentialLease: snapshot.credentialLease,
+    outerDeadlineNs: snapshot.outerDeadlineNs,
+    signal: snapshot.signal,
+  });
+  return executeMemberConversationOpenAIHTTPRequest(
+    client,
+    binding,
+    credentialOperation,
+    () => {
+      const currentBinding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+        snapshot.wireRequest, snapshot.request, snapshot.signal
+      );
+      return Boolean(currentBinding
+        && currentBinding.body === binding.body
+        && currentBinding.clientRequestId === binding.clientRequestId
+        && memberConversationProviderResultAuthorityV2MatchesRequest(
+          snapshot.resultAuthority, snapshot.request
+        )
+        && memberConversationProviderResultAuthorityV2MatchesOperation(
+          snapshot.resultAuthority, snapshot.signal, snapshot.outerDeadlineNs
+        )
+        && memberConversationProviderResultAuthorityV2MatchesTerminalState(
+          snapshot.resultAuthority, snapshot.terminalState
+        )
+        && markMemberConversationProviderResultAuthorityV2Contacted(
+          snapshot.resultAuthority
+        ));
+    }
+  );
 }
 
 function readMemberConversationOpenAIHTTPResponse(value) {
@@ -331,6 +448,7 @@ module.exports = {
   createMemberConversationOpenAIBoundedHTTPInterface,
   createMemberConversationOpenAIHTTPClient,
   executeMemberConversationOpenAIHTTPRequest,
+  executeMemberConversationOpenAIHTTPRequestV2,
   memberConversationOpenAIHTTPClientMatchesOrigin,
   readMemberConversationOpenAIHTTPResponse,
   validMemberConversationOpenAIBoundedHTTPInterface,

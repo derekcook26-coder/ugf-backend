@@ -2,7 +2,11 @@
 
 const { createHash } = require("node:crypto");
 const { types: { isProxy } } = require("node:util");
-const { validTerminalState } = require("./bounded-postgres-transaction");
+const {
+  monotonicNow,
+  positiveRemainingMilliseconds,
+  validTerminalState,
+} = require("./bounded-postgres-transaction");
 const {
   memberConversationProviderRequestV2Digest,
   validMemberConversationProviderRequestV2,
@@ -30,6 +34,13 @@ const REJECTION_CATEGORIES = new Set([
 const authorities = new WeakMap();
 const successes = new WeakMap();
 const rejections = new WeakMap();
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -67,9 +78,17 @@ function releaseTerminalSubscription(state) {
   unsubscribe();
 }
 
+function releaseOperationBinding(state) {
+  if (typeof state.releaseOperation !== "function") return;
+  const release = state.releaseOperation;
+  state.releaseOperation = null;
+  release();
+}
+
 function deleteChild(state, token, records) {
   records.delete(token);
   state.children.delete(token);
+  if (!state.children.size) releaseOperationBinding(state);
   releaseTerminalSubscription(state);
 }
 
@@ -79,6 +98,7 @@ function deleteChildren(state) {
     rejections.delete(token);
   }
   state.children.clear();
+  releaseOperationBinding(state);
   releaseTerminalSubscription(state);
 }
 
@@ -126,7 +146,10 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
       consumed: false,
       contacted: false,
       generation: 1,
+      operationDeadlineNs: null,
+      operationSignal: null,
       requestDigestSha256: digest,
+      releaseOperation: null,
       revoked: false,
       terminalState: value.terminalState,
       unsubscribeTerminal: null,
@@ -135,6 +158,70 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
     state.unsubscribeTerminal = value.terminalState.subscribe(() => revokeState(state));
     return token;
   } catch (_) { return null; }
+}
+
+function bindMemberConversationProviderResultAuthorityV2Operation(
+  authority, signal, outerDeadlineNs
+) {
+  const state = activeAuthority(authority);
+  if (!state || state.releaseOperation !== null
+    || !(signal instanceof AbortSignal) || typeof outerDeadlineNs !== "bigint") {
+    return false;
+  }
+  const remaining = positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow());
+  if (aborted(signal) || remaining === null) {
+    revokeState(state);
+    return false;
+  }
+  const revoke = () => revokeState(state);
+  ADD_EVENT_LISTENER.call(signal, "abort", revoke, { once: true });
+  const timer = setTimeout(revoke, remaining);
+  if (typeof timer.unref === "function") timer.unref();
+  state.releaseOperation = () => {
+    clearTimeout(timer);
+    try { REMOVE_EVENT_LISTENER.call(signal, "abort", revoke); } catch {}
+    state.operationDeadlineNs = null;
+    state.operationSignal = null;
+  };
+  state.operationDeadlineNs = outerDeadlineNs;
+  state.operationSignal = signal;
+  if (aborted(signal)
+    || positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow()) === null) {
+    revokeState(state);
+    return false;
+  }
+  return true;
+}
+
+function memberConversationProviderResultAuthorityV2MatchesOperation(
+  authority, signal, outerDeadlineNs
+) {
+  const state = activeAuthority(authority);
+  if (!state || state.operationSignal !== signal
+    || state.operationDeadlineNs !== outerDeadlineNs
+    || aborted(signal)
+    || positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow()) === null) {
+    return false;
+  }
+  return true;
+}
+
+function memberConversationProviderResultAuthorityV2MatchesTerminalState(
+  authority, terminalState
+) {
+  const state = activeAuthority(authority);
+  return Boolean(state && state.terminalState === terminalState);
+}
+
+function activeOperation(state) {
+  if (state.operationSignal === null && state.operationDeadlineNs === null) return true;
+  if (state.operationSignal === null || state.operationDeadlineNs === null
+    || aborted(state.operationSignal)
+    || positiveRemainingMilliseconds(state.operationDeadlineNs, monotonicNow()) === null) {
+    revokeState(state);
+    return false;
+  }
+  return true;
 }
 
 function validMemberConversationProviderResultAuthorityV2(value) {
@@ -195,7 +282,7 @@ function readMemberConversationProviderResultV2(token, authority) {
   const result = token && successes.get(token);
   if (!state || !result || result.consumed || result.authority !== state
     || result.generation !== state.generation || state.revoked
-    || state.terminalState.isTerminal()) return null;
+    || state.terminalState.isTerminal() || !activeOperation(state)) return null;
   const output = Object.freeze({
     attemptId: state.attemptId,
     coaching: result.coaching,
@@ -239,7 +326,7 @@ function readMemberConversationProviderRejectionV2(token, authority) {
   const rejection = token && rejections.get(token);
   if (!state || !rejection || rejection.consumed || rejection.authority !== state
     || rejection.generation !== state.generation || state.revoked
-    || state.terminalState.isTerminal()) return null;
+    || state.terminalState.isTerminal() || !activeOperation(state)) return null;
   const output = Object.freeze({
     attemptId: state.attemptId,
     providerRequestId: rejection.providerRequestId,
@@ -256,11 +343,14 @@ module.exports = {
   MEMBER_CONVERSATION_PROVIDER_REJECTION_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
   MEMBER_CONVERSATION_PROVIDER_RESULT_V2_VERSION,
+  bindMemberConversationProviderResultAuthorityV2Operation,
   createMemberConversationProviderRejectionV2,
   createMemberConversationProviderResultAuthorityV2,
   createMemberConversationProviderResultV2,
   markMemberConversationProviderResultAuthorityV2Contacted,
+  memberConversationProviderResultAuthorityV2MatchesOperation,
   memberConversationProviderResultAuthorityV2MatchesRequest,
+  memberConversationProviderResultAuthorityV2MatchesTerminalState,
   readMemberConversationProviderRejectionV2,
   readMemberConversationProviderResultV2,
   revokeMemberConversationProviderResultAuthorityV2,

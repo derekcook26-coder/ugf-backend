@@ -141,8 +141,19 @@ function validMemberConversationOpenAIResponsesTransportV2(value) {
       === state.requestDigestSha256);
 }
 
+function memberConversationOpenAIResponsesTransportV2MatchesDependencies(
+  value, adapter, request, providerTransport
+) {
+  const state = value && transportState.get(value);
+  return Boolean(state && validMemberConversationOpenAIResponsesTransportV2(value)
+    && state.adapter === adapter && state.request === request
+    && state.transport === providerTransport
+    && exactBinding(adapter, request, providerTransport) === state.requestDigestSha256);
+}
+
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_TRANSPORT_V2_VERSION,
   createMemberConversationOpenAIResponsesTransportV2,
+  memberConversationOpenAIResponsesTransportV2MatchesDependencies,
   validMemberConversationOpenAIResponsesTransportV2,
 };

@@ -42,6 +42,7 @@ const ABORT_SIGNAL_ABORTED = Object.getOwnPropertyDescriptor(
 ).get;
 const brandedAdapters = new WeakSet();
 const adapterState = new WeakMap();
+const wireState = new WeakMap();
 
 function validActiveAbortSignal(value) {
   if (!value || typeof value !== "object" || isProxy(value)) return false;
@@ -212,7 +213,7 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
       || input.transport.promptCacheBreakpointCount !== policy.breakpointCount
       || input.transport.requestDigestSha256
         !== memberConversationProviderRequestV2Digest(request)) return null;
-    return Object.freeze({
+    const wireRequest = Object.freeze({
       body: Object.freeze({
         model: state.model,
         input: Object.freeze([
@@ -239,12 +240,45 @@ function createMemberConversationOpenAIResponsesWireRequestV2(adapter, input = {
       regionPolicy: state.regionPolicy,
       signal: input.signal,
     });
+    wireState.set(wireRequest, Object.freeze({
+      body: wireRequest.body,
+      clientRequestId: wireRequest.clientRequestId,
+      request: input.request,
+      requestDigestSha256: memberConversationProviderRequestV2Digest(input.request),
+      signal: input.signal,
+    }));
+    return wireRequest;
   } catch (_) { return null; }
+}
+
+function memberConversationOpenAIResponsesWireRequestV2MatchesRequest(wireRequest, request) {
+  const state = wireRequest && wireState.get(wireRequest);
+  return Boolean(state && Object.isFrozen(wireRequest)
+    && validMemberConversationProviderRequestV2(request)
+    && state.request === request
+    && state.requestDigestSha256 === memberConversationProviderRequestV2Digest(request)
+    && state.clientRequestId === request.attemptId);
+}
+
+function memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
+  wireRequest, request, signal
+) {
+  const state = wireRequest && wireState.get(wireRequest);
+  if (!state || state.signal !== signal || !validActiveAbortSignal(signal)
+    || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
+      wireRequest, request
+    )) return null;
+  return Object.freeze({
+    body: state.body,
+    clientRequestId: state.clientRequestId,
+  });
 }
 
 module.exports = {
   MEMBER_CONVERSATION_OPENAI_RESPONSES_ADAPTER_V2_VERSION,
   createMemberConversationOpenAIResponsesAdapterV2,
   createMemberConversationOpenAIResponsesWireRequestV2,
+  memberConversationOpenAIResponsesWireRequestV2HTTPBinding,
+  memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
   validMemberConversationOpenAIResponsesAdapterV2,
 };
