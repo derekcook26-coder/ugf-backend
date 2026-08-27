@@ -353,6 +353,7 @@ function executeMemberConversationOpenAIHTTPRequestV2(
   } = require("./member-conversation-openai-responses-adapter-v2");
   const {
     markMemberConversationProviderResultAuthorityV2Contacted,
+    memberConversationProviderResultAuthorityV2MatchesOperation,
     memberConversationProviderResultAuthorityV2MatchesRequest,
   } = require("./member-conversation-provider-result-v2");
   const binding = memberConversationOpenAIResponsesWireRequestV2HTTPBinding(
@@ -361,6 +362,8 @@ function executeMemberConversationOpenAIHTTPRequestV2(
   if (!binding || !exactDataKeys(request, REQUEST_KEYS)
     || !memberConversationProviderResultAuthorityV2MatchesRequest(
     operation.resultAuthority, operation.request
+  ) || !memberConversationProviderResultAuthorityV2MatchesOperation(
+    operation.resultAuthority, operation.signal, operation.outerDeadlineNs
   ) || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
     operation.wireRequest, operation.request
   ) || request.body !== binding.body
@@ -386,6 +389,9 @@ function executeMemberConversationOpenAIHTTPRequestV2(
         && currentBinding.clientRequestId === binding.clientRequestId
         && memberConversationProviderResultAuthorityV2MatchesRequest(
           operation.resultAuthority, operation.request
+        )
+        && memberConversationProviderResultAuthorityV2MatchesOperation(
+          operation.resultAuthority, operation.signal, operation.outerDeadlineNs
         )
         && markMemberConversationProviderResultAuthorityV2Contacted(
           operation.resultAuthority

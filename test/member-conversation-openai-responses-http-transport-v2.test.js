@@ -282,6 +282,39 @@ test("HTTP V2 contact rejects cross-bound wire and result request authority", as
   revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
 });
 
+test("HTTP V2 requires exact result-authority operation binding before contact", async () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response() },
+  });
+  const terminalState = createTerminalState();
+  const signal = new AbortController().signal;
+  const outerDeadlineNs = deadlineAfter(monotonicNow(), 1000);
+  const credentialAuthority = createMemberConversationOpenAICredentialAuthority({
+    version: MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+    attemptId: fixture.created.request.attemptId,
+    terminalState,
+  });
+  const credentialLease = await resolveMemberConversationOpenAICredential(
+    fixture.resolver.resolver,
+    Object.freeze({ authority: credentialAuthority, outerDeadlineNs, signal })
+  );
+  const resultAuthority = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: fixture.created.request,
+    terminalState,
+  });
+  const wireRequest = fixture.input.responsesTransport.createWireRequest({ signal });
+  const result = await executeMemberConversationOpenAIHTTPRequestV2(
+    fixture.httpClient,
+    Object.freeze({ body: wireRequest.body, clientRequestId: wireRequest.clientRequestId }),
+    Object.freeze({ authority: credentialAuthority, credentialLease, outerDeadlineNs,
+      request: fixture.created.request, resultAuthority, signal, wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(fixture.http.calls.length, 0);
+  revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+});
+
 test("HTTP V2 rejects accessor body substitution without observation or contact", async () => {
   const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
     httpOptions: { outcome: response() },
@@ -456,6 +489,23 @@ test("abort after dispatch revokes unconsumed success and rejection capabilities
     );
     assert.ok(["succeeded", "rejected"].includes(result.classification));
     controller.abort();
+    assert.equal(result.classification === "succeeded"
+      ? readMemberConversationProviderResultV2(result.outcome, result.authority)
+      : readMemberConversationProviderRejectionV2(result.outcome, result.authority), null);
+  }
+});
+
+test("result reads synchronously reject an elapsed monotonic deadline", async () => {
+  for (const outcome of [response(), response(429, {})]) {
+    const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+      httpOptions: { outcome },
+    });
+    const outerDeadlineNs = deadlineAfter(monotonicNow(), 100);
+    const result = await fixture.transport.dispatch(
+      fixture.created.request, operation({ outerDeadlineNs })
+    );
+    assert.ok(["succeeded", "rejected"].includes(result.classification));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
     assert.equal(result.classification === "succeeded"
       ? readMemberConversationProviderResultV2(result.outcome, result.authority)
       : readMemberConversationProviderRejectionV2(result.outcome, result.authority), null);

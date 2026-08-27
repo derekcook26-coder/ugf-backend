@@ -146,6 +146,8 @@ function createMemberConversationProviderResultAuthorityV2(value = {}) {
       consumed: false,
       contacted: false,
       generation: 1,
+      operationDeadlineNs: null,
+      operationSignal: null,
       requestDigestSha256: digest,
       releaseOperation: null,
       revoked: false,
@@ -178,9 +180,37 @@ function bindMemberConversationProviderResultAuthorityV2Operation(
   state.releaseOperation = () => {
     clearTimeout(timer);
     try { REMOVE_EVENT_LISTENER.call(signal, "abort", revoke); } catch {}
+    state.operationDeadlineNs = null;
+    state.operationSignal = null;
   };
+  state.operationDeadlineNs = outerDeadlineNs;
+  state.operationSignal = signal;
   if (aborted(signal)
     || positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow()) === null) {
+    revokeState(state);
+    return false;
+  }
+  return true;
+}
+
+function memberConversationProviderResultAuthorityV2MatchesOperation(
+  authority, signal, outerDeadlineNs
+) {
+  const state = activeAuthority(authority);
+  if (!state || state.operationSignal !== signal
+    || state.operationDeadlineNs !== outerDeadlineNs
+    || aborted(signal)
+    || positiveRemainingMilliseconds(outerDeadlineNs, monotonicNow()) === null) {
+    return false;
+  }
+  return true;
+}
+
+function activeOperation(state) {
+  if (state.operationSignal === null && state.operationDeadlineNs === null) return true;
+  if (state.operationSignal === null || state.operationDeadlineNs === null
+    || aborted(state.operationSignal)
+    || positiveRemainingMilliseconds(state.operationDeadlineNs, monotonicNow()) === null) {
     revokeState(state);
     return false;
   }
@@ -245,7 +275,7 @@ function readMemberConversationProviderResultV2(token, authority) {
   const result = token && successes.get(token);
   if (!state || !result || result.consumed || result.authority !== state
     || result.generation !== state.generation || state.revoked
-    || state.terminalState.isTerminal()) return null;
+    || state.terminalState.isTerminal() || !activeOperation(state)) return null;
   const output = Object.freeze({
     attemptId: state.attemptId,
     coaching: result.coaching,
@@ -289,7 +319,7 @@ function readMemberConversationProviderRejectionV2(token, authority) {
   const rejection = token && rejections.get(token);
   if (!state || !rejection || rejection.consumed || rejection.authority !== state
     || rejection.generation !== state.generation || state.revoked
-    || state.terminalState.isTerminal()) return null;
+    || state.terminalState.isTerminal() || !activeOperation(state)) return null;
   const output = Object.freeze({
     attemptId: state.attemptId,
     providerRequestId: rejection.providerRequestId,
@@ -311,6 +341,7 @@ module.exports = {
   createMemberConversationProviderResultAuthorityV2,
   createMemberConversationProviderResultV2,
   markMemberConversationProviderResultAuthorityV2Contacted,
+  memberConversationProviderResultAuthorityV2MatchesOperation,
   memberConversationProviderResultAuthorityV2MatchesRequest,
   readMemberConversationProviderRejectionV2,
   readMemberConversationProviderResultV2,
