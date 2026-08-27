@@ -254,6 +254,62 @@ test("lookalikes, proxies, accessors, and unsafe turn drift are rejected without
   assert.equal(created.fixture.http.calls.length, 0);
 });
 
+test("factory rejects inconsistent adapter, request, region, and HTTP bindings", () => {
+  for (const requestConfig of [
+    { developerPromptSha256: "f".repeat(64) },
+    { developerPromptVersion: "different-prompt-2" },
+    { regionPolicy: "different-region-2" },
+    { responseSchemaSha256: "f".repeat(64) },
+    { responseSchemaVersion: "different_schema_2" },
+  ]) {
+    const created = setup();
+    assert.equal(createMemberConversationOpenAIResponsesOrchestratorTransportV2({
+      ...created.input,
+      requestConfig: { ...created.input.requestConfig, ...requestConfig },
+    }), null);
+    assert.equal(created.fixture.resolver.calls.length, 0);
+    assert.equal(created.fixture.http.calls.length, 0);
+  }
+
+  const origin = setup();
+  assert.equal(createMemberConversationOpenAIResponsesOrchestratorTransportV2({
+    ...origin.input,
+    origin: "https://different.openai.test",
+  }), null);
+  assert.equal(origin.fixture.resolver.calls.length, 0);
+  assert.equal(origin.fixture.http.calls.length, 0);
+});
+
+test("callable scalar leaves are rejected before parser coercion", () => {
+  for (const target of ["request", "response"]) {
+    const created = setup();
+    let calls = 0;
+    const callable = function callableLeaf() { calls += 1; return "coerced"; };
+    callable.toString = () => { calls += 1; return "coerced"; };
+    callable[Symbol.toPrimitive] = () => { calls += 1; return "coerced"; };
+    const turnRequest = target === "request" ? {
+      ...created.input.turnRequest,
+      memberText: callable,
+    } : created.input.turnRequest;
+    const turnResponse = target === "response" ? {
+      ...created.input.turnResponse,
+      result: {
+        ...created.input.turnResponse.result,
+        safety: {
+          ...created.input.turnResponse.result.safety,
+          ruleVersion: callable,
+        },
+      },
+    } : created.input.turnResponse;
+    assert.equal(createMemberConversationOpenAIResponsesOrchestratorTransportV2({
+      ...created.input, turnRequest, turnResponse,
+    }), null);
+    assert.equal(calls, 0);
+    assert.equal(created.fixture.resolver.calls.length, 0);
+    assert.equal(created.fixture.http.calls.length, 0);
+  }
+});
+
 test("production startup and disabled composition do not import the bridge", () => {
   const root = path.resolve(__dirname, "..");
   const bridge = "member-conversation-openai-responses-orchestrator-transport-v2";
