@@ -30,13 +30,16 @@ const OPERATION_KEYS = Object.freeze([
 ]);
 const V2_OPERATION_KEYS = Object.freeze([
   "authority", "credentialLease", "outerDeadlineNs", "request",
-  "resultAuthority", "signal",
+  "resultAuthority", "signal", "wireRequest",
 ]);
 const OUTCOME_KEYS = Object.freeze([
   "body", "complete", "contacted", "decompressedBytes", "headers",
   "kind", "redirected", "statusCode",
 ]);
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
 const clients = new WeakMap();
 const interfaces = new WeakMap();
 const responses = new WeakMap();
@@ -44,6 +47,18 @@ const consumedAuthorities = new WeakSet();
 const credentialConsumers = new WeakSet();
 const credentialConsumer = Object.freeze(Object.create(null));
 credentialConsumers.add(credentialConsumer);
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
+
+function addAbortListener(signal, listener) {
+  ADD_EVENT_LISTENER.call(signal, "abort", listener, { once: true });
+}
+
+function removeAbortListener(signal, listener) {
+  try { REMOVE_EVENT_LISTENER.call(signal, "abort", listener); } catch {}
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -207,7 +222,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     operation.outerDeadlineNs, monotonicNow()
   );
   if (!serialized || byteLength(serialized) > state.requestBodyMaximumBytes
-    || operation.signal.aborted || shared === null
+    || aborted(operation.signal) || shared === null
     || shared <= state.finalizationReserveMilliseconds) {
     revokeMemberConversationOpenAICredentialLease(operation.credentialLease);
     return publicFailure("not_contacted");
@@ -225,7 +240,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     revokeMemberConversationOpenAICredentialLease(operation.credentialLease);
     return publicFailure("not_contacted");
   }
-  operation.signal.addEventListener("abort", abort, { once: true });
+  addAbortListener(operation.signal, abort);
   let timer = setTimeout(abort, remaining);
   if (typeof timer.unref === "function") timer.unref();
   let contacted = false;
@@ -234,7 +249,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     const credential = consumeMemberConversationOpenAICredentialLease(
       operation.credentialLease, operation.authority, credentialConsumer
     );
-    if (!credential || operation.signal.aborted || controller.signal.aborted
+    if (!credential || aborted(operation.signal) || aborted(controller.signal)
       || !validMemberConversationOpenAICredentialAuthority(operation.authority)
       || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
       return publicFailure("not_contacted");
@@ -263,7 +278,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     const cancelledBeforeContact = Symbol("openai_http_cancelled_before_contact");
     const pending = Promise.resolve()
       .then(() => {
-        if (operation.signal.aborted || controller.signal.aborted
+        if (aborted(operation.signal) || aborted(controller.signal)
           || !validMemberConversationOpenAICredentialAuthority(operation.authority)
           || positiveRemainingMilliseconds(
             operation.outerDeadlineNs, monotonicNow()
@@ -277,12 +292,10 @@ async function executeMemberConversationOpenAIHTTPRequest(
       .then((outcome) => outcome === cancelledBeforeContact
         ? { notContacted: true } : { outcome }, () => ({ failed: true }));
     const cancelled = new Promise((resolve) => {
-      if (controller.signal.aborted) return resolve({ cancelled: true });
+      if (aborted(controller.signal)) return resolve({ cancelled: true });
       const listener = () => resolve({ cancelled: true });
-      controller.signal.addEventListener("abort", listener, { once: true });
-      removeInternalAbort = () => controller.signal.removeEventListener(
-        "abort", listener
-      );
+      addAbortListener(controller.signal, listener);
+      removeInternalAbort = () => removeAbortListener(controller.signal, listener);
     });
     const settled = await Promise.race([pending, cancelled]);
     if (settled.cancelled) {
@@ -292,7 +305,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
     if (settled.notContacted) return publicFailure("not_contacted");
     if (settled.failed) return publicFailure("indeterminate");
     const outcome = settled.outcome;
-    if (operation.signal.aborted || controller.signal.aborted
+    if (aborted(operation.signal) || aborted(controller.signal)
       || !validMemberConversationOpenAICredentialAuthority(operation.authority)
       || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
       return publicFailure("indeterminate");
@@ -307,7 +320,7 @@ async function executeMemberConversationOpenAIHTTPRequest(
   } finally {
     clearTimeout(timer);
     timer = null;
-    operation.signal.removeEventListener("abort", abort);
+    removeAbortListener(operation.signal, abort);
     removeInternalAbort();
     unsubscribeAuthority();
   }
@@ -318,12 +331,20 @@ function executeMemberConversationOpenAIHTTPRequestV2(
 ) {
   if (!exactKeys(operation, V2_OPERATION_KEYS)) return publicFailure("not_contacted");
   const {
+    memberConversationOpenAIResponsesWireRequestV2MatchesRequest,
+  } = require("./member-conversation-openai-responses-adapter-v2");
+  const {
     markMemberConversationProviderResultAuthorityV2Contacted,
     memberConversationProviderResultAuthorityV2MatchesRequest,
   } = require("./member-conversation-provider-result-v2");
   if (!memberConversationProviderResultAuthorityV2MatchesRequest(
     operation.resultAuthority, operation.request
-  )) return publicFailure("not_contacted");
+  ) || !memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
+    operation.wireRequest, operation.request
+  ) || request.body !== operation.wireRequest.body
+    || request.clientRequestId !== operation.wireRequest.clientRequestId) {
+    return publicFailure("not_contacted");
+  }
   const credentialOperation = Object.freeze({
     authority: operation.authority,
     credentialLease: operation.credentialLease,
@@ -336,7 +357,11 @@ function executeMemberConversationOpenAIHTTPRequestV2(
     credentialOperation,
     () => memberConversationProviderResultAuthorityV2MatchesRequest(
       operation.resultAuthority, operation.request
-    ) && markMemberConversationProviderResultAuthorityV2Contacted(
+    ) && memberConversationOpenAIResponsesWireRequestV2MatchesRequest(
+      operation.wireRequest, operation.request
+    ) && request.body === operation.wireRequest.body
+      && request.clientRequestId === operation.wireRequest.clientRequestId
+      && markMemberConversationProviderResultAuthorityV2Contacted(
       operation.resultAuthority
     )
   );

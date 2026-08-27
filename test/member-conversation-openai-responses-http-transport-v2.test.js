@@ -8,6 +8,20 @@ const {
   monotonicNow,
 } = require("../src/goals-coach/bounded-postgres-transaction");
 const {
+  MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+  createMemberConversationOpenAICredentialAuthority,
+  resolveMemberConversationOpenAICredential,
+  revokeMemberConversationOpenAICredentialAuthority,
+} = require("../src/goals-coach/member-conversation-openai-credential-resolver");
+const {
+  executeMemberConversationOpenAIHTTPRequestV2,
+} = require("../src/goals-coach/member-conversation-openai-http-client");
+const {
+  MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+  createMemberConversationProviderResultAuthorityV2,
+  validMemberConversationProviderResultAuthorityV2,
+} = require("../src/goals-coach/member-conversation-provider-result-v2");
+const {
   readMemberConversationProviderRejectionV2,
   readMemberConversationProviderResultV2,
 } = require("../src/goals-coach/member-conversation-provider-result-v2");
@@ -24,6 +38,15 @@ const { createDeterministicMemberConversationOpenAIResponsesTransportV2 } = requ
 );
 const { createDeterministicMemberConversationOpenAIResponsesAdapterV2 } = require(
   "./helpers/deterministic-member-conversation-openai-responses-adapter-v2"
+);
+const { createDeterministicMemberConversationProviderRequestV2 } = require(
+  "./helpers/deterministic-member-conversation-provider-request-v2"
+);
+const { createMemberConversationProviderTransportV2 } = require(
+  "../src/goals-coach/member-conversation-provider-transport-v2"
+);
+const { MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION } = require(
+  "../src/goals-coach/member-conversation-provider-request-envelope-v2"
 );
 
 function operation(overrides = {}) {
@@ -175,6 +198,110 @@ test("factory rejects origin, region, cache, digest, and branded dependency drif
   }), null);
 });
 
+test("factory rejects genuine same-public-metadata dependency identity swaps", () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2();
+  const secondAdapter = createDeterministicMemberConversationOpenAIResponsesAdapterV2();
+  assert.ok(secondAdapter.adapter);
+  assert.notEqual(secondAdapter.adapter, fixture.adapterFixture.adapter);
+  assert.equal(createMemberConversationOpenAIResponsesHTTPTransportV2({
+    ...fixture.input, adapter: secondAdapter.adapter,
+  }), null);
+  const secondProviderTransport = createMemberConversationProviderTransportV2({
+    version: MEMBER_CONVERSATION_PROVIDER_TRANSPORT_V2_VERSION,
+    provider: "openai",
+    model: fixture.created.request.model,
+    responseSchemaVersion: fixture.created.request.responseSchemaVersion,
+    request: fixture.created.request,
+    async dispatch() { return null; },
+  });
+  assert.ok(secondProviderTransport);
+  assert.notEqual(secondProviderTransport, fixture.providerTransport.transport);
+  assert.equal(createMemberConversationOpenAIResponsesHTTPTransportV2({
+    ...fixture.input, providerTransport: secondProviderTransport,
+  }), null);
+});
+
+test("request UUID versions one through five remain valid through exact HTTP dispatch", async () => {
+  for (const version of [1, 2, 3, 4, 5]) {
+    const adapterFixture = createDeterministicMemberConversationOpenAIResponsesAdapterV2();
+    const created = createDeterministicMemberConversationProviderRequestV2({
+      attemptId: `00000000-0000-${version}000-8000-000000000001`,
+      developerPromptSha256: adapterFixture.options.developerPromptSha256,
+      responseSchemaSha256: adapterFixture.options.responseSchemaSha256,
+    });
+    const responses = createDeterministicMemberConversationOpenAIResponsesTransportV2({
+      adapterFixture, created,
+    });
+    const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+      responses, httpOptions: { outcome: response() },
+    });
+    const result = await fixture.transport.dispatch(created.request, operation());
+    assert.equal(result.classification, "succeeded");
+    assert.equal(fixture.resolver.calls.length, 1);
+    assert.equal(fixture.http.calls.length, 1);
+  }
+});
+
+test("HTTP V2 contact rejects cross-bound wire and result request authority", async () => {
+  const left = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { outcome: response() },
+  });
+  const rightAdapter = createDeterministicMemberConversationOpenAIResponsesAdapterV2();
+  const rightCreated = createDeterministicMemberConversationProviderRequestV2({
+    attemptId: "00000000-0000-4000-8000-000000000099",
+    developerPromptSha256: rightAdapter.options.developerPromptSha256,
+    responseSchemaSha256: rightAdapter.options.responseSchemaSha256,
+  });
+  const terminalState = createTerminalState();
+  const signal = new AbortController().signal;
+  const outerDeadlineNs = deadlineAfter(monotonicNow(), 1000);
+  const credentialAuthority = createMemberConversationOpenAICredentialAuthority({
+    version: MEMBER_CONVERSATION_OPENAI_CREDENTIAL_AUTHORITY_VERSION,
+    attemptId: left.created.request.attemptId,
+    terminalState,
+  });
+  const credentialLease = await resolveMemberConversationOpenAICredential(
+    left.resolver.resolver,
+    Object.freeze({ authority: credentialAuthority, outerDeadlineNs, signal })
+  );
+  const resultAuthority = createMemberConversationProviderResultAuthorityV2({
+    version: MEMBER_CONVERSATION_PROVIDER_RESULT_AUTHORITY_V2_VERSION,
+    request: rightCreated.request,
+    terminalState,
+  });
+  const wireRequest = left.input.responsesTransport.createWireRequest({ signal });
+  const result = await executeMemberConversationOpenAIHTTPRequestV2(
+    left.httpClient,
+    Object.freeze({ body: wireRequest.body, clientRequestId: wireRequest.clientRequestId }),
+    Object.freeze({ authority: credentialAuthority, credentialLease, outerDeadlineNs,
+      request: rightCreated.request, resultAuthority, signal, wireRequest })
+  );
+  assert.equal(result.classification, "not_contacted");
+  assert.equal(left.http.calls.length, 0);
+  assert.equal(validMemberConversationProviderResultAuthorityV2(resultAuthority), true);
+  revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+});
+
+test("overridden prototype and own AbortSignal operations fail before dependencies", async () => {
+  for (const mutate of [
+    (signal) => Object.setPrototypeOf(signal, Object.create(AbortSignal.prototype)),
+    (signal) => Object.defineProperty(signal, "addEventListener", {
+      configurable: true, value() {}, writable: true,
+    }),
+    (signal) => Object.defineProperty(signal, "aborted", {
+      configurable: true, value: false, writable: true,
+    }),
+  ]) {
+    const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2();
+    const signal = new AbortController().signal;
+    mutate(signal);
+    const result = await fixture.transport.dispatch(fixture.created.request, operation({ signal }));
+    assert.equal(result.classification, "not_contacted");
+    assert.equal(fixture.resolver.calls.length, 0);
+    assert.equal(fixture.http.calls.length, 0);
+  }
+});
+
 test("queued pre-contact abort and terminal transition make zero resolver and HTTP calls", async () => {
   for (const terminate of [false, true]) {
     const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
@@ -230,6 +357,33 @@ test("post-contact abort promptly suppresses a late provider settlement", async 
   controller.abort();
   const result = await pending;
   assert.equal(result.classification, "indeterminate");
+  fixture.http.release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.http.calls.length, 1);
+});
+
+test("post-entry AbortSignal mutation cannot bypass cancellation or cleanup", async () => {
+  const fixture = createDeterministicMemberConversationOpenAIResponsesHTTPTransportV2({
+    httpOptions: { pending: true, outcome: response() },
+  });
+  const controller = new AbortController();
+  const pending = fixture.transport.dispatch(fixture.created.request, operation({
+    signal: controller.signal,
+  }));
+  while (!fixture.http.calls.length) await new Promise((resolve) => setImmediate(resolve));
+  Object.defineProperties(controller.signal, {
+    aborted: { configurable: true, value: false },
+    addEventListener: {
+      configurable: true,
+      value() { throw new Error("overridden addEventListener observed"); },
+    },
+    removeEventListener: {
+      configurable: true,
+      value() { throw new Error("overridden removeEventListener observed"); },
+    },
+  });
+  controller.abort();
+  assert.equal((await pending).classification, "indeterminate");
   fixture.http.release();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fixture.http.calls.length, 1);

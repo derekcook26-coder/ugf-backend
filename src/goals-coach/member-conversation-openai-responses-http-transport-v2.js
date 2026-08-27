@@ -19,7 +19,10 @@ const {
   createMemberConversationOpenAIResponsesWireRequestV2,
   validMemberConversationOpenAIResponsesAdapterV2,
 } = require("./member-conversation-openai-responses-adapter-v2");
-const { validMemberConversationOpenAIResponsesTransportV2 } = require("./member-conversation-openai-responses-transport-v2");
+const {
+  memberConversationOpenAIResponsesTransportV2MatchesDependencies,
+  validMemberConversationOpenAIResponsesTransportV2,
+} = require("./member-conversation-openai-responses-transport-v2");
 const {
   memberConversationProviderRequestV2Digest,
   validMemberConversationProviderRequestV2,
@@ -52,8 +55,22 @@ const PROVIDER_IDENTIFIER = /^[\x21-\x7e]{1,255}$/;
 const REGION_POLICY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFINITE_REQUEST_REJECTION = new Set([400, 404, 405, 413, 415, 422]);
 const ABORTED = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted").get;
+const ADD_EVENT_LISTENER = EventTarget.prototype.addEventListener;
+const REMOVE_EVENT_LISTENER = EventTarget.prototype.removeEventListener;
 const states = new WeakMap();
 const brands = new WeakSet();
+
+function aborted(signal) {
+  try { return ABORTED.call(signal); } catch { return true; }
+}
+
+function addAbortListener(signal, listener) {
+  ADD_EVENT_LISTENER.call(signal, "abort", listener, { once: true });
+}
+
+function removeAbortListener(signal, listener) {
+  try { REMOVE_EVENT_LISTENER.call(signal, "abort", listener); } catch {}
+}
 
 function exactObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
@@ -74,7 +91,13 @@ function exactKeys(value, keys) {
 
 function activeSignal(value) {
   if (!value || typeof value !== "object" || isProxy(value)) return false;
-  try { return ABORTED.call(value) === false; } catch (_) { return false; }
+  try {
+    return Object.getPrototypeOf(value) === AbortSignal.prototype
+      && !Object.prototype.hasOwnProperty.call(value, "aborted")
+      && !Object.prototype.hasOwnProperty.call(value, "addEventListener")
+      && !Object.prototype.hasOwnProperty.call(value, "removeEventListener")
+      && ABORTED.call(value) === false;
+  } catch (_) { return false; }
 }
 
 function binding(value) {
@@ -87,6 +110,9 @@ function binding(value) {
     || typeof value.origin !== "string"
     || !memberConversationOpenAIHTTPClientMatchesOrigin(value.httpClient, value.origin)
     || typeof value.regionPolicy !== "string" || !REGION_POLICY.test(value.regionPolicy)) return null;
+  if (!memberConversationOpenAIResponsesTransportV2MatchesDependencies(
+    value.responsesTransport, value.adapter, value.request, value.providerTransport
+  )) return null;
   const request = value.request;
   const digest = memberConversationProviderRequestV2Digest(request);
   const policy = request.controls.promptCachePolicy;
@@ -139,7 +165,7 @@ function failure(classification) {
 }
 
 function activeResult(operation, authority, request) {
-  return Boolean(!operation.signal.aborted && !operation.terminalState.isTerminal()
+  return Boolean(!aborted(operation.signal) && !operation.terminalState.isTerminal()
     && positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) !== null
     && memberConversationProviderResultAuthorityV2MatchesRequest(authority, request));
 }
@@ -178,9 +204,13 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
             attemptId: request.attemptId,
             terminalState: operation.terminalState,
           });
-          if (!resultAuthority || !credentialAuthority) return failure("not_contacted");
+          if (!resultAuthority || !credentialAuthority) {
+            if (resultAuthority) revokeMemberConversationProviderResultAuthorityV2(resultAuthority);
+            if (credentialAuthority) revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
+            return failure("not_contacted");
+          }
           const terminate = () => operation.terminalState.terminate("operation_aborted", { responseAllowed: false });
-          operation.signal.addEventListener("abort", terminate, { once: true });
+          addAbortListener(operation.signal, terminate);
           let retainResultAuthority = false;
           try {
             const wire = current.responsesTransport.createWireRequest({ signal: operation.signal });
@@ -202,7 +232,7 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
               Object.freeze({ body: wire.body, clientRequestId: wire.clientRequestId }),
               Object.freeze({ authority: credentialAuthority, credentialLease: lease,
                 outerDeadlineNs: operation.outerDeadlineNs, request,
-                resultAuthority, signal: operation.signal })
+                resultAuthority, signal: operation.signal, wireRequest: wire })
             );
             if (result && result.classification === "not_contacted") return failure("not_contacted");
             if (!result || result.classification !== "complete" || !result.response
@@ -218,7 +248,7 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
                 providerRequestId: parsed.providerRequestId,
                 terminalCategory: parsed.category,
               });
-              if (!outcome || operation.signal.aborted || operation.terminalState.isTerminal()
+              if (!outcome || aborted(operation.signal) || operation.terminalState.isTerminal()
                 || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
                 return failure("indeterminate");
               }
@@ -232,16 +262,16 @@ function createMemberConversationOpenAIResponsesHTTPTransportV2(value = {}) {
               providerRequestId: parsed.providerRequestId,
               providerResponseId: parsed.providerResponseId,
             });
-            if (!outcome || operation.signal.aborted || operation.terminalState.isTerminal()
+            if (!outcome || aborted(operation.signal) || operation.terminalState.isTerminal()
               || positiveRemainingMilliseconds(operation.outerDeadlineNs, monotonicNow()) === null) {
               return failure("indeterminate");
             }
             retainResultAuthority = true;
             return Object.freeze({ authority: resultAuthority, classification: "succeeded", outcome });
           } finally {
-            operation.signal.removeEventListener("abort", terminate);
+            removeAbortListener(operation.signal, terminate);
             revokeMemberConversationOpenAICredentialAuthority(credentialAuthority);
-            if (!retainResultAuthority || operation.signal.aborted || operation.terminalState.isTerminal()) {
+            if (!retainResultAuthority || aborted(operation.signal) || operation.terminalState.isTerminal()) {
               revokeMemberConversationProviderResultAuthorityV2(resultAuthority);
             }
           }
