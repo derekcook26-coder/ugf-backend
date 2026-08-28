@@ -50,15 +50,23 @@ getters or invoking caller-controlled coercion.
 The dependency set is exactly:
 
 - `GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-RESOLVER-1`;
-- `GC-MEMBER-CONVERSATION-OPENAI-BOUNDED-HTTP-CLIENT-1`;
+- `GC-MEMBER-CONVERSATION-OPENAI-HTTP-CLIENT-1`, whose private construction
+  already binds the separately versioned
+  `GC-MEMBER-CONVERSATION-OPENAI-BOUNDED-HTTP-INTERFACE-1`;
 - `GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-ADAPTER-2`;
 - `GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-TRANSPORT-2`;
 - `GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-HTTP-TRANSPORT-2`;
 - `GC-MEMBER-CONVERSATION-OPENAI-RESPONSES-ORCHESTRATOR-TRANSPORT-2`;
 - `GC-MEMBER-CONVERSATION-PROVIDER-REQUEST-2`;
-- `GC-MEMBER-CONVERSATION-PROVIDER-TRANSPORT-2`; and
-- the exact reviewed V2 provider-result and rejection capabilities used by the
-  merged orchestrator bridge.
+- `GC-MEMBER-CONVERSATION-PROVIDER-TRANSPORT-2`.
+
+Provider result and rejection capabilities are deliberately not construction
+dependencies. They are attempt-scoped runtime tokens created only after the
+HTTP boundary has been crossed and a complete provider outcome has been
+parsed. COMPOSITION-BINDING-2 pins their exact reviewed contract version
+identities; the existing post-contact authority boundary separately creates
+and validates each private token. Construction must neither fabricate nor
+consume a result authority, result token, or rejection token.
 
 Construction performs no I/O. It must not resolve a credential, read an
 environment variable or secret manager, inspect a provider account, query a
@@ -174,36 +182,41 @@ Its canonical payload contains exactly, in order:
 1. `version`;
 2. `configurationSha256`;
 3. `compositionVersion`;
-4. `boundedHttpClientVersion`;
-5. `responsesHttpTransportVersion`;
-6. `orchestratorTransportVersion`;
-7. `providerRequestVersion`;
-8. `providerTransportVersion`;
-9. `providerResultVersion`;
-10. `providerRejectionVersion`;
-11. `modelSnapshotEvidenceSha256`;
-12. `zeroDataRetentionEvidenceSha256`;
-13. `zeroDataRetentionEvidenceObservedAt`; and
-14. `codeTreeSha`.
+4. `boundedHttpInterfaceVersion`;
+5. `httpClientVersion`;
+6. `responsesHttpTransportVersion`;
+7. `orchestratorTransportVersion`;
+8. `providerRequestVersion`;
+9. `providerTransportVersion`;
+10. `providerResultVersion`;
+11. `providerRejectionVersion`;
+12. `modelSnapshotEvidenceSha256`;
+13. `zeroDataRetentionEvidenceSha256`;
+14. `zeroDataRetentionEvidenceObservedAt`; and
+15. `codeTreeSha`.
 
 An outer envelope contains exactly `version`, `payload`, and
 `compositionBindingSha256`; the digest is SHA-256 over UTF-8 canonical JSON of
 the payload only. The record is accepted only when `configurationSha256`
 matches the approved CONFIG-2 envelope, `compositionVersion` matches the
 CONFIG-2 field, `codeTreeSha` matches CONFIG-2, every component identity
-matches the privately branded dependency, and the digest is on a compiled
-exact allowlist. This record cannot add, remove, rename, reorder, or reinterpret
-any CONFIG-2 field and cannot substitute for configuration approval.
+matches the privately branded dependency, each result/rejection version matches
+the exact exported contract identity without constructing a runtime token, and
+the digest is on a compiled exact allowlist. This record cannot add, remove,
+rename, reorder, or reinterpret any CONFIG-2 field and cannot substitute for
+configuration approval.
 
 Successful parsing creates a module-private, frozen composition-binding
 capability. The enabled-path factory must atomically validate that capability
 with the CONFIG-2 capability and all dependencies in the same synchronous
 pre-consumption boundary. It rechecks exact CONFIG-2 digest, code tree,
-composition identity, every dependency private brand and version, evidence
-freshness, and the exact allowlisted composition-binding digest. No partial
-validation result is cached. A missing, stale, forged, cross-configuration,
-cross-tree, or dependency-drifted capability returns the exact disabled result
-before credential resolution, HTTP contact, or durable-attempt consumption.
+composition identity, every construction dependency private brand and version,
+the non-callable result/rejection contract identities, evidence freshness, and
+the exact allowlisted composition-binding digest. No partial validation result
+is cached. A missing, stale, forged, cross-configuration, cross-tree,
+contract-drifted, or dependency-drifted capability returns the exact disabled
+result before credential resolution, HTTP contact, or durable-attempt
+consumption.
 
 ## Cache and model binding
 
@@ -229,10 +242,12 @@ themselves prove zero-data-retention eligibility or absence of provider-side
 processing.
 
 The model, prompt-cache tuple, region policy, origin, request digest, schema
-digest, adapter, every transport, provider-result capability, and durable
-attempt must remain exactly bound throughout construction and dispatch. Drift
-at any layer fails before credential resolution or contact; after possible
-contact, uncertainty remains indeterminate and cannot authorize redispatch.
+digest, adapter, every transport, provider-result/rejection contract identity,
+and durable attempt must remain exactly bound throughout construction and
+dispatch. Each runtime result or rejection token is validated only at its
+existing post-contact authority boundary. Drift at any layer fails before
+credential resolution or contact when provable; after possible contact,
+uncertainty remains indeterminate and cannot authorize redispatch.
 
 ## Configuration capability and digest
 
@@ -316,6 +331,10 @@ prove:
 - V1 configuration, receipts, requests, transports, results, and activation
   evidence cannot enter V2, and V2 cannot enter V1;
 - CONFIG-2 canonical bytes and digest match fixed cross-environment vectors;
+- COMPOSITION-BINDING-2 canonical payload bytes and
+  `compositionBindingSha256` match separate fixed cross-environment vectors,
+  proving exact key order, UTF-8 serialization, payload-only hash domain, and
+  exclusion of the outer digest field;
 - changing any exact field changes the digest and invalidates the capability;
 - missing, stale, expired, forged, proxy, accessor-backed, cross-configuration,
   cross-tree, and cross-dependency composition-binding capabilities return the
