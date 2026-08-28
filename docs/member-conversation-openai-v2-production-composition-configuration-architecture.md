@@ -198,7 +198,8 @@ Its canonical payload contains exactly, in order:
 An outer envelope contains exactly `version`, `payload`, and
 `compositionBindingSha256`; the digest is SHA-256 over UTF-8 canonical JSON of
 the payload only. The record is accepted only when `configurationSha256`
-matches the approved CONFIG-2 envelope, `compositionVersion` matches the
+matches the payload digest carried by the successfully parsed approved
+CONFIG-2 envelope, `compositionVersion` matches the
 CONFIG-2 field, `codeTreeSha` matches CONFIG-2, every component identity
 matches the privately branded dependency, each result/rejection version matches
 the exact exported contract identity without constructing a runtime token, and
@@ -270,13 +271,26 @@ private, frozen configuration capability. Callers cannot enumerate, clone,
 serialize, or structurally recreate that capability.
 
 CONFIG-2 approval is insufficient by itself. The composition must also require
-an exact current V2 credential-provision envelope and authoritative current
-receipt record bound to the same `configurationSha256`. V1 receipt identities
-are always rejected. The V2 receipt chain requires distinct version names,
+an exact current
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-2` envelope containing
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-PAYLOAD-2`, plus the
+authoritative
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-CURRENT-2` record, all
+bound to the exact `configurationSha256` carried by a successfully parsed
+CONFIG-2 approval envelope. That digest is SHA-256 over the canonical CONFIG-2
+payload bytes only; the outer approval envelope is excluded. V1 receipt
+identities are always rejected. The V2 receipt chain requires these distinct
+version names,
 strict previous-digest and monotonically increasing sequence binding, atomic
 advance-or-no-change currentness, and rejection of stale, forked, superseded,
 or skipped records. Credential material and credential hashes are never part
 of either record.
+The V2 chain starts at sequence 1 with no V1 predecessor; it never mutates or
+reinterprets V1 currentness. The production configuration runbook defines the
+exact V2 payload, envelope, current-record fields, canonicalization, and fixed
+cross-environment vector requirements.
+Mixed CONFIG-2 payload-digest/outer-envelope substitutions fail closed before
+credential resolution, contact, or durable authority consumption.
 
 ## Fail-closed composition rules
 

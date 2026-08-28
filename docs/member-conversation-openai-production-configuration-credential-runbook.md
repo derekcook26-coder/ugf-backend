@@ -168,6 +168,58 @@ mismatched, or non-current evidence fails closed. Creating this currentness
 record is a future separately authorized evidence operation, never an
 environment or secret write.
 
+#### CONFIG-2 credential provision records
+
+CONFIG-2 uses a distinct immutable receipt chain. It never reinterprets or
+accepts any V1 payload, envelope, or current record.
+
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-PAYLOAD-2` has exactly the
+same twelve keys, insertion order, value domains, and canonical JSON rules as
+the V1 payload above, except:
+
+- `version` is exactly
+  `GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-PAYLOAD-2`; and
+- `configurationSha256` is the exact lowercase 64-hex
+  `configurationSha256` carried by a successfully parsed approved
+  `GC-MEMBER-CONVERSATION-OPENAI-PRODUCTION-CONFIG-2` envelope. That value is
+  `SHA-256(UTF-8(canonical CONFIG-2 payload JSON))`; the outer CONFIG-2
+  envelope and its digest field are excluded from this hash domain.
+
+Its outer envelope contains exactly `version`, `payload`, and
+`receiptSha256`, in that order. `version` is exactly
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-2`, and
+`receiptSha256` is `SHA-256(UTF-8(JSON.stringify(payload)))`. The digest field
+is excluded from the hash domain. No V1 version string or CONFIG-1 digest is
+valid in this envelope.
+
+V2 currentness requires an authoritative non-secret
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-CURRENT-2` record with
+exact keys, in order: `version`, `environmentName`, `configurationSha256`,
+`lifecycleSequence`, `currentReceiptSha256`,
+`previousCurrentReceiptSha256`, and `updatedAt`. Its `version` is exactly
+`GC-MEMBER-CONVERSATION-OPENAI-CREDENTIAL-PROVISION-CURRENT-2`; its
+`configurationSha256` equals the same validated CONFIG-2 payload digest as the
+V2 receipt.
+All other field domains, sequence rules, atomic advance-or-no-change rule,
+and current-only acceptance rule are identical to V1 but operate only within
+the V2 chain.
+
+V1 and V2 chains have disjoint identities and hash domains. A parser or
+consumer must reject every mixed-version payload/envelope/current-record
+combination, CONFIG-1/CONFIG-2 digest substitution, CONFIG-2 payload-digest or
+outer-envelope substitution, cross-chain predecessor,
+sequence reuse, fork, skipped sequence, stale receipt, or superseded receipt.
+Migration from a V1 chain to V2 starts a new V2 chain at
+`lifecycleSequence:1` with `previousReceiptSha256:null`; it does not supersede,
+link to, mutate, or make current any V1 receipt. Selecting or advancing a V2
+current record remains a separately authorized privacy-safe evidence action.
+
+Before implementation or operational use, fixed cross-environment test
+vectors must publish the exact UTF-8 canonical V2 payload bytes, payload byte
+length, `receiptSha256`, exact envelope bytes, and exact current-record bytes.
+Vectors use synthetic labels and digests only and contain no credential,
+secret metadata, or provider/account identifier.
+
 It must not contain the credential, a credential prefix or suffix, credential
 length, provider account/project/organization identifiers, authorization
 header, secret-manager resource path, environment value, ciphertext, secret
@@ -250,9 +302,11 @@ permissions. The safe procedure is:
    field. The agent must not type, paste, receive, display, or inspect it.
 5. Confirm only the secret manager's bounded success state. Do not reveal the
    stored value and do not test it against the provider.
-6. Bind the canonical privacy-safe payload to the exact approved configuration
-   digest and immediately preceding current receipt, compute its digest over
-   the payload only, and place both in the exact receipt envelope. Under a
+6. Select the receipt contract matching the approved configuration version:
+   V1 only for CONFIG-1 or V2 only for CONFIG-2. Bind the canonical privacy-safe
+   payload to that exact approved configuration digest and the immediately
+   preceding current receipt in the same versioned chain, compute its digest
+   over the payload only, and place both in the matching exact envelope. Under a
    separate evidence-record authorization, advance the privacy-safe current
    receipt record atomically or leave the old record current. Do not hash the
    credential: a credential digest would remain sensitive comparison material.
@@ -325,6 +379,9 @@ deterministic offline tests must prove:
   any payload/digest mismatch;
 - exact receipt field order, NFC/Unicode, timestamp, safe-integer, enum, null,
   JSON escaping, and UTF-8 hash vectors across supported environments;
+- fixed V2 payload, envelope, and current-record byte/digest vectors and exact
+  rejection of every V1/V2 payload, envelope, current-record, configuration,
+  predecessor, and sequence crossover;
 - rejection of configuration-hash mismatch and every stale, forked,
   superseded, skipped-sequence, or non-current receipt/current-record pair;
 - rejection of placeholders, moving aliases, wildcard origins, expired
