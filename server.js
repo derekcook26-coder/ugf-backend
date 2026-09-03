@@ -45,6 +45,8 @@ var { createGymMasterMemberCoachingConsentStartup } = require("./src/goals-coach
 var { composeGymMasterMemberCoachingConsentRoutes } = require("./src/goals-coach/gymmaster-member-coaching-consent-route-composition");
 var { createGymMasterMemberTodayStartup } = require("./src/goals-coach/gymmaster-member-today-startup");
 var { composeGymMasterMemberTodayRoute } = require("./src/goals-coach/gymmaster-member-today-route-composition");
+var { createGymMasterPublicWidgetsStartup } = require("./src/goals-coach/gymmaster-public-widgets-startup");
+var { composeGymMasterPublicWidgetsRoutes } = require("./src/goals-coach/gymmaster-public-widgets-route-composition");
   var { createGymMasterMemberBootstrapStartup } = require("./src/goals-coach/gymmaster-member-bootstrap-startup");
   var { composeGymMasterMemberBootstrapRoute } = require("./src/goals-coach/gymmaster-member-bootstrap-route-composition");
   var { createGymMasterMemberConversationTurnStartup } = require("./src/goals-coach/gymmaster-member-conversation-turn-startup");
@@ -126,6 +128,12 @@ var db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// Public website widgets are separately gated, read-only, exact-origin, and
+// use the Member Portal integration credential only. They never inherit member
+// sessions, Gatekeeper credentials, plan data, or transactional signup actions.
+var publicWidgetsStartup = createGymMasterPublicWidgetsStartup({ fetchImpl: fetch });
+composeGymMasterPublicWidgetsRoutes(app, publicWidgetsStartup);
 
 // The member private shell is separately gated and performs no work at startup.
 // It revalidates the signed session, local mapping, and Gatekeeper membership
