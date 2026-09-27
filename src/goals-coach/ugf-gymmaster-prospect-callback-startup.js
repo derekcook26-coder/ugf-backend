@@ -6,6 +6,7 @@ const {
   PROSPECT_CALLBACK_FLAG,
   createGymMasterProspectClient,
   createProspectCallbackHandler,
+  createStaffSupportClient,
   enabled,
 } = require("./ugf-gymmaster-prospect-callback");
 
@@ -16,6 +17,8 @@ function createProspectCallbackStartup(options = {}) {
   const origin = exactHttpsOrigin(environment.UGF_GYMMASTER_PROSPECT_CALLBACK_ORIGIN);
   const baseUrl = exactMemberPortalBaseUrl(environment.GYMMASTER_MEMBER_PORTAL_API_BASE_URL);
   const apiKey = environment.GYMMASTER_MEMBER_PORTAL_API_KEY;
+  const supportEndpoint = environment.UGF_HELP_SUPPORT_ENDPOINT;
+  const supportSecret = environment.UGF_HELP_SUPPORT_SECRET;
   const companyIds = Object.freeze({
     black_hawk: Number(environment.UGF_GYMMASTER_PROSPECT_BLACK_HAWK_COMPANY_ID),
     rapid_valley: Number(environment.UGF_GYMMASTER_PROSPECT_RAPID_VALLEY_COMPANY_ID),
@@ -24,15 +27,18 @@ function createProspectCallbackStartup(options = {}) {
     || apiKey.length < 8 || !Number.isInteger(companyIds.black_hawk) || companyIds.black_hawk < 1
     || !Number.isInteger(companyIds.rapid_valley) || companyIds.rapid_valley < 1
     || companyIds.black_hawk === companyIds.rapid_valley
+    || supportEndpoint !== "https://ultimategoalsfitness.com/wp-json/ugf/v1/help-followup"
+    || typeof supportSecret !== "string" || supportSecret.length < 32
     || typeof options.fetchImpl !== "function") {
     return Object.freeze({ ...common, status: "not_ready" });
   }
   const client = createGymMasterProspectClient({ baseUrl, apiKey, companyIds, fetchImpl: options.fetchImpl });
+  const supportClient = createStaffSupportClient({ endpoint: supportEndpoint, secret: supportSecret, fetchImpl: options.fetchImpl });
   return Object.freeze({
     ...common,
     status: "ready_for_separate_route_composition",
     origin,
-    handler: createProspectCallbackHandler({ client }),
+    handler: createProspectCallbackHandler({ client, supportClient }),
     externalCallsPermitted: true,
   });
 }

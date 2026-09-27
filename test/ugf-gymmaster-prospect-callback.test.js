@@ -19,6 +19,8 @@ function configuration(overrides = {}) {
     UGF_GYMMASTER_PROSPECT_RAPID_VALLEY_COMPANY_ID: "2",
     GYMMASTER_MEMBER_PORTAL_API_BASE_URL: "https://ugf.gymmasteronline.com/portal/api/v1/",
     GYMMASTER_MEMBER_PORTAL_API_KEY: API_KEY,
+    UGF_HELP_SUPPORT_ENDPOINT: "https://ultimategoalsfitness.com/wp-json/ugf/v1/help-followup",
+    UGF_HELP_SUPPORT_SECRET: "test-only-support-secret-at-least-32-characters",
     ...overrides,
   };
 }
@@ -53,13 +55,15 @@ test("prospect callback is exact-flag disabled and fails closed without configur
     { UGF_GYMMASTER_PROSPECT_RAPID_VALLEY_COMPANY_ID: "1" },
     { GYMMASTER_MEMBER_PORTAL_API_BASE_URL: "https://example.com/portal/api/v1/" },
     { GYMMASTER_MEMBER_PORTAL_API_KEY: "short" },
+    { UGF_HELP_SUPPORT_ENDPOINT: "https://evil.example/wp-json/ugf/v1/help-followup" },
+    { UGF_HELP_SUPPORT_SECRET: "short" },
   ]) {
     const startup = createProspectCallbackStartup({ environment: configuration(overrides), fetchImpl: async () => null });
     assert.equal(startup.status, "not_ready");
   }
 });
 
-test("submission validation accepts only four contact fields, consent, and an empty honeypot", () => {
+test("submission validation accepts the approved sales and support topics", () => {
   assert.deepEqual(normalizeSubmission({
     firstName: "  Ana María ", lastName: "O’Neil-Smith", email: " ANA@EXAMPLE.COM ",
     phone: "+1 (605) 555-0123", location: "rapid_valley", consent: true, website: "",
@@ -68,6 +72,12 @@ test("submission validation accepts only four contact fields, consent, and an em
     firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123",
     location: "black_hawk", inquiryType: "free_week_trial", consent: true,
   }).inquiryType, "free_week_trial");
+  for (const inquiryType of ["callback", "free_week_trial", "price_match", "account_help", "access_help", "membership_help", "facility_issue"]) {
+    assert.equal(normalizeSubmission({
+      firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123",
+      location: "black_hawk", inquiryType, consent: true,
+    }).inquiryType, inquiryType);
+  }
   for (const invalid of [
     {},
     { firstName: "Ana", lastName: "Smith", email: "bad", phone: "6055550123", location: "black_hawk", consent: true },
@@ -80,11 +90,14 @@ test("submission validation accepts only four contact fields, consent, and an em
   ]) assert.equal(normalizeSubmission(invalid), null);
 });
 
-test("approved callback sends minimized multipart data server-side and conceals provider identifiers", async (t) => {
+test("confirmed nonmember sales inquiry creates a prospect and conceals classification", async (t) => {
   const calls = [];
   const fetchImpl = async (url, options) => {
-    calls.push({ url: new URL(url), options, text: options.body.toString("utf8") });
-    return { status: 200, async json() { return { result: "created", token: "private-token", expires: 3600, memberid: 9182 }; } };
+    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
+    calls.push(call);
+    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
+    if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [] }; } };
+    return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9182 }; } };
   };
   const { app, startup, composition } = await application(fetchImpl);
   assert.equal(startup.status, "ready_for_separate_route_composition");
@@ -93,34 +106,77 @@ test("approved callback sends minimized multipart data server-side and conceals 
   const running = await startApp(app); t.after(() => running.close());
   const result = await submit(running.url, {
     firstName: "Derek", lastName: "Cook", email: "derek@example.com",
-    phone: "605-555-0123", location: "rapid_valley", consent: true, website: "",
+    phone: "605-555-0123", location: "rapid_valley", inquiryType: "free_week_trial", consent: true, website: "",
   });
   assert.equal(result.response.status, 201);
   assert.equal(result.response.headers.get("access-control-allow-origin"), ORIGIN);
   assert.equal(result.response.headers.get("cache-control"), "no-store");
-  assert.deepEqual(result.body, {
-    ok: true,
-    message: "Thanks. UGF staff will use the contact information you provided to follow up.",
-  });
-  const blackHawk = await submit(running.url, {
-    firstName: "Taylor", lastName: "Hill", email: "taylor@example.com",
-    phone: "605-555-0199", location: "black_hawk", inquiryType: "free_week_trial", consent: true,
-  });
-  assert.equal(blackHawk.response.status, 201);
+  assert.deepEqual(result.body, { ok: true, message: "Thanks. UGF staff will use the contact information you provided to follow up." });
   assert.equal(JSON.stringify(result.body).includes("9182"), false);
   assert.equal(JSON.stringify(result.body).includes("private-token"), false);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].url.origin, "https://ugf.gymmasteronline.com");
-  assert.equal(calls[0].url.pathname, "/portal/api/v1/prospect/create");
-  assert.equal(calls[0].url.search, "");
-  assert.equal(calls[0].options.method, "POST");
-  assert.match(calls[0].options.headers["Content-Type"], /^multipart\/form-data; boundary=/);
+  assert.deepEqual(calls.map((call) => call.url.pathname), [
+    "/portal/api/v2/member/exists", "/portal/api/v1/members", "/portal/api/v1/members", "/portal/api/v1/prospect/create",
+  ]);
+  assert.equal(calls[0].url.searchParams.get("email"), "derek@example.com");
+  assert.equal(calls[3].url.search, "");
+  assert.equal(calls[3].options.method, "POST");
+  assert.match(calls[3].options.headers["Content-Type"], /^multipart\/form-data; boundary=/);
   for (const expected of [API_KEY, "Derek", "Cook", "derek@example.com", "6055550123", "companyid\"\r\n\r\n2"] ) {
-    assert.equal(calls[0].text.includes(expected), true);
+    assert.equal(calls[3].text.includes(expected), true);
   }
-  assert.equal(calls[1].text.includes("companyid\"\r\n\r\n1"), true);
-  assert.equal(calls[1].text.includes("Website free-week trial request (new members only)."), true);
-  for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[0].text.includes(forbidden), false);
+  assert.equal(calls[3].text.includes("Website free-week trial request (new members only)."), true);
+  for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[3].text.includes(forbidden), false);
+});
+
+test("existing member and support topics route to staff feedback without creating prospects", async (t) => {
+  for (const scenario of [
+    { inquiryType: "price_match", exists: { result: { id: 42, current_member: true } }, label: "Existing member" },
+    { inquiryType: "account_help", exists: { result: "Member not found" }, label: "Possible member" },
+  ]) {
+    const calls = [];
+    const fetchImpl = async (url, options) => {
+      const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
+      calls.push(call);
+      if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return scenario.exists; } };
+      if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [] }; } };
+      if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
+      throw new Error("prospect creation must not run");
+    };
+    const { app } = await application(fetchImpl);
+    const running = await startApp(app); t.after(() => running.close());
+    const result = await submit(running.url, {
+      firstName: "Ana", lastName: "Smith", email: "ana@example.com", phone: "6055550123",
+      location: "black_hawk", inquiryType: scenario.inquiryType, consent: true,
+    });
+    assert.equal(result.response.status, 201);
+    assert.equal(calls.some((call) => call.url.pathname === "/portal/api/v1/prospect/create"), false);
+    const feedback = calls.find((call) => call.url.pathname === "/wp-json/ugf/v1/help-followup");
+    assert.ok(feedback);
+    assert.equal(feedback.url.origin, "https://ultimategoalsfitness.com");
+    assert.equal(feedback.options.headers["X-UGF-Help-Secret"], "test-only-support-secret-at-least-32-characters");
+    const payload = JSON.parse(feedback.text);
+    assert.equal(payload.recipient, "staff@ugf.club");
+    assert.equal(payload.staffLabel, scenario.label);
+    assert.equal(JSON.stringify(result.body).includes(scenario.label), false);
+  }
+});
+
+test("exact phone match to a current member prevents prospect creation", async (t) => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" }; calls.push(call);
+    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
+    if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [{ phonecell: "(605) 555-0123" }] }; } };
+    if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
+    throw new Error("prospect creation must not run");
+  };
+  const { app } = await application(fetchImpl); const running = await startApp(app); t.after(() => running.close());
+  const result = await submit(running.url, {
+    firstName: "Ana", lastName: "Smith", email: "new-email@example.com", phone: "6055550123",
+    location: "black_hawk", inquiryType: "free_week_trial", consent: true,
+  });
+  assert.equal(result.response.status, 201);
+  assert.equal(calls.some((call) => call.url.pathname === "/portal/api/v1/prospect/create"), false);
 });
 
 test("invalid, bot, cross-origin, and provider-failed requests are rejected or concealed", async (t) => {
