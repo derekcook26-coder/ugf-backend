@@ -237,8 +237,11 @@ function createProspectCallbackHandler(options = {}) {
     if (!submission) return res.status(400).json({ error: "Enter a valid name, email, phone number, location, and consent." });
     try {
       const classification = await client.classify(submission);
-      if (classification === "new_contact" && SALES_INQUIRY_TYPES.has(submission.inquiryType)) {
+      if (classification === "new_contact") {
         await client.create(submission);
+        if (SUPPORT_INQUIRY_TYPES.has(submission.inquiryType)) {
+          await supportClient.send(submission, classification);
+        }
       } else {
         await supportClient.send(submission, classification);
       }
