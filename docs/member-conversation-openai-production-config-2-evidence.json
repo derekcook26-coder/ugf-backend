@@ -1,0 +1,94 @@
+{
+  "version": "GC-MEMBER-CONVERSATION-OPENAI-PRODUCTION-CONFIG-EVIDENCE-2",
+  "observedAt": "2026-08-28T03:13:29.792Z",
+  "targetEnvironmentName": "production",
+  "codeTreeSha": "76253efe297b88f1bb6f7858352f31117d7dc680",
+  "runbookBlobSha": "812428468b75c1b706cba994835746c8bb3a28ea",
+  "v2ArchitectureBlobSha": "a3ba26b3d05875c2b88a52cb5547559c16427a60",
+  "productionCompositionV2BlobSha": "2141faaff72e310330f3105fb069c5ef39c8e4fe",
+  "verificationMode": "authenticated_console_read_only_and_official_openai_documentation",
+  "privacy": {
+    "providerIdentifiersRecorded": false,
+    "accountIdentifiersRecorded": false,
+    "projectIdentifiersRecorded": false,
+    "credentialOrSecretMetadataRecorded": false,
+    "authenticatedConsoleContentRecorded": false
+  },
+  "authenticatedControlEvidence": {
+    "authenticatedOrganizationAccessible": true,
+    "activeProjectEntryVisible": true,
+    "dedicatedGoalsCoachProductionProject": "not_verifiable",
+    "immutableGpt56OrLaterSnapshotPermission": "not_verifiable",
+    "responsesAndStructuredOutputPermission": "not_verifiable",
+    "projectRegionAndOriginBinding": "not_verifiable",
+    "projectZeroDataRetention": "not_verifiable",
+    "modifiedAbuseMonitoring": "not_verifiable",
+    "promptCacheModeAndRetention": "not_verifiable",
+    "organizationAndProjectAuditEvidence": "not_verifiable",
+    "monthlySpendCeiling": "not_verifiable",
+    "dailyWarningThreshold": "not_verifiable",
+    "visibleSpendAlert": "not_verifiable"
+  },
+  "officialDocumentationEvidence": [
+    {
+      "url": "https://developers.openai.com/api/docs/guides/your-data",
+      "conclusion": "Responses data is not used for training by default, but default abuse-monitoring retention can be up to 30 days. Zero Data Retention or Modified Abuse Monitoring requires approval and project or organization configuration. store=false does not by itself prove ZDR, residency, or prompt-cache retention controls."
+    },
+    {
+      "url": "https://developers.openai.com/api/docs/guides/your-data",
+      "conclusion": "Prompt caching can retain encrypted key-value tensors in GPU-local application state. For GPT-5.6 and later families, prompt_cache_options.ttl controls a minimum cache lifetime rather than the maximum application-state retention period."
+    },
+    {
+      "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+      "conclusion": "GPT-5.6 Luna publicly supports the Responses API and structured outputs, but the current page did not establish a distinct immutable dated snapshot identifier or this authenticated project's permission to use one."
+    }
+  ],
+  "repositoryControlEvidence": {
+    "configurationVersion": "GC-MEMBER-CONVERSATION-OPENAI-PRODUCTION-CONFIG-2",
+    "configurationAllowlistCount": 0,
+    "compositionBindingAllowlistCount": 0,
+    "runtimeWired": false,
+    "externalCallsPermitted": false,
+    "providerFree": true,
+    "v1Unchanged": true,
+    "productionStartupImportPresent": false
+  },
+  "configurationApprovalRecord": null,
+  "decision": "not_approvable",
+  "blockingReasons": [
+    "No dedicated Goals Coach production OpenAI project was verifiable without recording a forbidden provider project identifier.",
+    "No exact immutable dated GPT-5.6-or-later snapshot permission was visible and attributable to the active project.",
+    "No exact project region, regional processing eligibility, and matching approved HTTPS API origin were visible as one attributable control set.",
+    "No attributable project-level Zero Data Retention or Modified Abuse Monitoring selection was visible.",
+    "No attributable explicit prompt-cache retention control was visible, and official documentation states that prompt caching can retain encrypted application state.",
+    "No attributable audit-log control or privacy-safe audit-evidence identity was visible.",
+    "No exact monthly spending ceiling, daily warning threshold, or visible alert evidence was visible.",
+    "No approved developer-prompt digest, response-schema digest, migration-state digest, configuration expiration, or activation evidence exists for an exact CONFIG-2 record."
+  ],
+  "safetyConclusion": "No GC-MEMBER-CONVERSATION-OPENAI-PRODUCTION-CONFIG-2 approval envelope was instantiated. Configuration and composition allowlists remain empty; production remains disabled, null, unwired, provider-free, and unavailable for activation.",
+  "actionsPerformed": [
+    "read_authenticated_project_inventory",
+    "read_authenticated_limits_and_billing_surfaces",
+    "read_authenticated_data_retention_surface",
+    "read_authenticated_security_surface",
+    "read_official_openai_documentation",
+    "read_repository_state",
+    "write_local_non_secret_evidence"
+  ],
+  "actionsNotPerformed": [
+    "credential_access",
+    "credential_creation_or_rotation",
+    "provider_api_request",
+    "provider_console_write",
+    "configuration_write",
+    "railway_configuration",
+    "runtime_wiring",
+    "migration",
+    "deployment",
+    "activation",
+    "member_or_live_system_access",
+    "commit",
+    "push",
+    "pull_request"
+  ]
+}

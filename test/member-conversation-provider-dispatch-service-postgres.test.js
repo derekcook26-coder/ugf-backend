@@ -15,6 +15,7 @@ const {
   createMemberConversationProviderDispatchAuthorization,
   MemberConversationProviderDispatchError,
   createMemberConversationProviderDispatchService,
+  validMemberConversationProviderDispatchService,
 } = require("../src/goals-coach/member-conversation-provider-dispatch-service");
 const {
   createMemberConversationAuthorizationAdapters,
@@ -22,12 +23,24 @@ const {
 const {
   parseMemberConversationTurnResponse,
 } = require("../src/goals-coach/member-conversation-turn-contract");
+const {
+  memberConversationTurnResponseV2Digest,
+  parseMemberConversationTurnResponseV2,
+} = require("../src/goals-coach/member-conversation-provider-result");
+const {
+  createMemberConversationProviderOrchestrator,
+  validMemberConversationProviderOrchestrator,
+} = require("../src/goals-coach/member-conversation-provider-orchestrator");
+const {
+  createDeterministicMemberConversationProviderTransport,
+} = require("./helpers/deterministic-member-conversation-provider-transport");
 const { createRealDisposablePostgres } = require("./helpers/real-postgres");
 const { seedMemberAndPlan } = require("./helpers/disposable-db");
 
 const migrations = Array.from({ length: 14 }, (_, index) => String(index + 5).padStart(3, "0"))
   .map((number) => require(`../migrate_${number}`).runMigration);
 const { runMigration: runMigration019 } = require("../migrate_019");
+const { runMigration: runMigration020 } = require("../migrate_020");
 const skip = typeof process.getuid === "function" && process.getuid() === 0
   ? "requires unprivileged PostgreSQL 16" : false;
 
@@ -60,6 +73,12 @@ async function databaseAt019(t) {
   });
   await runMigration019({ pool: database.pool });
   assert.match((await database.pool.query("SHOW server_version")).rows[0].server_version, /^16\./);
+  return database;
+}
+
+async function databaseAt020(t) {
+  const database = await databaseAt019(t);
+  await runMigration020({ pool: database.pool });
   return database;
 }
 
@@ -183,6 +202,96 @@ function successInput(reservation, attemptId, overrides = {}) {
   };
 }
 
+function successInputV2(reservation, attemptId, coaching = "Keep the movement controlled.") {
+  const base = safeResponse(reservation);
+  const response = parseMemberConversationTurnResponseV2({
+    coaching,
+    contractVersion: "GC-MEMBER-CONVERSATION-TURN-RESPONSE-2",
+    conversation: base.conversation,
+    idempotencyKey: base.idempotencyKey,
+    requestContractVersion: base.contractVersion,
+    requestId: base.requestId,
+    result: base.result,
+  });
+  return {
+    ...attemptInput(reservation, attemptId),
+    providerRequestId: "provider-request-success-v2",
+    providerResponseId: "provider-response-success-v2",
+    response,
+    responseDigestSha256: memberConversationTurnResponseV2Digest(response),
+  };
+}
+
+function orchestrationOperation(milliseconds = 5000) {
+  const terminalState = createTerminalState();
+  const controller = new AbortController();
+  return {
+    controller,
+    operation: Object.freeze({
+      outerDeadlineNs: deadlineAfter(monotonicNow(), milliseconds),
+      signal: controller.signal,
+      terminalState,
+    }),
+    terminalState,
+  };
+}
+
+function orchestrator(service, results, options = {}) {
+  const fake = createDeterministicMemberConversationProviderTransport({ results });
+  const value = createMemberConversationProviderOrchestrator({
+    dispatchService: service,
+    transport: fake.transport,
+    ...options,
+  });
+  assert.equal(validMemberConversationProviderOrchestrator(value), true);
+  return { fake, value };
+}
+
+test("orchestrator rejects public metadata lookalikes for both protected dependencies", () => {
+  const fake = createDeterministicMemberConversationProviderTransport({
+    results: [Object.freeze({ category: "indeterminate" })],
+  });
+  const service = Object.freeze({
+    acquireLease() {},
+    contractVersion: "GC-MEMBER-CONVERSATION-PROVIDER-DISPATCH-1",
+    externalEffectsPermitted: false,
+    finalizeSuccess() {},
+    markIndeterminate() {},
+    providerFree: true,
+    read() {},
+    readFinalized() {},
+    recordRejection() {},
+    reserve() {},
+    startDispatch() {},
+  });
+  assert.equal(validMemberConversationProviderDispatchService(service), false);
+  assert.equal(createMemberConversationProviderOrchestrator({
+    dispatchService: service,
+    transport: fake.transport,
+  }), null);
+  assert.equal(createMemberConversationProviderOrchestrator({
+    dispatchService: service,
+    transport: Object.freeze({ ...fake.transport }),
+  }), null);
+});
+
+function succeededTransportResult(reservation) {
+  return Object.freeze({
+    category: "succeeded",
+    providerRequestId: "synthetic-request",
+    providerResponseId: "synthetic-response",
+    response: safeResponse(reservation),
+  });
+}
+
+async function waitFor(predicate, milliseconds = 1000) {
+  const deadline = Date.now() + milliseconds;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for deterministic state");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function failOncePool(pool, predicate) {
   let failed = false;
   return {
@@ -283,6 +392,174 @@ test("finalized replay is strict, minimized, read-only, and unavailable before f
                              WHERE idempotency_key=$1::uuid)` ,
     [input.idempotencyKey]
   )).rows[0].count, 5);
+});
+
+test("orchestrator dispatches once after durable authority, finalizes atomically, and replays", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-success", "10000000-0000-4000-8000-000000000316");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000316");
+  const composed = orchestrator(dispatchService(database.pool), [succeededTransportResult(input)]);
+  const first = await composed.value.execute(input, orchestrationOperation().operation);
+  assert.deepEqual(first, { outcome: "success", response: safeResponse(input) });
+  assert.equal(composed.fake.calls.length, 1);
+  assert.deepEqual(
+    await composed.value.execute(input, orchestrationOperation().operation),
+    first
+  );
+  assert.equal(composed.fake.calls.length, 1);
+});
+
+test("orchestrator records definite rejection without replay and never redispatches", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-reject", "10000000-0000-4000-8000-000000000317");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000317");
+  const composed = orchestrator(dispatchService(database.pool), [Object.freeze({
+    category: "rejected",
+    providerRequestId: "synthetic-rejected-request",
+    terminalCategory: "request_rejected",
+  })]);
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "unavailable",
+  });
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "unavailable",
+  });
+  assert.equal(composed.fake.calls.length, 1);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+});
+
+test("concurrent exact orchestration permits at most one transport dispatch", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-concurrent", "10000000-0000-4000-8000-000000000318");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000318");
+  const composed = orchestrator(dispatchService(database.pool), [succeededTransportResult(input)]);
+  const results = await Promise.all([
+    composed.value.execute(input, orchestrationOperation().operation),
+    composed.value.execute(input, orchestrationOperation().operation),
+  ]);
+  const successes = results.filter((result) => result.outcome === "success");
+  assert.ok(successes.length >= 1 && successes.length <= 2);
+  assert.deepEqual(successes[0], { outcome: "success", response: safeResponse(input) });
+  assert.equal(results.every((result) => ["success", "unavailable"].includes(result.outcome)), true);
+  assert.equal(composed.fake.calls.length, 1);
+});
+
+test("abort after committed dispatch is silent and every late result loses authority", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-abort", "10000000-0000-4000-8000-000000000319");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000319");
+  let resolveTransport;
+  const late = new Promise((resolve) => { resolveTransport = resolve; });
+  const composed = orchestrator(dispatchService(database.pool), [late]);
+  const context = orchestrationOperation();
+  const executing = composed.value.execute(input, context.operation);
+  await waitFor(() => composed.fake.calls.length === 1);
+  context.controller.abort();
+  assert.deepEqual(await executing, { outcome: "silent" });
+  resolveTransport(succeededTransportResult(input));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const counts = (await database.pool.query(
+    `SELECT event_type,COUNT(*)::int count
+       FROM goals_coach_member_conversation_turn_dispatch_events
+      GROUP BY event_type`
+  )).rows;
+  assert.equal(counts.some((row) => ["provider_succeeded", "provider_rejected", "finalized"]
+    .includes(row.event_type)), false);
+  assert.equal((await database.pool.query(
+    "SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_idempotency"
+  )).rows[0].count, 0);
+});
+
+test("deadline after committed dispatch returns unavailable and rejects every late receipt", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-deadline", "10000000-0000-4000-8000-000000000321");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000321");
+  let resolveTransport;
+  const late = new Promise((resolve) => { resolveTransport = resolve; });
+  const composed = orchestrator(dispatchService(database.pool), [late]);
+  const executing = composed.value.execute(input, orchestrationOperation(75).operation);
+  await waitFor(() => composed.fake.calls.length === 1);
+  assert.deepEqual(await executing, { outcome: "unavailable" });
+  resolveTransport(Object.freeze({
+    category: "rejected",
+    providerRequestId: "late-rejected-request",
+    terminalCategory: "request_rejected",
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const events = (await database.pool.query(
+    `SELECT event_type FROM goals_coach_member_conversation_turn_dispatch_events`
+  )).rows.map((row) => row.event_type);
+  assert.equal(events.includes("provider_rejected"), false);
+  assert.equal(events.includes("provider_succeeded"), false);
+  assert.equal(events.includes("finalized"), false);
+});
+
+test("indeterminate recovery is threshold-gated and cannot redispatch", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-indeterminate", "10000000-0000-4000-8000-000000000320");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000320");
+  const service = dispatchService(database.pool, { reconciliationMilliseconds: 25 });
+  const composed = orchestrator(service, [Object.freeze({ category: "indeterminate" })]);
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "unavailable",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "unavailable",
+  });
+  assert.equal(composed.fake.calls.length, 1);
+  assert.equal((await service.read(input)).state, "indeterminate");
+});
+
+test("orchestrator cannot use or replace an unexpired pre-dispatch lease", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-live-lease", "10000000-0000-4000-8000-000000000322");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000322");
+  const service = dispatchService(database.pool, {
+    leaseMilliseconds: 1000,
+    randomUUID() { return "30000000-0000-4000-8000-000000000322"; },
+  });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  const composed = orchestrator(service, [succeededTransportResult(input)]);
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "unavailable",
+  });
+  assert.equal(composed.fake.calls.length, 0);
+  assert.equal((await service.read(input)).state, "lease_acquired");
+});
+
+test("orchestrator reclaims an expired pre-dispatch lease and dispatches exactly once", { skip }, async (t) => {
+  const database = await databaseAt019(t);
+  const owned = await owner(database.pool, "orchestrator-expired-lease", "10000000-0000-4000-8000-000000000323");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000323");
+  const attempts = [
+    "30000000-0000-4000-8000-000000000323",
+    "30000000-0000-4000-8000-000000000324",
+  ];
+  const service = dispatchService(database.pool, {
+    leaseMilliseconds: 20,
+    randomUUID() { return attempts.shift(); },
+  });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  const composed = orchestrator(service, [succeededTransportResult(input)]);
+  assert.deepEqual(await composed.value.execute(input, orchestrationOperation().operation), {
+    outcome: "success",
+    response: safeResponse(input),
+  });
+  assert.equal(composed.fake.calls.length, 1);
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type='lease_acquired'`
+  )).rows[0].count, 2);
+  assert.equal((await database.pool.query(
+    `SELECT COUNT(*)::int count FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE event_type='dispatch_started'`
+  )).rows[0].count, 1);
 });
 
 test("concurrent lease acquisition grants one bounded attempt and dispatch starts once", { skip }, async (t) => {
@@ -501,6 +778,72 @@ test("provider success, exact replay, and finalized state commit atomically", { 
   assert.equal(replay[0].response_reason, null);
   assert.equal(replay[0].safety_classification, "clear");
   assert.equal(replay[0].safety_action, "allow_provider_processing");
+});
+
+test("RESPONSE-2 coaching replay joins M018 and M020 atomically and replays strictly", { skip }, async (t) => {
+  const database = await databaseAt020(t);
+  const owned = await owner(database.pool, "dispatch-success-v2", "10000000-0000-4000-8000-000000000321");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000321");
+  const attemptId = "30000000-0000-4000-8000-000000000321";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInputV2(input, attemptId, "Breathe steadily.\nKeep the movement controlled.");
+
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+  assert.deepEqual(await service.finalizeSuccess(success), { response: success.response });
+  assert.deepEqual(await service.readFinalized(input), { response: success.response });
+
+  const durable = (await database.pool.query(
+    `SELECT replay.coaching_text,replay.response_digest_sha256,
+            replay.migration_018_row_id,final_row.id AS final_row_id
+       FROM goals_coach_member_conversation_provider_coaching_replays replay
+       JOIN goals_coach_member_conversation_turn_idempotency final_row
+         ON final_row.id=replay.migration_018_row_id
+      WHERE replay.reservation_id=(
+        SELECT id FROM goals_coach_member_conversation_turn_reservations
+         WHERE idempotency_key=$1::uuid)`,
+    [input.idempotencyKey]
+  )).rows;
+  assert.equal(durable.length, 1);
+  assert.equal(durable[0].coaching_text, success.response.coaching);
+  assert.equal(durable[0].response_digest_sha256, success.responseDigestSha256);
+  assert.equal(String(durable[0].migration_018_row_id), String(durable[0].final_row_id));
+  assert.deepEqual((await database.pool.query(
+    `SELECT event_type FROM goals_coach_member_conversation_turn_dispatch_events
+      WHERE reservation_id=(SELECT id FROM goals_coach_member_conversation_turn_reservations
+                             WHERE idempotency_key=$1::uuid)
+      ORDER BY event_sequence`,
+    [input.idempotencyKey]
+  )).rows.map((row) => row.event_type), [
+    "reserved", "lease_acquired", "dispatch_started", "provider_succeeded", "finalized",
+  ]);
+});
+
+test("RESPONSE-2 companion or finalized failures roll back every success authority row", { skip }, async (t) => {
+  const database = await databaseAt020(t);
+  const owned = await owner(database.pool, "dispatch-success-v2-rollback", "10000000-0000-4000-8000-000000000322");
+  const input = reservationInput(owned, "20000000-0000-4000-8000-000000000322");
+  const attemptId = "30000000-0000-4000-8000-000000000322";
+  const service = dispatchService(database.pool, { randomUUID() { return attemptId; } });
+  await service.reserve(input);
+  await service.acquireLease(input);
+  await service.startDispatch(attemptInput(input, attemptId));
+  const success = successInputV2(input, attemptId);
+
+  const failing = dispatchService(failOncePool(database.pool, (text) =>
+    String(text).includes("INSERT INTO goals_coach_member_conversation_provider_coaching_replays")));
+  await assert.rejects(failing.finalizeSuccess(success), (error) => error.code === "database_unavailable");
+  const counts = (await database.pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_turn_idempotency) final_rows,
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_provider_coaching_replays) companions,
+       (SELECT COUNT(*)::int FROM goals_coach_member_conversation_turn_dispatch_events
+         WHERE event_type IN ('provider_succeeded','finalized')) terminal_events`
+  )).rows[0];
+  assert.deepEqual(counts, { final_rows: 0, companions: 0, terminal_events: 0 });
+  assert.equal((await service.read(input)).state, "dispatch_started");
 });
 
 test("success conflicts and terminal states create no partial replay authority", { skip }, async (t) => {
@@ -740,6 +1083,8 @@ test("production remains unwired and migrations remain unchanged", () => {
     "utf8"
   );
   assert.doesNotMatch(server, /member-conversation-provider-dispatch-service/);
+  assert.doesNotMatch(server, /member-conversation-provider-orchestrator/);
+  assert.doesNotMatch(startup, /member-conversation-provider-orchestrator/);
   assert.match(server, /idempotency:\s*null/);
   assert.match(server, /provider:\s*null/);
   assert.doesNotMatch(startup, /member-conversation-provider-dispatch-service/);
