@@ -6,7 +6,6 @@ const { exactMemberPortalBaseUrl } = require("./gymmaster-public-widgets");
 const PROSPECT_CALLBACK_FLAG = "UGF_GYMMASTER_PROSPECT_CALLBACK_ENABLED";
 const PROSPECT_PATH = "/portal/api/v1/prospect/create";
 const MEMBER_EXISTS_PATH = "/portal/api/v2/member/exists";
-const MEMBERS_PATH = "/portal/api/v1/members";
 const DEFAULT_TIMEOUT_MILLISECONDS = 5000;
 const STAFF_SUPPORT_EMAIL = "staff@ugf.club";
 const SALES_INQUIRY_TYPES = new Set(["callback", "free_week_trial", "price_match"]);
@@ -63,10 +62,6 @@ function inquiryLabel(value) {
     membership_help: "Membership help",
     facility_issue: "Facility issue",
   })[value];
-}
-
-function phoneDigits(value) {
-  return typeof value === "string" ? value.replace(/\D/g, "") : "";
 }
 
 function normalizeSubmission(body) {
@@ -132,7 +127,11 @@ function createGymMasterProspectClient(options = {}) {
       url: url.toString(),
       options: {
         method: "POST",
-        headers: { Accept: "application/json", "Content-Type": `multipart/form-data; boundary=${multipart.boundary}` },
+        headers: {
+          Accept: "application/json",
+          "Content-Type": `multipart/form-data; boundary=${multipart.boundary}`,
+          "X-GM-API-KEY": apiKey,
+        },
         body: multipart.body,
       },
     });
@@ -143,27 +142,17 @@ function createGymMasterProspectClient(options = {}) {
     for (const [name, value] of Object.entries(parameters)) url.searchParams.set(name, String(value));
     return requestJson(pathname, {
       url: url.toString(),
-      options: { method: "GET", headers: { Accept: "application/json" } },
+      options: { method: "GET", headers: { Accept: "application/json", "X-GM-API-KEY": apiKey } },
     });
   }
 
   return Object.freeze({
     async classify(submission) {
       try {
-        const emailCheck = await get(MEMBER_EXISTS_PATH, { api_key: apiKey, email: submission.email });
+        const emailCheck = await get(MEMBER_EXISTS_PATH, { email: submission.email });
         if (emailCheck.result && typeof emailCheck.result === "object"
           && Number.isInteger(emailCheck.result.id) && emailCheck.result.id > 0) return "existing_member";
         if (typeof emailCheck.result !== "string") return "unknown";
-
-        const expectedPhone = phoneDigits(submission.phone);
-        for (const companyId of [companyIds.black_hawk, companyIds.rapid_valley]) {
-          const memberList = await get(MEMBERS_PATH, { api_key: apiKey, companyid: companyId });
-          if (!Array.isArray(memberList.result)) return "unknown";
-          if (memberList.result.some((member) => member && typeof member === "object"
-            && [member.phonecell, member.phonehome].some((phone) => phoneDigits(phone) === expectedPhone))) {
-            return "existing_member";
-          }
-        }
         return "new_contact";
       } catch (_) {
         return "unknown";
@@ -171,7 +160,6 @@ function createGymMasterProspectClient(options = {}) {
     },
     async create(submission) {
       const result = await postMultipart(PROSPECT_PATH, {
-        api_key: apiKey,
         firstname: submission.firstName,
         surname: submission.lastName,
         email: submission.email,
@@ -267,7 +255,6 @@ function createProspectCallbackHandler(options = {}) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MILLISECONDS,
-  MEMBERS_PATH,
   MEMBER_EXISTS_PATH,
   PROSPECT_CALLBACK_FLAG,
   PROSPECT_PATH,

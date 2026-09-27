@@ -112,7 +112,6 @@ function createProviderClient(options = {}) {
   async function get(path, query = {}) {
     const url = new URL(baseUrl);
     url.pathname = path;
-    url.searchParams.set("api_key", apiKey);
     Object.entries(query).forEach(([key, value]) => {
       if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
     });
@@ -122,7 +121,7 @@ function createProviderClient(options = {}) {
     try {
       response = await fetchImpl(url.toString(), {
         method: "GET",
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", "X-GM-API-KEY": apiKey },
         redirect: "error",
         signal: controller.signal,
       });

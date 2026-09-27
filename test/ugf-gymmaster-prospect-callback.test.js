@@ -96,7 +96,6 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
     const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
     calls.push(call);
     if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
-    if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [] }; } };
     return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9182 }; } };
   };
   const { app, startup, composition } = await application(fetchImpl);
@@ -115,17 +114,21 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
   assert.equal(JSON.stringify(result.body).includes("9182"), false);
   assert.equal(JSON.stringify(result.body).includes("private-token"), false);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/members", "/portal/api/v1/members", "/portal/api/v1/prospect/create",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create",
   ]);
   assert.equal(calls[0].url.searchParams.get("email"), "derek@example.com");
-  assert.equal(calls[3].url.search, "");
-  assert.equal(calls[3].options.method, "POST");
-  assert.match(calls[3].options.headers["Content-Type"], /^multipart\/form-data; boundary=/);
-  for (const expected of [API_KEY, "Derek", "Cook", "derek@example.com", "6055550123", "companyid\"\r\n\r\n2"] ) {
-    assert.equal(calls[3].text.includes(expected), true);
+  assert.equal(calls[0].url.searchParams.has("api_key"), false);
+  assert.equal(calls[0].options.headers["X-GM-API-KEY"], API_KEY);
+  assert.equal(calls[1].url.search, "");
+  assert.equal(calls[1].options.method, "POST");
+  assert.equal(calls[1].options.headers["X-GM-API-KEY"], API_KEY);
+  assert.match(calls[1].options.headers["Content-Type"], /^multipart\/form-data; boundary=/);
+  for (const expected of ["Derek", "Cook", "derek@example.com", "6055550123", "companyid\"\r\n\r\n2"] ) {
+    assert.equal(calls[1].text.includes(expected), true);
   }
-  assert.equal(calls[3].text.includes("Website free-week trial request (new members only)."), true);
-  for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[3].text.includes(forbidden), false);
+  assert.equal(calls[1].text.includes(API_KEY), false);
+  assert.equal(calls[1].text.includes("Website free-week trial request (new members only)."), true);
+  for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[1].text.includes(forbidden), false);
 });
 
 test("existing member and support topics route to staff feedback without creating prospects", async (t) => {
@@ -138,7 +141,6 @@ test("existing member and support topics route to staff feedback without creatin
       const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
       calls.push(call);
       if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return scenario.exists; } };
-      if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [] }; } };
       if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
       throw new Error("prospect creation must not run");
     };
@@ -159,24 +161,6 @@ test("existing member and support topics route to staff feedback without creatin
     assert.equal(payload.staffLabel, scenario.label);
     assert.equal(JSON.stringify(result.body).includes(scenario.label), false);
   }
-});
-
-test("exact phone match to a current member prevents prospect creation", async (t) => {
-  const calls = [];
-  const fetchImpl = async (url, options) => {
-    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" }; calls.push(call);
-    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
-    if (call.url.pathname === "/portal/api/v1/members") return { status: 200, async json() { return { result: [{ phonecell: "(605) 555-0123" }] }; } };
-    if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
-    throw new Error("prospect creation must not run");
-  };
-  const { app } = await application(fetchImpl); const running = await startApp(app); t.after(() => running.close());
-  const result = await submit(running.url, {
-    firstName: "Ana", lastName: "Smith", email: "new-email@example.com", phone: "6055550123",
-    location: "black_hawk", inquiryType: "free_week_trial", consent: true,
-  });
-  assert.equal(result.response.status, 201);
-  assert.equal(calls.some((call) => call.url.pathname === "/portal/api/v1/prospect/create"), false);
 });
 
 test("invalid, bot, cross-origin, and provider-failed requests are rejected or concealed", async (t) => {
