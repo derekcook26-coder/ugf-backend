@@ -104,13 +104,13 @@ test("provider uses the integration key only server-side and exact read-only pat
   await provider.memberships();
   assert.equal(calls[0].url.pathname, "/portal/api/v1/booking/classes/schedule");
   assert.equal(calls[0].url.searchParams.get("week"), "2026-08-24");
-  assert.equal(calls[0].url.searchParams.get("api_key"), API_KEY);
+  assert.equal(calls[0].url.searchParams.has("api_key"), false);
   assert.equal(calls[1].url.pathname, "/portal/api/v1/memberships");
-  assert.equal(calls[1].url.searchParams.get("api_key"), API_KEY);
+  assert.equal(calls[1].url.searchParams.has("api_key"), false);
   for (const call of calls) {
     assert.equal(call.options.method, "GET");
     assert.equal(call.options.redirect, "error");
-    assert.deepEqual(call.options.headers, { Accept: "application/json" });
+    assert.deepEqual(call.options.headers, { Accept: "application/json", "X-GM-API-KEY": API_KEY });
     assert.equal(call.url.searchParams.has("token"), false);
   }
 });
