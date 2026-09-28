@@ -131,16 +131,13 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
   for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[1].text.includes(forbidden), false);
 });
 
-test("existing member and support topics route to staff feedback without creating prospects", async (t) => {
-  for (const scenario of [
-    { inquiryType: "price_match", exists: { result: { id: 42, current_member: true } }, label: "Existing member" },
-    { inquiryType: "account_help", exists: { result: "Member not found" }, label: "Possible member" },
-  ]) {
+test("existing members route to staff feedback without creating prospects", async (t) => {
+  for (const inquiryType of ["price_match", "account_help"]) {
     const calls = [];
     const fetchImpl = async (url, options) => {
       const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
       calls.push(call);
-      if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return scenario.exists; } };
+      if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: { id: 42, current_member: true } }; } };
       if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
       throw new Error("prospect creation must not run");
     };
@@ -148,7 +145,7 @@ test("existing member and support topics route to staff feedback without creatin
     const running = await startApp(app); t.after(() => running.close());
     const result = await submit(running.url, {
       firstName: "Ana", lastName: "Smith", email: "ana@example.com", phone: "6055550123",
-      location: "black_hawk", inquiryType: scenario.inquiryType, consent: true,
+      location: "black_hawk", inquiryType, consent: true,
     });
     assert.equal(result.response.status, 201);
     assert.equal(calls.some((call) => call.url.pathname === "/portal/api/v1/prospect/create"), false);
@@ -158,9 +155,34 @@ test("existing member and support topics route to staff feedback without creatin
     assert.equal(feedback.options.headers["X-UGF-Help-Secret"], "test-only-support-secret-at-least-32-characters");
     const payload = JSON.parse(feedback.text);
     assert.equal(payload.recipient, "staff@ugf.club");
-    assert.equal(payload.staffLabel, scenario.label);
-    assert.equal(JSON.stringify(result.body).includes(scenario.label), false);
+    assert.equal(payload.staffLabel, "Existing member");
+    assert.equal(JSON.stringify(result.body).includes("Existing member"), false);
   }
+});
+
+test("confirmed nonmember support inquiry creates a prospect and still notifies staff", async (t) => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
+    calls.push(call);
+    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
+    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { result: "created", memberid: 9183 }; } };
+    if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
+    throw new Error("unexpected provider call");
+  };
+  const { app } = await application(fetchImpl);
+  const running = await startApp(app); t.after(() => running.close());
+  const result = await submit(running.url, {
+    firstName: "Ana", lastName: "Smith", email: "ana@example.com", phone: "6055550123",
+    location: "black_hawk", inquiryType: "account_help", consent: true,
+  });
+  assert.equal(result.response.status, 201);
+  assert.deepEqual(calls.map((call) => call.url.pathname), [
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/wp-json/ugf/v1/help-followup",
+  ]);
+  const feedback = calls.find((call) => call.url.pathname === "/wp-json/ugf/v1/help-followup");
+  assert.ok(feedback);
+  assert.equal(JSON.parse(feedback.text).staffLabel, "Possible member");
 });
 
 test("invalid, bot, cross-origin, and provider-failed requests are rejected or concealed", async (t) => {
