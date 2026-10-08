@@ -119,7 +119,7 @@ test("confirmed nonmember sales inquiry creates a prospect, saves opted-in SMS p
   assert.equal(JSON.stringify(result.body).includes("9182"), false);
   assert.equal(JSON.stringify(result.body).includes("private-token"), false);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/member/communication/preference",
   ]);
   assert.equal(calls[0].url.searchParams.get("email"), "derek@example.com");
   assert.equal(calls[0].url.searchParams.has("api_key"), false);
@@ -165,7 +165,7 @@ test("unchecked SMS consent explicitly disables every GymMaster SMS category", a
   assert.equal(result.response.status, 201);
   const prospect = calls.find((call) => call.url.pathname === "/portal/api/v1/prospect/create");
   assert.match(prospect.text, /SMS consent: no, homepage form,/);
-  const preferenceCall = calls.find((call) => call.url.pathname === "/portal/api/v2/email/member/communication/preference");
+  const preferenceCall = calls.find((call) => call.url.pathname === "/portal/api/v2/member/communication/preference");
   const preferences = new URLSearchParams(preferenceCall.text);
   for (const name of ["sms_general", "sms_booking", "sms_membership", "sms_account", "sms_marketing"]) {
     assert.equal(preferences.get(name), "false");
@@ -209,7 +209,7 @@ test("confirmed nonmember support inquiry creates a prospect and still notifies 
     calls.push(call);
     if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
     if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9183 }; } };
-    if (call.url.pathname === "/portal/api/v2/email/member/communication/preference") return { status: 200, async json() { return { result: "updated" }; } };
+    if (call.url.pathname === "/portal/api/v2/member/communication/preference") return { status: 200, async json() { return { result: "updated" }; } };
     if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
     throw new Error("unexpected provider call");
   };
@@ -221,7 +221,7 @@ test("confirmed nonmember support inquiry creates a prospect and still notifies 
   });
   assert.equal(result.response.status, 201);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference", "/wp-json/ugf/v1/help-followup",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/member/communication/preference", "/wp-json/ugf/v1/help-followup",
   ]);
   const feedback = calls.find((call) => call.url.pathname === "/wp-json/ugf/v1/help-followup");
   assert.ok(feedback);
@@ -260,7 +260,7 @@ test("preference delivery failure is logged without hiding a successfully create
   assert.equal(result.body.ok, true);
   assert.deepEqual(warnings, ["GymMaster communication preference update failed after prospect creation"]);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/member/communication/preference",
   ]);
 });
 
