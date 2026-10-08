@@ -5,7 +5,11 @@ const test = require("node:test");
 const express = require("express");
 const { createProspectCallbackStartup } = require("../src/goals-coach/ugf-gymmaster-prospect-callback-startup");
 const { composeProspectCallbackRoute } = require("../src/goals-coach/ugf-gymmaster-prospect-callback-route-composition");
-const { normalizeSubmission } = require("../src/goals-coach/ugf-gymmaster-prospect-callback");
+const {
+  createGymMasterProspectClient,
+  createProspectCallbackHandler,
+  normalizeSubmission,
+} = require("../src/goals-coach/ugf-gymmaster-prospect-callback");
 const { startApp } = require("./helpers/http-app");
 
 const ORIGIN = "https://ultimategoalsfitness.com";
@@ -67,7 +71,7 @@ test("submission validation accepts the approved sales and support topics", () =
   assert.deepEqual(normalizeSubmission({
     firstName: "  Ana María ", lastName: "O’Neil-Smith", email: " ANA@EXAMPLE.COM ",
     phone: "+1 (605) 555-0123", location: "rapid_valley", consent: true, website: "",
-  }), { firstName: "Ana María", lastName: "O’Neil-Smith", email: "ana@example.com", phone: "+16055550123", location: "rapid_valley", inquiryType: "callback" });
+  }), { firstName: "Ana María", lastName: "O’Neil-Smith", email: "ana@example.com", phone: "+16055550123", location: "rapid_valley", inquiryType: "callback", smsConsent: false });
   assert.deepEqual(normalizeSubmission({
     firstName: "Ana", lastName: "Smith", email: "a@example.com", phone: "6055550123",
     location: "black_hawk", inquiryType: "free_week_trial", consent: true,
@@ -90,13 +94,14 @@ test("submission validation accepts the approved sales and support topics", () =
   ]) assert.equal(normalizeSubmission(invalid), null);
 });
 
-test("confirmed nonmember sales inquiry creates a prospect and conceals classification", async (t) => {
+test("confirmed nonmember sales inquiry creates a prospect, saves opted-in SMS preferences, and conceals provider credentials", async (t) => {
   const calls = [];
   const fetchImpl = async (url, options) => {
     const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
     calls.push(call);
     if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
-    return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9182 }; } };
+    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9182 }; } };
+    return { status: 200, async json() { return { result: "updated" }; } };
   };
   const { app, startup, composition } = await application(fetchImpl);
   assert.equal(startup.status, "ready_for_separate_route_composition");
@@ -105,7 +110,7 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
   const running = await startApp(app); t.after(() => running.close());
   const result = await submit(running.url, {
     firstName: "Derek", lastName: "Cook", email: "derek@example.com",
-    phone: "605-555-0123", location: "rapid_valley", inquiryType: "free_week_trial", consent: true, website: "",
+    phone: "605-555-0123", location: "rapid_valley", inquiryType: "free_week_trial", consent: true, smsConsent: true, website: "",
   });
   assert.equal(result.response.status, 201);
   assert.equal(result.response.headers.get("access-control-allow-origin"), ORIGIN);
@@ -114,7 +119,7 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
   assert.equal(JSON.stringify(result.body).includes("9182"), false);
   assert.equal(JSON.stringify(result.body).includes("private-token"), false);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference",
   ]);
   assert.equal(calls[0].url.searchParams.get("email"), "derek@example.com");
   assert.equal(calls[0].url.searchParams.has("api_key"), false);
@@ -128,7 +133,43 @@ test("confirmed nonmember sales inquiry creates a prospect and conceals classifi
   }
   assert.equal(calls[1].text.includes(API_KEY), false);
   assert.equal(calls[1].text.includes("Website free-week trial request (new members only)."), true);
+  assert.match(calls[1].text, /SMS consent: yes, homepage form, \d{4}-\d{2}-\d{2}T[^,]+, IP (?:::ffff:)?127\.0\.0\.1, checkbox wording version homepage-sms-consent-2026-10-08-v1\./);
+  const preferences = new URLSearchParams(calls[2].text);
+  assert.equal(calls[2].options.headers["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(preferences.get("api_key"), API_KEY);
+  assert.equal(preferences.get("token"), "private-token");
+  assert.equal(preferences.get("sms_general"), "true");
+  assert.equal(preferences.get("sms_booking"), "false");
+  assert.equal(preferences.get("sms_membership"), "true");
+  assert.equal(preferences.get("sms_account"), "true");
+  assert.equal(preferences.get("sms_marketing"), "false");
+  assert.equal(calls[2].url.search, "");
   for (const forbidden of ["memberid", "password", "credit", "billing"]) assert.equal(calls[1].text.includes(forbidden), false);
+});
+
+test("unchecked SMS consent explicitly disables every GymMaster SMS category", async (t) => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
+    calls.push(call);
+    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
+    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { token: "private-token", memberid: 9184 }; } };
+    return { status: 200, async json() { return { result: "updated" }; } };
+  };
+  const { app } = await application(fetchImpl);
+  const running = await startApp(app); t.after(() => running.close());
+  const result = await submit(running.url, {
+    firstName: "Ana", lastName: "Smith", email: "ana@example.com", phone: "6055550123",
+    location: "black_hawk", inquiryType: "price_match", consent: true, smsConsent: false,
+  });
+  assert.equal(result.response.status, 201);
+  const prospect = calls.find((call) => call.url.pathname === "/portal/api/v1/prospect/create");
+  assert.match(prospect.text, /SMS consent: no, homepage form,/);
+  const preferenceCall = calls.find((call) => call.url.pathname === "/portal/api/v2/email/member/communication/preference");
+  const preferences = new URLSearchParams(preferenceCall.text);
+  for (const name of ["sms_general", "sms_booking", "sms_membership", "sms_account", "sms_marketing"]) {
+    assert.equal(preferences.get(name), "false");
+  }
 });
 
 test("existing members route to staff feedback without creating prospects", async (t) => {
@@ -156,6 +197,7 @@ test("existing members route to staff feedback without creating prospects", asyn
     const payload = JSON.parse(feedback.text);
     assert.equal(payload.recipient, "staff@ugf.club");
     assert.equal(payload.staffLabel, "Existing member");
+    assert.equal(payload.smsConsent, false);
     assert.equal(JSON.stringify(result.body).includes("Existing member"), false);
   }
 });
@@ -166,7 +208,8 @@ test("confirmed nonmember support inquiry creates a prospect and still notifies 
     const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
     calls.push(call);
     if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
-    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { result: "created", memberid: 9183 }; } };
+    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { result: "created", token: "private-token", memberid: 9183 }; } };
+    if (call.url.pathname === "/portal/api/v2/email/member/communication/preference") return { status: 200, async json() { return { result: "updated" }; } };
     if (call.url.pathname === "/wp-json/ugf/v1/help-followup") return { status: 200, async json() { return { ok: true }; } };
     throw new Error("unexpected provider call");
   };
@@ -178,11 +221,47 @@ test("confirmed nonmember support inquiry creates a prospect and still notifies 
   });
   assert.equal(result.response.status, 201);
   assert.deepEqual(calls.map((call) => call.url.pathname), [
-    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/wp-json/ugf/v1/help-followup",
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference", "/wp-json/ugf/v1/help-followup",
   ]);
   const feedback = calls.find((call) => call.url.pathname === "/wp-json/ugf/v1/help-followup");
   assert.ok(feedback);
   assert.equal(JSON.parse(feedback.text).staffLabel, "Possible member");
+  assert.equal(JSON.parse(feedback.text).smsConsent, false);
+});
+
+test("preference delivery failure is logged without hiding a successfully created prospect", async (t) => {
+  const calls = [];
+  const warnings = [];
+  const fetchImpl = async (url, options) => {
+    const call = { url: new URL(url), options, text: options.body ? options.body.toString("utf8") : "" };
+    calls.push(call);
+    if (call.url.pathname === "/portal/api/v2/member/exists") return { status: 200, async json() { return { result: "Member not found" }; } };
+    if (call.url.pathname === "/portal/api/v1/prospect/create") return { status: 200, async json() { return { token: "private-token", memberid: 9185 }; } };
+    return { status: 503, async json() { return { error: "unavailable" }; } };
+  };
+  const client = createGymMasterProspectClient({
+    baseUrl: "https://ugf.gymmasteronline.com/portal/api/v1/",
+    apiKey: API_KEY,
+    companyIds: { black_hawk: 1, rapid_valley: 2 },
+    fetchImpl,
+    logger: { warn(message) { warnings.push(message); } },
+  });
+  const app = express(); app.set("trust proxy", 1); app.use(express.json({ limit: "2kb" }));
+  app.post("/public/help/prospect", createProspectCallbackHandler({
+    client,
+    supportClient: { async send() { throw new Error("should not send for sales inquiry"); } },
+  }));
+  const running = await startApp(app); t.after(() => running.close());
+  const result = await submit(running.url, {
+    firstName: "Ana", lastName: "Smith", email: "ana@example.com", phone: "6055550123",
+    location: "rapid_valley", inquiryType: "free_week_trial", consent: true, smsConsent: true,
+  });
+  assert.equal(result.response.status, 201);
+  assert.equal(result.body.ok, true);
+  assert.deepEqual(warnings, ["GymMaster communication preference update failed after prospect creation"]);
+  assert.deepEqual(calls.map((call) => call.url.pathname), [
+    "/portal/api/v2/member/exists", "/portal/api/v1/prospect/create", "/portal/api/v2/email/member/communication/preference",
+  ]);
 });
 
 test("invalid, bot, cross-origin, and provider-failed requests are rejected or concealed", async (t) => {
