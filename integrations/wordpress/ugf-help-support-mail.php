@@ -41,9 +41,11 @@ function ugf_help_support_deliver( WP_REST_Request $request ) {
 	$phone       = ugf_help_support_text( $input['phone'] ?? '', 24 );
 	$topic       = ugf_help_support_text( $input['topic'] ?? '', 100 );
 	$staff_label = ugf_help_support_text( $input['staffLabel'] ?? '', 40 );
+	$sms_consent = $input['smsConsent'] ?? null;
 	$location    = $input['location'] ?? '';
 	if ( ! $first_name || ! $last_name || ! is_email( $email ) || ! $phone || ! $topic
 		|| ! in_array( $staff_label, array( 'Existing member', 'Possible member' ), true )
+		|| ! is_bool( $sms_consent )
 		|| ! in_array( $location, array( 'black_hawk', 'rapid_valley' ), true ) ) {
 		return new WP_Error( 'ugf_help_invalid', 'Invalid request.', array( 'status' => 400 ) );
 	}
@@ -57,6 +59,7 @@ function ugf_help_support_deliver( WP_REST_Request $request ) {
 		'Email: ' . $email,
 		'Phone: ' . $phone,
 		'Location: ' . $location_label,
+		'SMS consent: ' . ( $sms_consent ? 'yes' : 'no' ),
 		'',
 		'No GymMaster prospect was created for this support request.',
 	) );

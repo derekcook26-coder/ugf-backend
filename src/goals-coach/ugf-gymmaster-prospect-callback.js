@@ -6,7 +6,9 @@ const { exactMemberPortalBaseUrl } = require("./gymmaster-public-widgets");
 const PROSPECT_CALLBACK_FLAG = "UGF_GYMMASTER_PROSPECT_CALLBACK_ENABLED";
 const PROSPECT_PATH = "/portal/api/v1/prospect/create";
 const MEMBER_EXISTS_PATH = "/portal/api/v2/member/exists";
+const COMMUNICATION_PREFERENCE_PATH = "/portal/api/v2/email/member/communication/preference";
 const DEFAULT_TIMEOUT_MILLISECONDS = 5000;
+const SMS_CHECKBOX_WORDING_VERSION = "homepage-sms-consent-2026-10-08-v1";
 const STAFF_SUPPORT_EMAIL = "staff@ugf.club";
 const SALES_INQUIRY_TYPES = new Set(["callback", "free_week_trial", "price_match"]);
 const SUPPORT_INQUIRY_TYPES = new Set(["account_help", "access_help", "membership_help", "facility_issue"]);
@@ -46,10 +48,12 @@ function normalizeInquiryType(value) {
   return SALES_INQUIRY_TYPES.has(value) || SUPPORT_INQUIRY_TYPES.has(value) ? value : null;
 }
 
-function inquiryNote(value) {
-  if (value === "free_week_trial") return "Website free-week trial request (new members only). Contact information submitted with explicit consent.";
-  if (value === "price_match") return "Website 24/7 gym price-matching inquiry. Contact information submitted with explicit consent.";
-  return "Website callback request. Contact information submitted with explicit consent.";
+function inquiryNote(value, audit) {
+  let note;
+  if (value === "free_week_trial") note = "Website free-week trial request (new members only). Contact information submitted with explicit consent.";
+  else if (value === "price_match") note = "Website 24/7 gym price-matching inquiry. Contact information submitted with explicit consent.";
+  else note = "Website callback request. Contact information submitted with explicit consent.";
+  return `${note}\nSMS consent: ${audit.smsConsent ? "yes" : "no"}, homepage form, ${audit.submittedAt}, IP ${audit.ipAddress}, checkbox wording version ${SMS_CHECKBOX_WORDING_VERSION}.`;
 }
 
 function inquiryLabel(value) {
@@ -66,7 +70,7 @@ function inquiryLabel(value) {
 
 function normalizeSubmission(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const allowed = new Set(["firstName", "lastName", "email", "phone", "location", "inquiryType", "consent", "website"]);
+  const allowed = new Set(["firstName", "lastName", "email", "phone", "location", "inquiryType", "consent", "smsConsent", "website"]);
   if (Object.keys(body).some((key) => !allowed.has(key)) || body.consent !== true
     || (body.website !== undefined && body.website !== "")) return null;
   const submission = {
@@ -76,8 +80,15 @@ function normalizeSubmission(body) {
     phone: normalizePhone(body.phone),
     location: normalizeLocation(body.location),
     inquiryType: normalizeInquiryType(body.inquiryType),
+    smsConsent: body.smsConsent === true,
   };
-  return Object.values(submission).some((value) => !value) ? null : Object.freeze(submission);
+  return Object.entries(submission).some(([key, value]) => key !== "smsConsent" && !value) ? null : Object.freeze(submission);
+}
+
+function normalizeIpAddress(value) {
+  if (typeof value !== "string") return "unavailable";
+  const ipAddress = value.trim();
+  return ipAddress && ipAddress.length <= 64 && /^[0-9a-f:.]+$/i.test(ipAddress) ? ipAddress : "unavailable";
 }
 
 function multipartBody(fields) {
@@ -95,6 +106,7 @@ function createGymMasterProspectClient(options = {}) {
   const apiKey = options.apiKey;
   const companyIds = options.companyIds;
   const fetchImpl = options.fetchImpl;
+  const logger = options.logger && typeof options.logger.warn === "function" ? options.logger : console;
   const timeoutMilliseconds = Number.isInteger(options.timeoutMilliseconds) && options.timeoutMilliseconds > 0
     ? options.timeoutMilliseconds : DEFAULT_TIMEOUT_MILLISECONDS;
   if (!baseUrl || typeof apiKey !== "string" || apiKey.length < 8
@@ -137,6 +149,20 @@ function createGymMasterProspectClient(options = {}) {
     });
   }
 
+  async function postForm(pathname, fields) {
+    const url = new URL(baseUrl); url.pathname = pathname; url.search = "";
+    const body = new URLSearchParams();
+    for (const [name, value] of Object.entries(fields)) body.set(name, String(value));
+    return requestJson(pathname, {
+      url: url.toString(),
+      options: {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+      },
+    });
+  }
+
   async function get(pathname, parameters) {
     const url = new URL(baseUrl); url.pathname = pathname; url.search = "";
     for (const [name, value] of Object.entries(parameters)) url.searchParams.set(name, String(value));
@@ -158,17 +184,31 @@ function createGymMasterProspectClient(options = {}) {
         return "unknown";
       }
     },
-    async create(submission) {
+    async create(submission, audit) {
       const result = await postMultipart(PROSPECT_PATH, {
         firstname: submission.firstName,
         surname: submission.lastName,
         email: submission.email,
         companyid: String(companyIds[submission.location]),
         phonecell: submission.phone,
-        notes: inquiryNote(submission.inquiryType),
+        notes: inquiryNote(submission.inquiryType, audit),
       });
-      if (!Number.isInteger(result.memberid) || result.memberid < 1) {
+      if (!Number.isInteger(result.memberid) || result.memberid < 1 || typeof result.token !== "string" || result.token.length < 8) {
         throw new Error("GymMaster prospect creation is unavailable");
+      }
+      const smsEnabled = submission.smsConsent === true;
+      try {
+        await postForm(COMMUNICATION_PREFERENCE_PATH, {
+          api_key: apiKey,
+          token: result.token,
+          sms_general: smsEnabled,
+          sms_booking: false,
+          sms_membership: smsEnabled,
+          sms_account: smsEnabled,
+          sms_marketing: false,
+        });
+      } catch (_) {
+        logger.warn("GymMaster communication preference update failed after prospect creation");
       }
     },
   });
@@ -211,6 +251,7 @@ function createStaffSupportClient(options = {}) {
             email: submission.email,
             phone: submission.phone,
             location: submission.location,
+            smsConsent: submission.smsConsent,
           }),
           redirect: "error",
           signal: controller.signal,
@@ -238,7 +279,11 @@ function createProspectCallbackHandler(options = {}) {
     try {
       const classification = await client.classify(submission);
       if (classification === "new_contact") {
-        await client.create(submission);
+        await client.create(submission, Object.freeze({
+          smsConsent: submission.smsConsent,
+          submittedAt: new Date().toISOString(),
+          ipAddress: normalizeIpAddress(req && req.ip),
+        }));
         if (SUPPORT_INQUIRY_TYPES.has(submission.inquiryType)) {
           await supportClient.send(submission, classification);
         }
@@ -258,9 +303,11 @@ function createProspectCallbackHandler(options = {}) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MILLISECONDS,
+  COMMUNICATION_PREFERENCE_PATH,
   MEMBER_EXISTS_PATH,
   PROSPECT_CALLBACK_FLAG,
   PROSPECT_PATH,
+  SMS_CHECKBOX_WORDING_VERSION,
   createGymMasterProspectClient,
   createProspectCallbackHandler,
   createStaffSupportClient,
@@ -271,5 +318,6 @@ module.exports = {
   normalizeLocation,
   normalizeName,
   normalizePhone,
+  normalizeIpAddress,
   normalizeSubmission,
 };
